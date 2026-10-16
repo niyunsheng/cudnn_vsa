@@ -1,0 +1,6 @@
+# Standalone VSA: cuDNN BSA fine + FA4 varlen coarse.
+torch>=2.10
+triton>=3.3
+nvidia-cudnn-frontend[cutedsl]>=1.28.0
+nvidia-cutlass-dsl[cu13]>=4.6.2
+flash-attn-4>=4.0.0b35

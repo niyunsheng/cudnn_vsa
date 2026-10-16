@@ -1,0 +1,5 @@
+# Optional correctness oracle. The Python package is pinned to the previously
+# audited main commit; pip builds only a Python wheel. Never build kernel C++.
+--only-binary=fastvideo-kernel
+fastvideo @ https://github.com/hao-ai-lab/FastVideo/archive/d5253fd71055927f12aa6c4aa679b93a00238851.tar.gz
+fastvideo-kernel==0.3.5

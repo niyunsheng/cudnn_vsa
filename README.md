@@ -58,7 +58,8 @@ The attention path only adds/removes padding, packs Q/K/V together, and
 skips those copies when all blocks are full. See [the input contract](docs/block_major.md).
 
 Add this directory to `PYTHONPATH`, or copy `vsa.py`, `vsa_layout.py` and
-`vsa_kernels.py` into your project and adjust imports.
+`vsa_kernels.py` into your project and adjust imports. Include `vsa_ring.py`
+when using ring context parallelism.
 
 ## Attention semantics
 
@@ -141,8 +142,11 @@ order. Passing `ring_cp_group=None` retains single-device behavior.
 `input_order="raster"` remains available for existing restricted-raster callers.
 See [ring layout and algorithm](docs/ring_cp.md) for the ownership contract.
 Compact inputs pass the complete numerical/group/graph suite. Same-allocation
-comparisons improve 64k total MFU by 2.4–2.9%; 720p30s/ring8 stays near
-17.0–17.2%, below the parent's approximately 20.3% no-ring target.
+comparisons improve 64k total MFU by 2.4–2.9%; 720p30s/ring8 remains near
+17%, below the parent's approximately 20.3% no-ring target. The latest
+30-warmup/500-replay A/B/B/A run measures 16.929% versus the original ring's
+16.891% for single-sample dense-query-full. All tested total MFUs improve,
+but this is not a guarantee that every phase improves on every workload.
 See the [compact-input results](docs/ring_cp_benchmark.md#compact-block-major-child-branch).
 The prior raster-input ring baseline passes output/gradient and changed-input CUDA Graph checks for single,
 packed, ragged, dense-only and empty-peer cases on GB200.

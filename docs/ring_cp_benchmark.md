@@ -1,10 +1,10 @@
 # Ring CP validation and tuning
 
-Measured on 2026-10-20, branch `codex/ring-cp-thd`.
+Measured on 2026-10-20. The original `codex/ring-cp-thd` results are retained
+below; the latest compact-input child run is SLURM 8097850.
 
-The latest complete run is SLURM 8093259. See the
-[phase comparison](#phase-comparison-with-the-720p5s-reference) and
-[final validation](#final-validation) below.
+See the [longer compact-input repeat](#longer-compact-input-repeat) for the
+latest phase comparison. The 720p5s/no-ring MFU target remains unmet.
 
 ## Workload and measurement boundary
 
@@ -468,3 +468,101 @@ Raw evidence: `runtime/cudnn-vsa/block-ring-8096942/` in the toolkit.
 Reproduction: `scripts/dit/block_major_vsa/run_ring.sh` and
 `analyze_ring.py`. Neither feature branch is merged. Further scheduling
 experiments must preserve these checks and compare repeated controls.
+
+## Longer compact-input repeat
+
+SLURM 8097850 repeats the unchanged sources with 30 warmups and 500
+graph replays, in A/B/B/A order on the same eight GPUs. All 8 artifacts /
+1,792 rank/check records pass, minimum similarity 0.9999916846. Runtime and
+benchmark source fingerprints match the clean committed worktrees.
+
+| Case | Raster-ring F/B/total MFU (%) | Block-ring F/B/total MFU (%) |
+|---|---|---|
+| single64k-full0 | 5.824/5.049/5.314 | 6.065/5.141/5.446 |
+| thd64k-full0 | 2.987/2.892/2.942 | 3.128/2.944/3.027 |
+| single720p30s-full0 | 21.788/14.752/16.718 | 21.897/14.734/16.726 |
+| thd720p30s-full0 | 21.740/14.728/16.683 | 21.831/14.733/16.711 |
+| single64k-full1 | 7.393/6.211/6.580 | 7.682/6.321/6.736 |
+| thd64k-full1 | 3.813/3.779/3.811 | 3.956/3.863/3.919 |
+| single720p30s-full1 | 21.991/14.907/16.891 | 22.113/14.925/16.929 |
+| thd720p30s-full1 | 21.854/14.902/16.854 | 21.988/14.936/16.906 |
+
+All measured total MFUs improve: 64k by 2.38–2.89%, 30s by 0.05–0.31%.
+The dense-query-full single and THD cases improve in both phases. Default
+single-sample 30s backward has a -0.12% point estimate, versus 0.35%
+control drift (26.956 to 26.861 ms). Preserve this observation; the
+measurement does not justify a universal per-phase no-regression claim.
+Absolute times also vary across allocations; compare paired controls.
+
+The latest single 30s/ring8 result is 9.257 ms forward, 27.432 ms backward
+and 36.276 ms total. Its 22.113%/14.925%/16.929% phase MFUs remain below
+the parent's 27.177%/18.035%/20.312% single 5s/no-ring result. Block-order
+inputs preserve/improve the existing ring's total MFU but do not close
+that gap. Both feature branches remain unmerged.
+
+Raw evidence: `runtime/cudnn-vsa/block-ring-confirm-8097850/`.
+Reproduce with toolkit `scripts/dit/block_major_vsa/run_ring_confirm.sh`
+and `analyze_ring.py`.
+
+## Rejected query-window scheduling experiment
+
+An isolated prototype keeps forward's KV ring but circulates Q/dO/global
+O/LSE in backward, holding K/V stationary. It gathers compact routing
+metadata asynchronously in forward and returns/accumulates dQ in FP32.
+It does not gather full token KV. This prototype is not in the branch API.
+
+Job 8097460 completes the world-group Q1/Q2/Q4 sweep: 11 artifacts /
+2,336 checks, minimum similarity 0.9999916846. Q2's small 30s gain does
+not generalize to 64k. The job subsequently fails singleton graph capture;
+joining an unused route stream caused an external capture dependency.
+The isolated fix passes job 8097738: 96 GPU tests per node, 52 group/window
+artifacts / 1,920 checks, minimum similarity 0.9999916846. An earlier
+retained-backward failure was fixed by cloning the saved LSE receive buffer.
+These were prototype issues, not changes to this branch's default path.
+
+Job 8097662 compares Q2/Q4 bucket settings with repeated unchanged KV-ring
+controls; all 14 artifacts / 2,240 checks pass. Single/THD control totals
+are 17.226%/17.176%, while paired Q2 defaults are 17.183%/17.112%.
+No tested bucket beats both KV controls. Larger windows and buckets
+regress further. Reject this as a default optimization rather than
+selecting the earlier favorable allocation.
+
+Raw evidence and preserved source: toolkit `runtime/cudnn-vsa/query-ring-8097460/`,
+`query-groups-8097738/`, and `query-buckets-8097662/`.
+
+## Rejected separate dense-KV backward buckets
+
+A second isolated prototype splits always-visible KV and routed KV into
+separate backward calls, preserving the original forward, selected pairs,
+global O/LSE and gradient ring. Dense KV uses bucket 16/32/64/128/256;
+routed KV keeps the original bucket. It uses FP32 dQ accumulation and
+maps disjoint dK/dV rows back to the original owner buffer.
+
+Job 8098057 passes 132 CPU tests beforehand, 82 GPU tests per node, and
+all 11 artifacts / 2,688 rank/check records at minimum similarity
+0.9999916846. A small mixed THD case compares against independent token
+math and asserts the split path is active; long and 64k cases also assert
+activation. Empty components retain ordinary backward.
+
+Every tested split setting regresses total MFU. Dense-query-full 30s
+single/THD controls are 17.275%/17.244%; even the best per-case split
+settings reach only 16.369%/16.301%. Bucket 64 reaches 16.319%/16.273%.
+Default-policy 30s bucket-64 totals regress by 5.73%/5.38%; 64k regresses
+more. This prototype is not included in the branch API.
+
+Same-job rank-0 CUDA Graph traces explain the rejection: the ordinary
+backward's 8 main BSA kernels total 21.869 ms; the split path's 16 total
+22.109 ms. Splitting adds 1.354 ms of KV gather work and raises gradient
+conversion from 0.626 to 1.062 ms. Exposed communication is only
+0.151/0.233 ms for ordinary/split paths, versus GPU spans of 35.210/37.708 ms.
+Summed overlapping P2P durations are not elapsed overhead. This evidence
+points toward the BSA backward kernel and repeated preparation/finalization
+as the next optimization target, not merely more communication overlap.
+It does not prove SM saturation or rank balance from one rank's trace.
+
+Raw results, preserved prototype and HTML/JSON analyses:
+`runtime/cudnn-vsa/split-kv-8098057/` in the toolkit. Open
+`control-single30s.html` and `split64-single30s.html` to inspect the traces.
+The reports' automatic transformer-layer inference is not meaningful for
+this standalone attention benchmark; use whole-step/kernel/communication
+sections and the distributed phase timing JSON.

@@ -31,7 +31,8 @@ def vsa_attention(q, k, v, gate, vsa_layout, *, scale=None):
     Segment sparsities are resolved into top-k counts when building the layout;
     every call uses these counts and selects blocks from the current Q/K.
     layout.dense_query_full controls whether dense queries bypass top-k.
-    Inputs are contiguous sample-major raster rows, following layout.samples.
+    Inputs follow layout.input_order: raster or compact block-major, without
+    padding. Output uses the same order; Q/K/V/gate must share that order.
     """
     _validate(q, k, v, gate)
     layout = vsa_layout
@@ -43,12 +44,17 @@ def vsa_attention(q, k, v, gate, vsa_layout, *, scale=None):
         raise ValueError("VSALayout and activations must be on the same device")
     if not q.is_cuda or q.dtype != torch.bfloat16 or q.shape[-1] != 128:
         raise ValueError("cuDNN BSA training requires CUDA BF16 and head_dim=128")
-    q_slots, k_slots, v_slots = (
-        vsa_kernels.to_slots(x, layout.slot_row, layout.row_slot)
-        for x in (q, k, v)
-    )
+    if layout.slots_are_input:
+        q_slots, k_slots, v_slots = q, k, v
+    elif layout.input_order == "block":
+        q_slots, k_slots, v_slots = vsa_kernels.to_slots_qkv(
+            q, k, v, layout.slot_row, layout.row_slot)
+    else:
+        q_slots, k_slots, v_slots = (
+            vsa_kernels.to_slots(x, layout.slot_row, layout.row_slot) for x in (q, k, v))
     fine, coarse = _attention_slots(q_slots, k_slots, v_slots, layout, scale=scale)
-    out = vsa_kernels.from_slots(fine, layout.slot_row, layout.row_slot)
+    out = fine if layout.slots_are_input else vsa_kernels.from_slots(
+        fine, layout.slot_row, layout.row_slot)
     if coarse is not None:
         out = vsa_kernels.fine_coarse_gate_add(
             out, gate, coarse, layout.row_coarse, layout.coarse_rows)

@@ -49,6 +49,14 @@ or keyframe segments. Video sizes are `(F, H, W)` token grids in raster order;
 `F=1` is an image. Other segment kinds take token counts and use `sparsity=None`.
 Reuse the layout across layers with the same geometry and settings.
 
+For training with tokens already in block order, pass `input_order="block"`
+to `build_vsa_layout`. Inputs and outputs contain only valid tokens, with no
+padding. Each sample uses dense blocks first, followed by 4×4×4 video tiles.
+`layout.input_rows` maps this order to the original raster stream; apply the
+same order to Q/K/V, gate and position coordinates once at the model boundary.
+The attention path only adds/removes padding, packs Q/K/V together, and
+skips those copies when all blocks are full. See [the input contract](docs/block_major.md).
+
 Add this directory to `PYTHONPATH`, or copy `vsa.py`, `vsa_layout.py` and
 `vsa_kernels.py` into your project and adjust imports.
 

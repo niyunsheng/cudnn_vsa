@@ -8,12 +8,14 @@ from flash_attn.cute.interface import flash_attn_varlen_func
 import vsa_kernels
 
 
-def _validate(q, k, v, gate):
+def _validate(q, k, v, gate, *, allow_empty=False):
     if q is None or k is None or v is None:
         raise ValueError("Q, K and V are required separate tensors")
     if gate is None:
         raise ValueError("VSA requires a gate tensor; use FA4 full attention without a gate")
-    if q.ndim != 3 or any(n <= 0 for n in q.shape):
+    if q.ndim != 3 or any(n <= 0 for n in q.shape[1:]) or (
+        q.shape[0] < 0 if allow_empty else q.shape[0] <= 0
+    ):
         raise ValueError("Q/K/V must have shape [tokens, heads, head_dim] with positive dimensions")
     for x in (q, k, v, gate):
         if x.shape != q.shape or x.dtype != q.dtype or x.device != q.device:
@@ -22,7 +24,10 @@ def _validate(q, k, v, gate):
             raise ValueError("Q/K/V/gate must be contiguous; materialize projections before calling attention")
 
 
-def vsa_attention(q, k, v, gate, vsa_layout, *, scale=None):
+def vsa_attention(q, k, v, gate, vsa_layout, *, scale=None, ring_cp_group=None,
+                  ring_cp_batch_p2p=None, ring_cp_bwd_bucket_size="auto",
+                  ring_cp_fwd_use_clc="auto", ring_cp_fwd_kv_splits=1,
+                  ring_cp_chunk_size=1):
     """[T,H,D] Q/K/V/gate -> O in the caller's original row order.
 
     Pass the current batch's prepared layout on every call. Q's head count must
@@ -33,7 +38,28 @@ def vsa_attention(q, k, v, gate, vsa_layout, *, scale=None):
     layout.dense_query_full controls whether dense queries bypass top-k.
     Inputs follow layout.input_order: raster or compact block-major, without
     padding. Output uses the same order; Q/K/V/gate must share that order.
+    With an explicit ring_cp_group, use build_ring_vsa_layout and supply its
+    local THD rows. Ulysses transformations, if any, remain caller-owned.
+    ring_cp_batch_p2p=None chooses batched P2P for device-bound groups and
+    individual P2P for lazy groups; a bool explicitly selects either mode.
+    ring_cp_bwd_bucket_size="auto" uses a measured SM100 tuning choice where
+    available; None retains cuDNN's default and a positive int overrides it.
+    ring_cp_fwd_use_clc="auto" and None use the backend scheduling policy;
+    a bool selects CLC or static scheduling.
+    ring_cp_fwd_kv_splits controls forward KV splitting (default 1).
+    ring_cp_chunk_size coalesces 1, 2 or 4 adjacent KV shards per BSA call.
     """
+    if ring_cp_group is not None:
+        from vsa_ring import ring_vsa_attention
+        return ring_vsa_attention(q, k, v, gate, vsa_layout, ring_cp_group,
+                                 scale=scale, batch_p2p=ring_cp_batch_p2p,
+                                 bwd_bucket_size=ring_cp_bwd_bucket_size,
+                                 fwd_use_clc=ring_cp_fwd_use_clc,
+                                 fwd_kv_splits=ring_cp_fwd_kv_splits,
+                                 chunk_size=ring_cp_chunk_size)
+    from vsa_layout import RingVSALayout
+    if isinstance(vsa_layout, RingVSALayout):
+        raise ValueError("RingVSALayout requires an explicit ring_cp_group")
     _validate(q, k, v, gate)
     layout = vsa_layout
     if q.shape[0] != layout.tokens:

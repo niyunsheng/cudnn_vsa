@@ -115,6 +115,54 @@ A sample whose segments all have `sparsity=None` uses **full attention through
 BSA**, with no coarse branch. This is how the independent images above are
 handled; a dense image inside a VSA sample still participates in coarse.
 
+## Ring context parallelism
+
+An optional `ring_cp_group` distributes VSA across sequence shards. The caller
+owns the process group and any Ulysses all-to-all before/after this call.
+Every peer must own the same attention heads.
+
+```python
+from vsa_layout import build_ring_vsa_layout
+
+layout = build_ring_vsa_layout(
+    samples, head_num=2,
+    ring_size=ring_group.size(), ring_rank=ring_group.rank(), device="cuda",
+    input_order="block",
+)
+# Q/K/V/gate are compact owned-block rows, without padding.
+# input_rows maps them to original global coordinates for positions/reference.
+out = vsa_attention(q, k, v, gate, layout, ring_cp_group=ring_group)
+```
+
+Complete 64-token blocks are assigned cyclically across peers. THD samples
+remain isolated; ragged lengths, partial blocks and empty local partitions
+are represented by the layout. Output and gradients preserve local input
+order. Passing `ring_cp_group=None` retains single-device behavior.
+`input_order="raster"` remains available for existing restricted-raster callers.
+See [ring layout and algorithm](docs/ring_cp.md) for the ownership contract.
+Compact inputs pass the complete numerical/group/graph suite. Same-allocation
+comparisons improve 64k total MFU by 2.4–2.9%; 720p30s/ring8 stays near
+17.0–17.2%, below the parent's approximately 20.3% no-ring target.
+See the [compact-input results](docs/ring_cp_benchmark.md#compact-block-major-child-branch).
+The prior raster-input ring baseline passes output/gradient and changed-input CUDA Graph checks for single,
+packed, ragged, dense-only and empty-peer cases on GB200.
+The initial 64k/H2/ring8 implementation reaches 2.04 ms (single sample) and
+1.83 ms (packed THD) for complete forward/backward, or 5.05%/2.80%
+attention-core MFU. See [ring measurements and scope](docs/ring_cp_benchmark.md).
+For the 720p30s workload, a caller-created high-priority NCCL group improves
+overlap. The benchmark document compares forward and backward separately
+with the historical 720p5s single-device baseline. Group setup and optional
+window/scheduler controls are documented in [the ring design](docs/ring_cp.md).
+The performance table below describes the existing single-device operator.
+
+```bash
+torchrun --standalone --nproc-per-node=8 --module benchmark.ring --input-order block
+```
+
+This validates small native references and 65,536-token H2 single/packed cases,
+then measures complete forward/backward CUDA Graph latency. Distributed MFU
+uses the slowest rank and all eight GPUs' dense BF16 peak.
+
 ## Performance
 
 The benchmark uses the sample above: 121 frames,

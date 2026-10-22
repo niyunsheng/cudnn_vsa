@@ -1,4 +1,6 @@
 """THD ownership and global routing contracts, without distributed execution."""
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -18,21 +20,17 @@ PACK = (
 
 @pytest.mark.parametrize("size", [1, 2, 8, 64])
 @pytest.mark.parametrize("dense_query_full", [False, True])
-@pytest.mark.parametrize("input_order", ["raster", "block"])
-def test_thd_partition(size, dense_query_full, input_order):
+def test_thd_partition(size, dense_query_full):
     full = build_vsa_layout(PACK, head_num=2, dense_query_full=dense_query_full)
     owners, seen = [], []
     for rank in range(size):
         local = build_ring_vsa_layout(PACK, head_num=2, ring_size=size, ring_rank=rank,
-                                     dense_query_full=dense_query_full, input_order=input_order)
+                                     dense_query_full=dense_query_full)
         ids = local.block_ids[local.block_ids >= 0]
         assert ids.tolist() == list(range(rank, full.blocks, size))
-        if input_order == "raster":
-            assert local.input_rows.tolist() == sorted(local.input_rows.tolist())
-            assert not local.slots_are_input
-        else:
-            assert local.slot_row[local.slot_row >= 0].tolist() == list(range(local.tokens))
-            assert local.slots_are_input == (local.tokens == local.padded_tokens)
+        assert local.input_order == "block"
+        assert local.slot_row[local.slot_row >= 0].tolist() == list(range(local.tokens))
+        assert local.slots_are_input == (local.tokens == local.padded_tokens)
         assert local.padded_tokens == ((full.blocks + size - 1) // size) * 64
         valid = local.slot_row >= 0
         original_slots = torch.full_like(local.slot_row, -1)
@@ -84,19 +82,17 @@ def test_global_topk_and_peer_lists(dense_query_full):
                 assert sorted(gathered) == sorted(actual[0, head, row, :n].tolist())
 
 
-@pytest.mark.parametrize("input_order", ["raster", "block"])
-def test_64k_h2_ring8(input_order):
+def test_64k_h2_ring8():
     samples = [[Segment("video", (16, 60, 64), .9), Segment("text", 4096)]]
     for rank in range(8):
-        local = build_ring_vsa_layout(samples, head_num=2, ring_size=8, ring_rank=rank,
-                                     input_order=input_order)
+        local = build_ring_vsa_layout(samples, head_num=2, ring_size=8, ring_rank=rank)
         assert local.global_tokens == 65536
         assert local.tokens == 8192
         assert local.blocks == 128
         assert local.coarse_max_q == 128
         assert local.coarse_max_kv == 1024
         assert torch.all(local.routing_counts == 160)
-        assert local.slots_are_input == (input_order == "block")
+        assert local.slots_are_input
 
 
 @pytest.mark.parametrize("size,rank", [(0, 0), (8, 8), (8, -1), (True, 0)])
@@ -105,7 +101,18 @@ def test_invalid_group_shape(size, rank):
         build_ring_vsa_layout(PACK, head_num=2, ring_size=size, ring_rank=rank)
 
 
-@pytest.mark.parametrize("order", ["slots", "", None, 1])
+@pytest.mark.parametrize("order", ["raster", "slots", "", None, 1])
 def test_invalid_input_order(order):
     with pytest.raises(ValueError, match="input_order"):
         build_ring_vsa_layout(PACK, head_num=2, ring_size=8, ring_rank=0, input_order=order)
+
+
+def test_size_one_ring_is_still_compact_block_order():
+    ring = build_ring_vsa_layout(PACK, head_num=2, ring_size=1, ring_rank=0)
+    single = build_vsa_layout(PACK, head_num=2, input_order="block")
+    for name in ("input_rows", "slot_row", "row_slot", "block_sizes"):
+        torch.testing.assert_close(getattr(ring, name), getattr(single, name), rtol=0, atol=0)
+    with pytest.raises(ValueError, match='input_order must be "block"'):
+        build_ring_vsa_layout(PACK, head_num=2, ring_size=1, ring_rank=0, input_order="raster")
+    with pytest.raises(ValueError, match='input_order must be "block"'):
+        replace(ring, input_order="raster")

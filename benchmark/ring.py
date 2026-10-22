@@ -238,7 +238,8 @@ def main():
     parser.add_argument("--cases", nargs="+", choices=CASES,
                         default=["ragged", "empty_peers", "dense", "single64k", "thd64k"])
     parser.add_argument("--heads", type=int, default=2)
-    parser.add_argument("--input-order", choices=("raster", "block"), default="raster")
+    parser.add_argument("--input-order", choices=("block",), default="block",
+                        help="Ring inputs must contain compact owned blocks without padding")
     transport = parser.add_mutually_exclusive_group()
     transport.add_argument("--batch-p2p", action="store_true", default=None)
     transport.add_argument("--unbatched-p2p", dest="batch_p2p", action="store_false")

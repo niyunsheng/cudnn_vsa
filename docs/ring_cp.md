@@ -1,8 +1,9 @@
 # Ring context parallelism
 
 The operator supports single-device and ring execution through one public
-`vsa_attention` entry. Both use the same attention math and compact/raster
-input contract.
+`vsa_attention` entry. Both use the same attention math. The non-ring path
+accepts original FHW/raster or compact block inputs, while an explicit ring
+requires compact block inputs, even when its size is one.
 
 ## Module responsibilities
 
@@ -36,8 +37,29 @@ After A2A, each rank has all rows for its ring coordinate and `H/U` heads.
 Q, K, V and the elementwise gate must use this same local THD ordering. The
 output uses that ordering, so the external inverse A2A can restore the
 projection's distribution. The caller may prepare this distribution at the
-data/projection boundary rather than gathering a full sequence in each
-attention layer.
+dataset/model boundary. The one-time FHW-to-block token reorder happens
+before the entire VSA stack and is outside this library. Dataset sharding
+must assign whole blocks to the ring coordinates at that boundary; padding
+is introduced only inside each attention call, never in these input tensors.
+The block order is maintained across layers.
+
+## Input order and slot conversion
+
+`layout.input_order` is explicit metadata, not inferred from tensor shape.
+`build_vsa_layout` keeps the original non-ring default `"raster"`: samples
+and segments follow their declared order, and video rows follow FHW. Its
+`slot_row` map performs the FHW-to-slot permutation and padding each call.
+With `input_order="block"`, this non-ring builder instead describes already
+reordered, compact blocks; `slot_row` only inserts padding. Both paths restore
+the supplied order for outputs and gradients.
+
+`build_ring_vsa_layout` defaults to and only accepts `input_order="block"`.
+The same applies to `RingVSALayout`, including size-one rings. Its valid
+`slot_row` entries are consecutive local input rows: no FHW permutation is
+performed. Both layout types expose `slots_are_input` to skip slot copies
+for fully populated block inputs. Partial/dummy blocks still get internal
+zero padding. Global sample and segment metadata remains in original raster
+coordinates; `input_rows` maps each supplied token to those coordinates.
 
 ## Packed THD ownership
 
@@ -54,8 +76,9 @@ by owned block ID, with each block's valid tokens adjacent and no padding.
 `input_rows` still maps these local rows to the original global raster
 coordinates. Slot conversion only adds/removes padding; Q/K/V padding and
 its adjoint share a fused kernel, and complete physical blocks skip copying.
-The default `input_order="raster"` preserves the previous restricted
-sample/segment/raster order and its permutation path.
+Ring raster inputs are rejected. The caller supplies this ordering after
+one-time preprocessing and whole-block dataset sharding, not a contiguous
+slice of the original FHW sequence.
 Different ranks can have different valid token counts. Communication uses
 `ceil(global_blocks/R)` physical blocks per rank, with zero-filled dummy
 blocks. Real partial blocks retain their original valid-token counts.
@@ -155,6 +178,13 @@ are not part of this API because no stable total-time benefit was established.
 
 ## Validation and performance
 
+The block-only ring input contract passes 122 CPU tests (50 CUDA/optional
+skips), including rejection of ring raster inputs and equivalence of the
+size-one ring and non-ring compact maps. Non-ring CUDA tests exercise both
+input orders against native math and original/changed-input graph replay.
+The current GPU run (SLURM 8159648) is queued; the results below belong to
+the earlier shared-core revision, before ring raster inputs were removed.
+
 Initial target: BF16, D128, H2, R8, 65,536 valid global tokens. The single
 sample is a 16x60x64 video plus 4096 text tokens at video sparsity 0.9.
 The packed case has two independent video/text samples and one independent
@@ -234,8 +264,9 @@ torchrun --standalone --nproc-per-node=8 --module benchmark.ring \
   --cases single720p30s thd720p30s --warmup 30 --repeats 500
 ```
 
-Use `--eager-group` to exercise device-bound batched P2P and
-`--input-order raster` to validate restricted raster rows. For multiple nodes, replace
+Use `--eager-group` to exercise device-bound batched P2P. Non-ring FHW and
+block order are both covered by `tests/test_block_major.py`; the ring driver
+only accepts `--input-order block` (also its default). For multiple nodes, replace
 `--standalone` with torchrun rendezvous arguments. Each result records source
 hashes, numerical checks and graph checks; numerical failures stop timing.
 

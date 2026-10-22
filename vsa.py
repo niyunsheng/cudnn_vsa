@@ -26,9 +26,12 @@ def vsa_attention(q, k, v, gate, vsa_layout, *, scale=None, ring_cp_group=None,
                   ring_cp_batch_p2p=None, ring_cp_bwd_bucket_size="auto"):
     """CUDA BF16 [T,H,128] Q/K/V/gate -> output in the supplied token order.
 
-    Reuse the current geometry's layout across layers. Both raster and compact
-    block inputs contain valid tokens only; this entry owns all slot padding.
-    An explicit ring group requires build_ring_vsa_layout and its local rows.
+    Reuse the current geometry's layout across layers. Non-ring calls accept
+    original FHW/raster or compact block inputs as declared by input_order.
+    An explicit ring group requires build_ring_vsa_layout and compact local
+    block rows, even for a size-one group. Inputs never contain padding;
+    this entry owns slot padding. A one-time FHW-to-block reorder before the
+    VSA stack and whole-block dataset sharding belong to the caller.
     The caller owns groups and any external Ulysses transformations.
 
     batch_p2p=None selects batched P2P for device-bound groups and individual

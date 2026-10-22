@@ -75,6 +75,9 @@ class VSALayout:
     Construction lives in build_vsa_layout. __post_init__ builds contiguous
     BSA routing templates for head_num heads and inverse coarse-row groups.
     Dynamic Q/K routing lives in vsa_core.route and does not modify these templates.
+    input_order="raster" means original sample/segment order (FHW for video):
+    slot conversion permutes and pads. "block" means compact canonical blocks:
+    slot conversion only pads, or is an identity when every block is full.
     """
     samples: tuple[tuple[Segment, ...], ...]
     head_num: int
@@ -96,6 +99,8 @@ class VSALayout:
 
     def __post_init__(self):
         """Build routing templates and coarse-row groups before attention runs."""
+        if self.input_order not in ("raster", "block"):
+            raise ValueError('input_order must be "raster" or "block"')
         if not isinstance(self.head_num, int) or isinstance(self.head_num, bool) or self.head_num <= 0:
             raise ValueError("head_num must be a positive integer")
         if not isinstance(self.dense_query_full, bool):
@@ -255,9 +260,12 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
                      input_order="raster") -> VSALayout:
     """Public layout builder: ordered samples of Segments -> VSALayout.
 
-    input_order="raster" concatenates samples/segments in their original order.
+    input_order="raster" (the non-ring default) concatenates samples/segments
+    in their original order, with FHW raster order inside each video.
     input_order="block" accepts valid rows in canonical block order without
-    padding. input_rows maps either ordering to the original raster stream.
+    padding; the caller reorders once before the stack of VSA layers.
+    input_rows maps either ordering to the original raster stream. The layout
+    records the input order explicitly; it is never inferred from tensor shape.
     Samples never attend to each other.
     Each sample requires at least one video segment. None sparsity preserves
     segment-internal row order and adds only padding, regardless of frame count.
@@ -307,7 +315,10 @@ class RingVSALayout:
     """Packed THD ownership after any external Ulysses all-to-all.
 
     ``input_rows`` indexes the original global sample-major raster stream.
-    All other row maps index the rank's compact THD input. Communication
+    input_order is always "block": valid tokens of each owned block are
+    adjacent, with no input padding. All other row maps index this compact
+    THD input. Slot conversion only adds padding; it never reorders FHW.
+    Communication
     buffers have ``blocks * 64`` rows, including any dummy trailing block.
     """
     samples: tuple
@@ -338,8 +349,12 @@ class RingVSALayout:
     coarse_rows: torch.Tensor
     dense_only: bool
     dense_query_full: bool
-    input_order: str = "raster"
+    input_order: str = "block"
     _runtime: dict = field(default_factory=dict, repr=False)
+
+    def __post_init__(self):
+        if self.input_order != "block":
+            raise ValueError('Ring input_order must be "block" (compact, without padding)')
 
     @property
     def tokens(self):
@@ -359,18 +374,19 @@ class RingVSALayout:
 
 
 def build_ring_vsa_layout(samples, *, head_num, ring_size, ring_rank,
-                          dense_query_full=False, device="cpu", input_order="raster") -> RingVSALayout:
+                          dense_query_full=False, device="cpu", input_order="block") -> RingVSALayout:
     """Distribute complete sample-local VSA blocks cyclically across a ring.
 
     This builder requires no distributed initialization. Pass group-local rank
     and size, then pass that same explicit process group to ``vsa_attention``.
     A peer can own no rows of a particular sample, or even no real blocks.
-    "block" accepts compact owned-block order without padding; "raster" keeps
-    original raster order restricted to owned blocks. input_rows maps either
-    local ordering to global raster coordinates.
+    Only input_order="block" is supported, including a size-one ring. Reorder
+    FHW tokens once outside this library before the VSA stack and distribute
+    whole blocks at the dataset/model boundary. Inputs are compact owned-block
+    rows without padding; input_rows maps them to global raster coordinates.
     """
-    if input_order not in ("raster", "block"):
-        raise ValueError('input_order must be "raster" or "block"')
+    if input_order != "block":
+        raise ValueError('Ring input_order must be "block" (compact, without padding)')
     for name, number, minimum in (("head_num", head_num, 1), ("ring_size", ring_size, 1),
                                   ("ring_rank", ring_rank, 0)):
         if isinstance(number, bool) or not isinstance(number, int) or number < minimum:
@@ -384,10 +400,11 @@ def build_ring_vsa_layout(samples, *, head_num, ring_size, ring_rank,
     capacity = (total + ring_size - 1) // ring_size
     owned = list(range(ring_rank, total, ring_size))
     input_rows = [row for bid in owned for row in global_rows[bid]]
-    if input_order == "raster":
-        input_rows.sort()
-    local_row = {row: i for i, row in enumerate(input_rows)}
-    blocks = [[local_row[row] for row in global_rows[bid]] for bid in owned]
+    blocks, offset = [], 0
+    for bid in owned:
+        length = len(global_rows[bid])
+        blocks.append(list(range(offset, offset + length)))
+        offset += length
     blocks += [[] for _ in range(capacity - len(blocks))]
     slots = [row for rows in blocks for row in rows + [-1] * (BLOCK - len(rows))]
     inverse = [0] * len(input_rows)

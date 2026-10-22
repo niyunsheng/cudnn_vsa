@@ -24,6 +24,9 @@ def test_compact_mapping(samples, cpu_kernels):
     raster = build_vsa_layout(samples, head_num=2)
     block = build_vsa_layout(samples, head_num=2, input_order="block")
     rows = block.input_rows
+    assert raster.input_order == "raster" and block.input_order == "block"
+    assert raster.input_rows.tolist() == list(range(raster.tokens))
+    assert not raster.slots_are_input  # Even full FHW blocks need a permutation.
     assert rows.sort().values.tolist() == list(range(raster.tokens))
     assert block.slot_row[block.slot_row >= 0].tolist() == list(range(block.tokens))
     assert block.sample_lengths == raster.sample_lengths
@@ -69,7 +72,7 @@ def test_native_reference(samples, dense_query_full, cpu_kernels):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("samples", CASES)
 @pytest.mark.parametrize("dense_query_full", [False, True])
-def test_cuda_order_and_graph(samples, dense_query_full):
+def test_cuda_orders_and_graph(samples, dense_query_full):
     from benchmark.utils import capture_graph, similarity
 
     raster = build_vsa_layout(samples, head_num=2, dense_query_full=dense_query_full, device="cuda")
@@ -78,22 +81,23 @@ def test_cuda_order_and_graph(samples, dense_query_full):
     torch.manual_seed(612)
     xs = [torch.randn(raster.tokens, 2, 128, device="cuda", dtype=torch.bfloat16,
                       requires_grad=True) for _ in range(4)]
-    bx = [x.detach()[block.input_rows].requires_grad_() for x in xs]
     dy = torch.randn_like(xs[0])
     expected = reference_pack(samples, raster.sample_slices,
                               dense_query_full=dense_query_full)(*xs)
-    fn = functools.partial(vsa_attention, vsa_layout=block)
-    actual = fn(*bx)
     want = torch.autograd.grad(expected, xs, dy)
-    got = torch.autograd.grad(actual, bx, dy[block.input_rows])
-    for a, b in zip((actual, *got), (expected, *want)):
-        metrics = similarity(a, b[block.input_rows])
-        assert min(metrics["cosine"], metrics["tensor_similarity"]) >= .99999, metrics
-    # Reference outputs retain AccumulateGrad nodes on the default stream.
-    # Capture must own fresh leaves whose autograd nodes are created on its
-    # warmup/capture stream, as in the distributed graph validation.
-    graph_inputs = [x.detach().clone().requires_grad_() for x in bx]
-    capture_graph(fn, graph_inputs, dy[block.input_rows], 3, 1e-5)
+    for layout in (raster, block):
+        rows = layout.input_rows
+        inputs = [x.detach()[rows].requires_grad_() for x in xs]
+        fn = functools.partial(vsa_attention, vsa_layout=layout)
+        actual = fn(*inputs)
+        got = torch.autograd.grad(actual, inputs, dy[rows])
+        for a, b in zip((actual, *got), (expected, *want)):
+            metrics = similarity(a, b[rows])
+            assert min(metrics["cosine"], metrics["tensor_similarity"]) >= .99999, metrics
+        # Capture owns fresh leaves; reference autograd nodes live on the
+        # default stream rather than the graph's warmup/capture stream.
+        graph_inputs = [x.detach().clone().requires_grad_() for x in inputs]
+        capture_graph(fn, graph_inputs, dy[rows], 3, 1e-5)
 
 
 @pytest.mark.cuda

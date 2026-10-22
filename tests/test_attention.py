@@ -3,9 +3,10 @@ from functools import partial
 
 import pytest
 import torch
-import vsa as core
+import vsa_core as core
 import vsa_kernels
-from vsa import route, vsa_attention
+from vsa import vsa_attention
+from vsa_core import route
 from vsa_layout import Segment, build_vsa_layout
 
 from tests import reference
@@ -163,7 +164,7 @@ def test_gpu_backend_never_silently_falls_back():
 
 @pytest.mark.parametrize("scale", [None, .2])
 def test_coarse_uses_one_fa4_varlen_call(monkeypatch, scale):
-    import vsa as core
+    import vsa_core as core
 
     layout = build_vsa_layout([
         [Segment("video", (4, 4, 8), .5), Segment("text", 3)],
@@ -185,6 +186,23 @@ def test_coarse_uses_one_fa4_varlen_call(monkeypatch, scale):
     assert kwargs["max_seqlen_q"] == kwargs["max_seqlen_k"] == 3
     assert kwargs["softmax_scale"] == (128**-0.5 if scale is None else scale)
     assert kwargs["causal"] is False
+
+
+def test_coarse_preserves_asymmetric_ring_boundaries(monkeypatch):
+    cu_q = torch.tensor([0, 1, 3], dtype=torch.int32)
+    cu_kv = torch.tensor([0, 4, 7], dtype=torch.int32)
+    q = torch.randn(3, 2, 128, dtype=torch.bfloat16)
+    k, v = (torch.randn(7, 2, 128, dtype=torch.bfloat16) for _ in range(2))
+    def fake_fa4(query, key, value, **kwargs):
+        assert query is q and key is k and value is v
+        assert kwargs["cu_seqlens_q"] is cu_q
+        assert kwargs["cu_seqlens_k"] is cu_kv
+        assert (kwargs["max_seqlen_q"], kwargs["max_seqlen_k"]) == (2, 4)
+        assert kwargs["softmax_scale"] == .125
+        return query, None
+    monkeypatch.setattr(core, "flash_attn_varlen_func", fake_fa4)
+    assert core.coarse_attention(q, k, v, cu_q, 2, .125,
+                                 cu_seqlens_kv=cu_kv, max_seqlen_kv=4) is q
 
 
 @pytest.mark.parametrize("dense_query_full", [True, False])
@@ -245,7 +263,7 @@ def test_segment_sparsity_controls_kv_columns_including_cross_video_attention(de
 @pytest.mark.parametrize("frames,sizes", [(1, [64, 17, 64, 1]), (2, [64, 64, 34, 64, 1])])
 def test_none_sparsity_only_pads_and_uses_full_fine(monkeypatch, frames, sizes):
     import importlib
-    core = importlib.import_module("vsa")
+    core = importlib.import_module("vsa_core")
     layout = build_vsa_layout([(Segment("video", (frames, 9, 9), sparsity=None), Segment("text", 65))], head_num=2)
     assert layout.dense_only and layout.groups[0].video_spans == ()
     assert layout.block_sizes.tolist() == sizes
@@ -300,7 +318,7 @@ def test_numeric_sparsity_enables_image_vsa(sparsity, keep):
 def test_bsa_forward_backward_contract(monkeypatch, full):
     from types import SimpleNamespace
 
-    import vsa as core
+    import vsa_core as core
 
     sizes = None if full else torch.tensor([63], dtype=torch.int32)
     index = torch.zeros((1, 2, 1, 1), dtype=torch.int32)

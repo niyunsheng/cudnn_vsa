@@ -49,8 +49,33 @@ or keyframe segments. Video sizes are `(F, H, W)` token grids in raster order;
 `F=1` is an image. Other segment kinds take token counts and use `sparsity=None`.
 Reuse the layout across layers with the same geometry and settings.
 
-Add this directory to `PYTHONPATH`, or copy `vsa.py`, `vsa_layout.py` and
-`vsa_kernels.py` into your project and adjust imports.
+`layout.input_order` explicitly declares the token order; tensor shape does
+not determine it. The single-device default remains compatible with main:
+
+| Execution | `input_order` | Input tokens | Slot conversion |
+| --- | --- | --- | --- |
+| No ring | `"raster"` (default) | Original sample/segment order, video in FHW order | Reorder into blocks and add padding |
+| No ring | `"block"` | Compact canonical blocks, no padding | Add padding only; skip copies for full blocks |
+| Explicit ring, including size one | `"block"` (required/default) | Compact owned blocks, no padding | Add padding only; skip copies for full blocks |
+
+For training with tokens already in block order, pass `input_order="block"`
+to `build_vsa_layout`. Inputs and outputs contain only valid tokens, with no
+padding. Each sample uses dense blocks first, followed by 4×4×4 video tiles.
+`layout.input_rows` maps this order to the original raster stream; apply the
+same order to Q/K/V, gate and position coordinates once at the model boundary.
+The one-time FHW-to-block token reorder happens before the entire VSA stack,
+outside this library. Keep that order across VSA layers. For ring execution,
+the dataset/model boundary must shard by whole blocks using the layout's
+ownership rule, preserving each partial block's valid length and adding no
+padding. Equal token slices of the original FHW sequence do not implement it.
+The attention path only adds/removes padding, packs Q/K/V together, and
+skips those copies when all blocks are full. The same permutation must apply to
+dO; padding is always zeroed inside the operator. Sample/segment boundaries
+remain those of the original raster stream. See [the layout contract](docs/ring_cp.md).
+
+Add this directory to `PYTHONPATH`, or copy `vsa.py`, `vsa_core.py`,
+`vsa_layout.py` and `vsa_kernels.py` into your project and adjust imports. Include `vsa_ring.py`
+when using ring context parallelism.
 
 ## Attention semantics
 
@@ -106,6 +131,61 @@ from **all segments**, producing `fine + gate * coarse[its_block]` per token.
 A sample whose segments all have `sparsity=None` uses **full attention through
 BSA**, with no coarse branch. This is how the independent images above are
 handled; a dense image inside a VSA sample still participates in coarse.
+
+## Ring context parallelism
+
+An optional `ring_cp_group` distributes VSA across sequence shards. The caller
+owns the process group and any Ulysses all-to-all before/after this call.
+Every peer must own the same attention heads.
+
+```python
+from vsa_layout import build_ring_vsa_layout
+
+layout = build_ring_vsa_layout(
+    samples, head_num=2,
+    ring_size=ring_group.size(), ring_rank=ring_group.rank(), device="cuda",
+    input_order="block",
+)
+# Q/K/V/gate are compact owned-block rows, without padding.
+# input_rows maps them to original global coordinates for positions/reference.
+out = vsa_attention(q, k, v, gate, layout, ring_cp_group=ring_group)
+```
+
+Whole blocks of up to 64 valid tokens are assigned cyclically across peers. THD samples
+remain isolated; ragged lengths, partial blocks and empty local partitions
+are represented by the layout. Output and gradients preserve local input
+order. Passing `ring_cp_group=None` retains single-device behavior with either
+input order. Ring layouts reject `input_order="raster"`, including size-one
+groups: they expect the caller to have completed the one-time reorder and
+whole-block sharding before entering the VSA stack.
+See [ring layout and algorithm](docs/ring_cp.md) for the ownership contract.
+The public entry shares validation, padding and output merging between the
+single-device and ring paths. `vsa_core.py` owns common routing and backend
+calls; `vsa_ring.py` owns communication and distributed autograd scheduling.
+Tensor kernels live in `vsa_kernels.py`, and static metadata in `vsa_layout.py`.
+
+The input-contract update passes 122 CPU tests and 170 tests per GPU node.
+Its targeted distributed/graph run (SLURM 8159648) passes 1,088 rank/check
+records across 32 result files, with source hashes verified.
+An added six-token fine-only peer check exposes a pre-existing native-reference
+precision failure, reproduced bitwise by the old and new code; the expanded
+numerical suite is not fully passing. See the validation notes before adoption.
+
+Paired GB200 measurements of `1236082` give 720p30s/ring8 total MFU of
+17.371% (single) and 17.322% (packed), below the 20.360% single-device 720p5s
+measurement. Total MFU stays close to the pre-refactor revision; some backward
+phase measurements decline, so there is no universal no-regression claim.
+See [validation, measurement scope and reproduction](docs/ring_cp.md#validation-and-performance).
+
+```bash
+torchrun --standalone --nproc-per-node=8 --module benchmark.ring --input-order block
+```
+
+This validates small native references and 65,536-token H2 single/packed cases,
+then measures complete forward/backward CUDA Graph latency. Use
+`--cases ragged empty_peers fine_only_peer dense` for a small distributed
+regression, including ranks with only fine queries and ignored nonfinite gates. Distributed MFU
+uses the slowest rank and all eight GPUs' dense BF16 peak.
 
 ## Performance
 

@@ -182,8 +182,18 @@ The block-only ring input contract passes 122 CPU tests (50 CUDA/optional
 skips), including rejection of ring raster inputs and equivalence of the
 size-one ring and non-ring compact maps. Non-ring CUDA tests exercise both
 input orders against native math and original/changed-input graph replay.
-The current GPU run (SLURM 8159648) is queued; the results below belong to
-the earlier shared-core revision, before ring raster inputs were removed.
+SLURM 8159648 validates the contract revision `cb9c054`: 170 unit tests pass
+per GPU node (two optional skips), and 32 distributed result files contain
+1,088 passing rank/check records, minimum similarity 0.9999916846. Groups
+1/2/4/8 use the default block order; eager groups explicitly request block.
+Both policies cover ragged, empty-peer and dense packs, plus single/packed
+64k on R8, retained backward and original/changed-input graphs. Source
+hashes and software versions match across all files. The job exits 0.
+
+This targeted contract run does not remeasure the known `fine_only_peer`
+precision limit or the long A/B/B/A performance gate. Those results below
+belong to the earlier shared-core revision, before ring raster inputs were
+removed; the numerical limitation remains unresolved.
 
 Initial target: BF16, D128, H2, R8, 65,536 valid global tokens. The single
 sample is a 16x60x64 video plus 4096 text tokens at video sparsity 0.9.

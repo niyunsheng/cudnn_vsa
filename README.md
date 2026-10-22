@@ -164,9 +164,9 @@ single-device and ring paths. `vsa_core.py` owns common routing and backend
 calls; `vsa_ring.py` owns communication and distributed autograd scheduling.
 Tensor kernels live in `vsa_kernels.py`, and static metadata in `vsa_layout.py`.
 
-The input-contract update passes 122 CPU tests; its GPU run is queued
-(SLURM 8159648). The earlier shared-core revision `1236082` passed 129 CPU
-tests and 177 tests per GPU node.
+The input-contract update passes 122 CPU tests and 170 tests per GPU node.
+Its targeted distributed/graph run (SLURM 8159648) passes 1,088 rank/check
+records across 32 result files, with source hashes verified.
 An added six-token fine-only peer check exposes a pre-existing native-reference
 precision failure, reproduced bitwise by the old and new code; the expanded
 numerical suite is not fully passing. See the validation notes before adoption.

@@ -1,10 +1,26 @@
 # Ring context parallelism
 
-This branch is based on `codex/block-major-input` (`0a14382`). It ports the
-validated ring implementation from `1f8ed95`, retaining its communication,
-attention, reduction and scheduling logic. Compact block-order metadata
-and the parent's padding/no-copy paths are the new integration points.
-The default raster API remains compatible with the measured ring baseline.
+The operator supports single-device and ring execution through one public
+`vsa_attention` entry. Both use the same attention math and compact/raster
+input contract.
+
+## Module responsibilities
+
+- `vsa.py`: input/group-layout validation, Q/K/V slot conversion, dispatch,
+  row restoration and gated coarse merge.
+- `vsa_core.py`: shared per-region top-k routing, cuDNN BSA and FA4 calls,
+  and the single-device slot-attention autograd path.
+- `vsa_ring.py`: caller-group runtime, P2P scheduling, differentiable mean
+  gather, and ring fine-attention forward/backward.
+- `vsa_kernels.py`: slot maps, shared FP32 pooling, peer-list compaction,
+  online-softmax merge, FP32 gradient accumulation and gate kernels.
+- `vsa_layout.py`: sample geometry, whole-block ownership and static maps.
+
+The core and kernels do not import the public entry. Backends return fine
+slots and optional coarse output; only the entry converts user rows. Ring
+peers without coarse queries retain a zero-valued dependency on gathered
+means so every peer executes reduce-scatter in backward. The entry also
+preserves zero gate gradients on these fine-only rows, including NaN gates.
 
 ## Boundary
 
@@ -85,18 +101,18 @@ carrying the compacted count between chunks and visiting only a row's valid
 input entries. This bounds scan state when a few dense queries make the
 shared list capacity much wider than most sparse rows. Unused output entries
 are zeroed, including empty rows and output lists spanning multiple chunks.
-Peer metadata bases are 16-byte aligned, even
-when a rank has an odd number of blocks. Fine attention keeps Q local and circulates BF16 KV, prefetching the
+Peer metadata bases are 16-byte aligned, even when a rank has an odd number
+of blocks. Fine attention keeps Q local and circulates BF16 KV, prefetching the
 next shard while the current BSA call runs. Merge partial O and LSE in FP32.
 Each block is visited once; the forward saves local Q, the final received
-KV window, global fine O/LSE, and the selected block lists.
+KV shard, global fine O/LSE, and the selected block lists.
 
-Fine backward starts from the saved final window and traverses the ring in
+Fine backward starts from the saved final shard and traverses the ring in
 reverse with the final fine O/LSE and local dO. Accumulate dQ in FP32.
 Pipeline the next KV transfer with the previous step's FP32 dK/dV
-accumulation transfer. The last window belongs to this rank, so no final
-gradient-return hop or backward window-building prefix is required.
-Ping-pong receives use a clone of the saved window to preserve repeated
+accumulation transfer. The last shard belongs to this rank, so no final
+gradient-return hop or backward KV exchange prefix is required.
+Ping-pong receives use a clone of the saved shard to preserve repeated
 backward with `retain_graph=True`. The coarse branch and gate retain their
 existing mathematical meaning. No derivative flows through top-k.
 
@@ -132,35 +148,10 @@ KV-gradient tasks, at the cost of additional partial gradient accumulation;
 the fastest size varies with sample geometry. This entry is intentionally
 limited to the measured shape.
 
-Forward scheduling can be compared separately using
-`ring_cp_fwd_use_clc`: `"auto"` currently delegates to cuDNN,
-`None` delegates to cuDNN, and `True`/`False` selects CLC/static scheduling.
-`ring_cp_fwd_kv_splits` is an integer from 1 to 256 (default 1), passed to
-the backend's split-KV forward path. Both controls are part of the cached
-runtime key and leave the non-ring operator unchanged. All alternatives
-must pass output/gradient and changed-input graph checks before timing.
-
-`ring_cp_chunk_size` optionally coalesces 2 or 4 adjacent KV shards per
-BSA call; the default is 1 and the chunk size must divide the ring size.
-For chunk size C, rank r first receives C-1 neighboring shards through
-ordinary one-hop ring transfers. Its window contains owners
-`[r, r-1, ..., r-C+1]`. The windows then circulate by C ranks at each step,
-covering every KV owner in R/C BSA calls. Forward still transfers R-1
-shards per rank, while buffer capacity increases by C. No new groups are
-created, and original sample masks, global routing and public THD rows
-are retained. The saved backward KV window also holds C local shards;
-the default C=1 holds the same KV capacity as the original local K and V.
-
-Routing assigns a global KV block to window `(r-owner mod R)//C` and slot
-`(r-owner mod C)*local_blocks + global_block//R`. Stable compaction keeps
-the original selected-key order; it need not sort window-local IDs.
-Window block-size tables, indices and counts each use padded storage strides
-so every window base is 16-byte aligned, including odd local block counts.
-Each backward window first accumulates the Q ranks in its strided cycle,
-then adjacent cycles send their remaining components back to the original
-KV owners. Those FP32 components are summed before the final BF16 cast.
-This final cross-cycle reduction is required for correct dK/dV; simply
-changing ring hop distance would omit gradients from other Q ranks.
+The supported ring schedule circulates one KV shard per step. Forward uses
+cuDNN's default scheduler and split count. Coalesced-window and forward
+scheduler/split sweeps remain in the historical experiment revision; they
+are not part of this API because no stable total-time benefit was established.
 
 ## Validation and performance
 
@@ -182,7 +173,59 @@ communication, or redundant work as useful model FLOPs.
 Optimization is evidence driven: compare complete forward/backward time,
 then inspect traces for exposed communication, metadata preparation, pooling,
 and BSA utilization. Preserve the same sparse math and numerical thresholds.
-See [the measured validation and tuning results](ring_cp_benchmark.md).
+The pre-refactor implementation (`b4d92d3`) passed 127 CPU tests, 73 GPU
+tests per node, and 2,272 rank/check records (SLURM 8096942). Its longer
+repeat passed 1,792 records (8097850); minimum similarity was 0.9999916846.
+These historical checks do not validate changed source files.
+
+The shared-core refactor passes 129 CPU tests (50 CUDA/optional skips) and
+177 tests per GPU node (two optional skips). An added `fine_only_peer` case
+exposes an existing numerical limit: for two six-token samples at R2, the
+fine-only peer's dK similarity to native FP32 token math is 0.9999890332,
+below the unchanged 0.99999 threshold. The baseline (`b4d92d3`) and refactor
+produce bitwise-identical outputs and gradients in both ring and CP1 paths
+on this case (40 tensors, both policies, SLURM 8158744). Ring and CP1 match
+exactly; the expanded strict numerical suite is therefore not fully passing.
+The failing case remains available for reproduction and is not waived.
+
+| Historical dense-query-full workload | Forward MFU | Backward MFU | Total MFU |
+| --- | ---: | ---: | ---: |
+| Single 720p5s, no ring | 27.177% | 18.035% | 20.312% |
+| Single 720p30s, ring8 | 22.113% | 14.925% | 16.929% |
+| Packed 720p30s, ring8 | 21.988% | 14.936% | 16.906% |
+
+The no-ring row is a cross-length MFU target, not an equal-workload latency
+control. The target remains unmet. Against the old raster ring on identical
+inputs, compact inputs improve total MFU 2.38–2.89% at 64k and 0.05–0.31%
+at 720p30s. One default-policy backward point estimate is -0.12%, within
+0.35% control drift; there is no universal phase-level no-regression claim.
+External Ulysses, projections and model-boundary conversion are excluded.
+Megatron ring integration and end-to-end training validation remain separate.
+
+Detailed experimental ledgers and the source-isolated block-order driver
+are archived in the toolkit under `docs/benchmarks/dit/` and
+`scripts/dit/block_major_vsa/`. The published
+[pre-refactor ledger](https://github.com/niyunsheng/cudnn_vsa/blob/b4d92d36667981ffbdcf453b7a92d1126eb0ab96/docs/ring_cp_benchmark.md)
+retains the complete historical evidence and rejected experiments.
+
+```bash
+python -m pytest -q
+# Small native-reference, retained-backward and changed-input graph checks.
+torchrun --standalone --nproc-per-node=8 --module benchmark.ring \
+  --input-order block --cases ragged empty_peers fine_only_peer dense
+# Interleaved subgroups; repeat with --ring-size 1 and 4.
+torchrun --standalone --nproc-per-node=8 --module benchmark.ring \
+  --input-order block --ring-size 2 --dense-query-full
+# Long workload, full numerical checks before independent phase timing.
+torchrun --standalone --nproc-per-node=8 --module benchmark.ring \
+  --input-order block --high-priority-group --dense-query-full \
+  --cases single720p30s thd720p30s --warmup 30 --repeats 500
+```
+
+Use `--eager-group` to exercise device-bound batched P2P and
+`--input-order raster` to validate restricted raster rows. For multiple nodes, replace
+`--standalone` with torchrun rendezvous arguments. Each result records source
+hashes, numerical checks and graph checks; numerical failures stop timing.
 
 The long-sequence cases `single720p30s` and `thd720p30s` use a 720p,
 30-second video at 24 fps: 721 frames, temporal compression 4, and spatial

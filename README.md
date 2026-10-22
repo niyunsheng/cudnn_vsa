@@ -55,10 +55,12 @@ padding. Each sample uses dense blocks first, followed by 4×4×4 video tiles.
 `layout.input_rows` maps this order to the original raster stream; apply the
 same order to Q/K/V, gate and position coordinates once at the model boundary.
 The attention path only adds/removes padding, packs Q/K/V together, and
-skips those copies when all blocks are full. See [the input contract](docs/block_major.md).
+skips those copies when all blocks are full. The same permutation must apply to
+dO; padding is always zeroed inside the operator. Sample/segment boundaries
+remain those of the original raster stream. See [the layout contract](docs/ring_cp.md).
 
-Add this directory to `PYTHONPATH`, or copy `vsa.py`, `vsa_layout.py` and
-`vsa_kernels.py` into your project and adjust imports. Include `vsa_ring.py`
+Add this directory to `PYTHONPATH`, or copy `vsa.py`, `vsa_core.py`,
+`vsa_layout.py` and `vsa_kernels.py` into your project and adjust imports. Include `vsa_ring.py`
 when using ring context parallelism.
 
 ## Attention semantics
@@ -141,30 +143,29 @@ are represented by the layout. Output and gradients preserve local input
 order. Passing `ring_cp_group=None` retains single-device behavior.
 `input_order="raster"` remains available for existing restricted-raster callers.
 See [ring layout and algorithm](docs/ring_cp.md) for the ownership contract.
-Compact inputs pass the complete numerical/group/graph suite. Same-allocation
-comparisons improve 64k total MFU by 2.4–2.9%; 720p30s/ring8 remains near
-17%, below the parent's approximately 20.3% no-ring target. The latest
-30-warmup/500-replay A/B/B/A run measures 16.929% versus the original ring's
-16.891% for single-sample dense-query-full. All tested total MFUs improve,
-but this is not a guarantee that every phase improves on every workload.
-See the [compact-input results](docs/ring_cp_benchmark.md#compact-block-major-child-branch).
-The prior raster-input ring baseline passes output/gradient and changed-input CUDA Graph checks for single,
-packed, ragged, dense-only and empty-peer cases on GB200.
-The initial 64k/H2/ring8 implementation reaches 2.04 ms (single sample) and
-1.83 ms (packed THD) for complete forward/backward, or 5.05%/2.80%
-attention-core MFU. See [ring measurements and scope](docs/ring_cp_benchmark.md).
-For the 720p30s workload, a caller-created high-priority NCCL group improves
-overlap. The benchmark document compares forward and backward separately
-with the historical 720p5s single-device baseline. Group setup and optional
-window/scheduler controls are documented in [the ring design](docs/ring_cp.md).
-The performance table below describes the existing single-device operator.
+The public entry shares validation, padding and output merging between the
+single-device and ring paths. `vsa_core.py` owns common routing and backend
+calls; `vsa_ring.py` owns communication and distributed autograd scheduling.
+Tensor kernels live in `vsa_kernels.py`, and static metadata in `vsa_layout.py`.
+
+The shared-core refactor passes 129 CPU tests and 177 tests per GPU node.
+An added six-token fine-only peer check exposes a pre-existing native-reference
+precision failure, reproduced bitwise by the old and new code; the expanded
+numerical suite is not fully passing. See the validation notes before adoption.
+
+The pre-refactor implementation's latest 720p30s/ring8 total MFU is 16.929%
+(single) and 16.906% (packed), below the 20.312% single-device 720p5s target.
+Those are historical measurements, not a claim about unmeasured revisions.
+See [validation, measurement scope and reproduction](docs/ring_cp.md#validation-and-performance).
 
 ```bash
 torchrun --standalone --nproc-per-node=8 --module benchmark.ring --input-order block
 ```
 
 This validates small native references and 65,536-token H2 single/packed cases,
-then measures complete forward/backward CUDA Graph latency. Distributed MFU
+then measures complete forward/backward CUDA Graph latency. Use
+`--cases ragged empty_peers fine_only_peer dense` for a small distributed
+regression, including ranks with only fine queries and ignored nonfinite gates. Distributed MFU
 uses the slowest rank and all eight GPUs' dense BF16 peak.
 
 ## Performance

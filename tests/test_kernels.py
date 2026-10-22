@@ -14,6 +14,25 @@ SAMPLES = (
 )
 
 
+def test_ring_pooling_keeps_fp32_means_and_zero_dummy_gradients():
+    sizes = torch.tensor([3, 64, 0], dtype=torch.int32)
+    xs = [torch.randn(3 * 64, 2, 8, requires_grad=True) for _ in range(3)]
+    valid = torch.arange(64)[None, :] < sizes[:, None]
+    masked = [x.view(3, 64, 2, 8).masked_fill(~valid[:, :, None, None], 0).flatten(0, 1)
+              for x in xs]
+    got = vsa_kernels.ring_block_means.__wrapped__(*masked, sizes)
+    expected = tuple(torch.stack((x[:3].mean(0), x[64:128].mean(0), x[128:].sum(0)))
+                     for x in masked)
+    for actual, target in zip(got, expected):
+        assert actual.dtype == torch.float32 and torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, target)
+    grad = torch.autograd.grad(sum(x.sum() for x in got), xs)
+    for x in grad:
+        torch.testing.assert_close(x[:3], torch.full_like(x[:3], 1 / 3))
+        torch.testing.assert_close(x[64:128], torch.full_like(x[64:128], 1 / 64))
+        assert not x[3:64].count_nonzero() and not x[128:].count_nonzero()
+
+
 def test_sample_major_tiling_maps_and_gather_adjoint():
     # Unequal samples, an image with no text, and a second ragged video.
     samples = [[Segment("video", (4, 4, 8), .9), Segment("text", 3)],

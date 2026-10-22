@@ -74,7 +74,7 @@ class FastVideoReference:
 
     @torch.no_grad()
     def check_routes(self, q, k, v, layout):
-        from vsa import route
+        from vsa_core import route
         import vsa_kernels
         torch.testing.assert_close(layout.block_sizes.long(), self.meta.variable_block_sizes.long(), rtol=0, atol=0)
         torch.testing.assert_close(layout.row_slot, self.meta.untile_combined_index, rtol=0, atol=0)

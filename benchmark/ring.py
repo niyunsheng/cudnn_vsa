@@ -35,6 +35,10 @@ CASES = {
         (Segment("video", (4, 8, 12), .5), Segment("video", (5, 4, 7), .9),
          Segment("audio", 17), Segment("text", 0))),
     "empty_peers": ((Segment("video", (1, 3, 5), .9), Segment("text", 7)),),
+    # With ring_size >= 2, rank 1 owns only a fine-only sample; ranks >= 2
+    # have no valid tokens. All must participate in the coarse gather adjoint.
+    "fine_only_peer": ((Segment("video", (1, 2, 3), .5),),
+                       (Segment("video", (1, 2, 3)),)),
     "dense": ((Segment("video", (1, 9, 11)), Segment("text", 67)),
               (Segment("video", (1, 3, 5)), Segment("text", 3))),
 }
@@ -107,15 +111,14 @@ def run_case(name, args, group):
     global_xs = [torch.randn(full.tokens, args.heads, 128, device="cuda",
                             dtype=torch.bfloat16).requires_grad_() for _ in range(4)]
     global_dy = torch.randn_like(global_xs[0])
+    if name == "fine_only_peer":
+        with torch.no_grad():
+            global_xs[3][full.sample_slices[1][0]] = float("nan")
     xs = [x.detach()[local.input_rows].contiguous().requires_grad_() for x in global_xs]
     dy = global_dy[local.input_rows].contiguous()
     fn = functools.partial(vsa_attention, vsa_layout=local, ring_cp_group=group,
                            ring_cp_batch_p2p=args.batch_p2p,
-                           ring_cp_bwd_bucket_size=args.bwd_bucket_size,
-                           ring_cp_fwd_use_clc={"auto": "auto", "backend": None,
-                                               "clc": True, "static": False}[args.fwd_scheduler],
-                           ring_cp_fwd_kv_splits=args.fwd_kv_splits,
-                           ring_cp_chunk_size=args.chunk_size)
+                           ring_cp_bwd_bucket_size=args.bwd_bucket_size)
     ref = (functools.partial(vsa_attention, vsa_layout=full) if full.tokens > 4096
            else reference_pack(samples, full.sample_slices, dense_query_full=args.dense_query_full))
     if rank == 0:
@@ -136,7 +139,6 @@ def run_case(name, args, group):
         _compare(repeated, actual, args.eps), group, f"{name} retained backward")
     del repeated, repeated_grads
     record["bwd_bucket_size_effective"] = next(iter(local._runtime.values())).bwd_bucket_size
-    record["fwd_use_clc_effective"] = next(iter(local._runtime.values())).fwd_use_clc
     if rank == 0:
         minimum = min(min(m["cosine"], m["tensor_similarity"])
                       for check in checks for m in check["metrics"].values())
@@ -246,9 +248,6 @@ def main():
                         help="Create caller-owned NCCL groups with high-priority streams")
     parser.add_argument("--bwd-bucket-size", type=_bucket_argument, default="auto",
                         help="auto (default), backend, or a positive number of query blocks")
-    parser.add_argument("--fwd-scheduler", choices=("auto", "backend", "clc", "static"), default="auto")
-    parser.add_argument("--fwd-kv-splits", type=int, default=1)
-    parser.add_argument("--chunk-size", type=int, choices=(1, 2, 4), default=1)
     parser.add_argument("--ring-size", type=int,
                         help="Test interleaved subgroups instead of WORLD; must divide world size")
     parser.add_argument("--dense-query-full", action="store_true")

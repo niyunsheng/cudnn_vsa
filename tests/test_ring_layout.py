@@ -2,9 +2,10 @@
 import pytest
 import torch
 
-from vsa import route
+from vsa_core import route
 from vsa_layout import Segment, build_ring_vsa_layout, build_vsa_layout
-from vsa_ring import _partition_indices, _route
+from vsa_kernels import partition_indices
+from vsa_core import ring_route
 
 
 PACK = (
@@ -66,9 +67,9 @@ def test_global_topk_and_peer_lists(dense_query_full):
         ids = local.block_ids[local.block_ids >= 0]
         query = torch.zeros(local.blocks, heads, 128)
         query[:len(ids)] = q[ids]
-        actual = _route(query, k, local)
+        actual = ring_route(query, k, local)
         assert torch.equal(actual[:, :, :len(ids)], selected[:, :, ids])
-        indices, counts = _partition_indices(
+        indices, counts = partition_indices(
             actual, local.routing_counts, size, local.blocks)
         assert all(x.data_ptr() % 16 == 0 and x.is_contiguous()
                    for table in (indices, counts) for x in table)

@@ -74,7 +74,7 @@ class VSALayout:
 
     Construction lives in build_vsa_layout. __post_init__ builds contiguous
     BSA routing templates for head_num heads and inverse coarse-row groups.
-    Dynamic Q/K routing lives in vsa.route and does not modify these templates.
+    Dynamic Q/K routing lives in vsa_core.route and does not modify these templates.
     """
     samples: tuple[tuple[Segment, ...], ...]
     head_num: int

@@ -153,9 +153,10 @@ An added six-token fine-only peer check exposes a pre-existing native-reference
 precision failure, reproduced bitwise by the old and new code; the expanded
 numerical suite is not fully passing. See the validation notes before adoption.
 
-The pre-refactor implementation's latest 720p30s/ring8 total MFU is 16.929%
-(single) and 16.906% (packed), below the 20.312% single-device 720p5s target.
-Those are historical measurements, not a claim about unmeasured revisions.
+Paired GB200 measurements of the refactor give 720p30s/ring8 total MFU of
+17.371% (single) and 17.322% (packed), below the 20.360% single-device 720p5s
+measurement. Total MFU stays close to the pre-refactor revision; some backward
+phase measurements decline, so there is no universal no-regression claim.
 See [validation, measurement scope and reproduction](docs/ring_cp.md#validation-and-performance).
 
 ```bash

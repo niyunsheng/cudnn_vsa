@@ -173,32 +173,44 @@ communication, or redundant work as useful model FLOPs.
 Optimization is evidence driven: compare complete forward/backward time,
 then inspect traces for exposed communication, metadata preparation, pooling,
 and BSA utilization. Preserve the same sparse math and numerical thresholds.
-The pre-refactor implementation (`b4d92d3`) passed 127 CPU tests, 73 GPU
-tests per node, and 2,272 rank/check records (SLURM 8096942). Its longer
-repeat passed 1,792 records (8097850); minimum similarity was 0.9999916846.
-These historical checks do not validate changed source files.
+The shared-core refactor (`1236082`) passes 129 CPU tests (50 CUDA/optional
+skips) and 177 tests per GPU node (two optional skips). SLURM 8158753 checked
+groups 1/2/4/8, both policies, lazy/eager groups, compact/raster inputs,
+retained backward and original/changed-input graphs. Its baseline/refactor
+comparison produced 60 complete result files and 2,912 passing rank/check
+records, with minimum similarity 0.9999911026. Source hashes and software
+versions were verified across all completed files.
 
-The shared-core refactor passes 129 CPU tests (50 CUDA/optional skips) and
-177 tests per GPU node (two optional skips). An added `fine_only_peer` case
+An added `fine_only_peer` case
 exposes an existing numerical limit: for two six-token samples at R2, the
 fine-only peer's dK similarity to native FP32 token math is 0.9999890332,
 below the unchanged 0.99999 threshold. The baseline (`b4d92d3`) and refactor
 produce bitwise-identical outputs and gradients in both ring and CP1 paths
 on this case (40 tensors, both policies, SLURM 8158744). Ring and CP1 match
 exactly; the expanded strict numerical suite is therefore not fully passing.
-The failing case remains available for reproduction and is not waived.
+The case fails at R2/4/8 and in the eager-group runs under both policies.
+It remains available for reproduction and is not waived: the full job and
+analyzer return failure despite completion of the other checks and timings.
 
-| Historical dense-query-full workload | Forward MFU | Backward MFU | Total MFU |
+Paired before/after/after/before measurements use the same two-node GB200
+allocation, 30 warmups and 500 timing repeats per arm. The following values
+use the mean of the refactor's two phase medians:
+
+| Refactored dense-query-full workload | Forward MFU | Backward MFU | Total MFU |
 | --- | ---: | ---: | ---: |
-| Single 720p5s, no ring | 27.177% | 18.035% | 20.312% |
-| Single 720p30s, ring8 | 22.113% | 14.925% | 16.929% |
-| Packed 720p30s, ring8 | 21.988% | 14.936% | 16.906% |
+| Single 720p5s, no ring | 27.272% | 18.070% | 20.360% |
+| Single 720p30s, ring8 | 22.943% | 15.388% | 17.371% |
+| Packed 720p30s, ring8 | 22.804% | 15.368% | 17.322% |
+
+Against `b4d92d3` on identical inputs, total-MFU relative changes range
+from -0.140% to +0.439% for ring and -0.220% to +0.185% for CP1. Maximum
+total-time control drift is 0.158% / 0.191%, respectively. Phase-level
+results are not uniformly positive: ring backward reaches -0.203%, and
+aligned-64k CP1 backward reaches -0.730% (control drift at most 0.252%).
+The overall totals are close, but there is no universal no-regression claim.
 
 The no-ring row is a cross-length MFU target, not an equal-workload latency
-control. The target remains unmet. Against the old raster ring on identical
-inputs, compact inputs improve total MFU 2.38–2.89% at 64k and 0.05–0.31%
-at 720p30s. One default-policy backward point estimate is -0.12%, within
-0.35% control drift; there is no universal phase-level no-regression claim.
+control. The target remains unmet, including the earlier 20.312% target.
 External Ulysses, projections and model-boundary conversion are excluded.
 Megatron ring integration and end-to-end training validation remain separate.
 

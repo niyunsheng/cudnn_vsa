@@ -50,12 +50,25 @@ or keyframe segments. Video sizes are `(F, H, W)` token grids in raster order;
 `F=1` is an image. Other segment kinds take token counts and use `sparsity=None`.
 Reuse the layout across layers with the same geometry and settings.
 
+Add this directory to `PYTHONPATH`, or copy `vsa.py`, `vsa_core.py`,
+`vsa_layout.py` and `vsa_kernels.py` into your project and adjust imports.
+
+## Input order
+
 `layout.input_order` explicitly declares the token order:
 
 | `input_order` | Input tokens | Slot conversion |
 | --- | --- | --- |
 | `"raster"` (default) | Original sample/segment order, video in FHW order | Reorder into blocks and add padding |
 | `"block"` | Compact canonical blocks, no padding | Add padding only; skip copies for full blocks |
+
+### Raster input
+
+The default `input_order="raster"` accepts the original FHW sequence, as in
+the example above. `vsa_attention` reorders and pads it internally, then
+restores the output to the same raster order. No preprocessing is required.
+
+### Block input
 
 Pass `input_order="block"` to `build_vsa_layout` when the caller already
 supplies block-ordered tokens. Samples stay in declared order. Within each
@@ -65,8 +78,52 @@ within each category; blocks never cross segment or sample boundaries.
 `layout.input_rows[i]` gives the original raster row for supplied row `i`
 (an identity map for raster inputs). Apply the same ordering to Q/K/V, gate,
 positional coordinates and dO. Outputs and gradients preserve that order.
-The one-time FHW-to-block reorder belongs before the entire VSA stack, outside
-this library; inputs never contain padding. Reuse the layout across layers.
+
+For raster data, call `to_block_order` once before the entire VSA stack.
+This repository provides the fused reorder kernel separately from
+`vsa_attention`: it permutes all supplied tensors in one kernel launch,
+preserving their shapes and dtypes and adding **no padding**. Inputs that are
+already in block order go directly to attention. Keep that order across layers.
+
+Both `to_block_order` and `to_raster_order` return a tuple, including for one
+tensor. They accept contiguous CUDA `[T, ...]` tensors on the layout's device,
+with different row shapes and floating-point or integer dtypes. Use a full
+block layout before any sequence sharding. For a complete model, call
+`to_block_order(hidden_states, positions, vsa_layout=layout)` before generating
+the layers' Q/K/V/gate; those projections then inherit block order. The
+operator-level example below starts from already projected raster tensors:
+
+```python
+import torch
+from vsa import to_block_order, to_raster_order, vsa_attention
+from vsa_layout import Segment, build_vsa_layout
+
+H, D = 2, 128
+layout = build_vsa_layout(
+    [[Segment("video", (5, 9, 11), sparsity=0.9), Segment("text", 67)]],
+    head_num=H, input_order="block", device="cuda",
+)
+q, k, v, gate = [
+    torch.randn(layout.tokens, H, D, device="cuda", dtype=torch.bfloat16,
+                requires_grad=True)
+    for _ in range(4)
+]
+position_ids = torch.arange(layout.tokens, device="cuda")
+
+# One fused reorder before attention; partial blocks add no input padding.
+q, k, v, gate, position_ids = to_block_order(
+    q, k, v, gate, position_ids, vsa_layout=layout,
+)
+assert q.shape[0] == layout.tokens  # 562 valid tokens, not 1280 padded slots.
+out = vsa_attention(q, k, v, gate, layout)
+
+# Keep block order between layers; restore only if the model output needs it.
+(out_raster,) = to_raster_order(out, vsa_layout=layout)
+out_raster.backward(torch.randn_like(out_raster))
+```
+
+The reorder's backward applies the inverse permutation to gradients. The
+inverse helper restores original sample/segment/FHW order after the stack.
 
 Internally, blocks occupy 64 slots: `slot_row` maps slots to input rows, using
 `-1` for padding, and `row_slot` is the inverse map for valid rows. Block inputs
@@ -74,17 +131,14 @@ use fused Q/K/V padding and fused dQ/dK/dV restoration; padding is zero and
 excluded from means and attention. `slots_are_input` skips conversion for
 full block inputs. Full raster blocks still require the FHW permutation.
 
-Add this directory to `PYTHONPATH`, or copy `vsa.py`, `vsa_core.py`,
-`vsa_layout.py` and `vsa_kernels.py` into your project and adjust imports.
-
 ## Code structure
 
 | File | Responsibility |
 | --- | --- |
-| `vsa.py` | Public entry: validation, slot conversion, row restoration and gated coarse merge |
+| `vsa.py` | Public attention entry and explicit block/raster reorder helpers |
 | `vsa_core.py` | Per-region routing, cuDNN BSA forward/backward, FA4 coarse attention and execution order |
 | `vsa_layout.py` | Static sample/block geometry, row maps, routing templates and coarse boundaries |
-| `vsa_kernels.py` | Slot gathers, fused Q/K/V padding, FP32 pooling and gated merge kernels |
+| `vsa_kernels.py` | Fused token reordering, slot gathers, Q/K/V padding, FP32 pooling and gated merge kernels |
 
 Both input orders share the core's attention math, per-region budgets and
 fine-before-coarse schedule. The core does not import the public entry.
@@ -205,9 +259,10 @@ operator measurements, not end-to-end training results.
 
 ## Tests
 
-The tests cover both input orders against independent token math, fused padding
-and its adjoint, and CUDA Graph replay with original and changed inputs. GPU
-tests are skipped when CUDA is unavailable.
+The tests cover both input orders against independent token math, fused
+reorder round trips with mixed tensor shapes/dtypes, padding and their adjoints,
+and CUDA Graph replay of reorder/attention/restore with original and changed
+inputs. GPU tests are skipped when CUDA is unavailable.
 
 ```bash
 python -m pip install 'pytest>=8'

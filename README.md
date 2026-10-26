@@ -287,6 +287,12 @@ there is no single top-k across all video regions in the pack.
 
 ### Execution
 
+Single-device and ring execution share `block_means`, which returns
+differentiable FP32 Q/K/V means. Single-device execution selects coarse blocks
+and fuses routing detach and coarse dtype conversion in `routing_and_coarse_means`.
+Ring execution pools all local slots, including zero-filled dummy blocks;
+`_GatherMeans` only communicates the resulting K/V means and their gradients.
+
 Pool local Q/K/V in FP32 and all-gather pooled K/V for global per-region top-k
 routing and coarse attention. Fine attention keeps Q local and circulates
 BF16 K/V shards. Selected global block IDs are partitioned by owner and

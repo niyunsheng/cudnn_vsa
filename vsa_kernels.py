@@ -140,16 +140,31 @@ def to_slots_qkv(q, k, v, slot_row, row_slot):
 
 
 @torch.compile(fullgraph=True)
-def block_means(q, k, v, block_sizes, coarse_blocks):
+def block_means(q, k, v, block_sizes, blocks=None):
+    """Return differentiable FP32 Q/K/V means over zero-padded block slots.
+
+    Select ``blocks`` before reducing, or pool every block when omitted.
+    Valid lengths exclude padding; zero-filled empty blocks produce zero means.
+    """
+    sizes = block_sizes if blocks is None else block_sizes[blocks]
+    denominator = sizes.clamp_min(1)[:, None, None]
+    means = []
+    for x in (q, k, v):
+        slots = x.view(block_sizes.numel(), BLOCK, *x.shape[1:])
+        if blocks is not None:
+            slots = slots[blocks]
+        means.append(slots.sum(1, dtype=torch.float32) / denominator)
+    return tuple(means)
+
+
+@torch.compile(fullgraph=True)
+def routing_and_coarse_means(q, k, v, block_sizes, coarse_blocks):
     """Return detached FP32 routing Q/K and differentiable coarse Q/K/V.
 
     Coarse means use the input dtype (BF16 in VSA). Include all regions of
     VSA samples and exclude entire fine-only samples.
     """
-    q_mean, k_mean, v_mean = (
-        x.view(block_sizes.numel(), BLOCK, *x.shape[1:])[coarse_blocks].sum(1, dtype=torch.float32)
-        / block_sizes[coarse_blocks, None, None] for x in (q, k, v)
-    )
+    q_mean, k_mean, v_mean = block_means(q, k, v, block_sizes, coarse_blocks)
     return (q_mean.detach(), k_mean.detach(),
             q_mean.to(q.dtype), k_mean.to(k.dtype), v_mean.to(v.dtype))
 
@@ -237,14 +252,6 @@ def fine_coarse_gate_add(fine, gate, coarse, row_coarse, coarse_rows):
     in FP32 and cast once on store, without a materialized FP32 coarse copy.
     """
     return _FineCoarseGateAdd.apply(fine, gate, coarse, row_coarse, coarse_rows)
-
-
-@torch.compile(fullgraph=True)
-def ring_block_means(q, k, v, block_sizes):
-    """All local means in FP32, including zero-filled dummy ring blocks."""
-    shape = (block_sizes.numel(), BLOCK, *q.shape[1:])
-    denominator = block_sizes.clamp_min(1)[:, None, None]
-    return tuple(x.view(shape).sum(1, dtype=torch.float32) / denominator for x in (q, k, v))
 
 
 def _align_peers(tensor):

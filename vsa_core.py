@@ -131,7 +131,7 @@ def attention_slots(q, k, v, layout, *, scale=None):
     scale = q.shape[-1]**-0.5 if scale is None else scale
     indices = layout.routing_indices
     if not layout.dense_only:
-        q_route, k_route, q_coarse, k_coarse, v_coarse = vsa_kernels.block_means(
+        q_route, k_route, q_coarse, k_coarse, v_coarse = vsa_kernels.routing_and_coarse_means(
             q, k, v, layout.block_sizes, layout.coarse_blocks)
         indices = route(q_route, k_route, layout.groups, indices,
             dense_query_full=layout.dense_query_full)
@@ -216,6 +216,8 @@ def _ring_exchange(runtime, pairs, *, reverse=False):
 
 
 class _GatherMeans(torch.autograd.Function):
+    """All-gather already-pooled K/V, with a reduce-scatter SUM adjoint."""
+
     @staticmethod
     def forward(ctx, means, runtime):
         ctx.runtime = runtime
@@ -312,7 +314,7 @@ def ring_attention_slots(q, k, v, layout, group, *, scale, batch_p2p=None, bwd_b
     indices = layout.routing_indices
     means = None
     if not layout.dense_only:
-        qm, km, vm = vsa_kernels.ring_block_means(q, k, v, layout.block_sizes)
+        qm, km, vm = vsa_kernels.block_means(q, k, v, layout.block_sizes)
         gathered = _GatherMeans.apply(torch.stack((km, vm), dim=1), runtime)
         means = gathered.index_select(0, layout.global_to_gather)
         indices = ring_route(qm.detach(), means[:, 0].detach(), layout)

@@ -122,7 +122,7 @@ def test_exempt_routing_and_all_modality_coarse():
     slots = [vsa_kernels.to_slots(t, layout.slot_row, layout.row_slot) for t in (q, k, v)]
     means = [pool(t, layout) for t in slots]
     scores = means[0] @ means[1].transpose(-2, -1) / 8**0.5
-    q_route, k_route, _, _, _ = vsa_kernels.block_means(*slots, layout.block_sizes, layout.coarse_blocks)
+    q_route, k_route, _, _, _ = vsa_kernels.routing_and_coarse_means(*slots, layout.block_sizes, layout.coarse_blocks)
     indices = route(q_route, k_route, layout.groups, layout.routing_indices,
         dense_query_full=layout.dense_query_full)
     mask = routing_mask(indices, layout.routing_counts)[0]
@@ -417,7 +417,7 @@ def test_packed_calls_and_metadata_exclude_whole_dense_samples(monkeypatch):
     assert calls == ["fine", "coarse"]
     slots = tuple(vsa_kernels.to_slots(x, layout.slot_row, layout.row_slot)
                   for x in xs[:3])
-    q_route, k_route, q_coarse, k_coarse, v_coarse = vsa_kernels.block_means(
+    q_route, k_route, q_coarse, k_coarse, v_coarse = vsa_kernels.routing_and_coarse_means(
         *slots, layout.block_sizes, layout.coarse_blocks)
     for routing, coarse in ((q_route, q_coarse), (k_route, k_coarse)):
         assert routing.dtype == torch.float32 and not routing.requires_grad
@@ -468,7 +468,7 @@ def test_fp32_routing_survives_autocast_and_templates_are_immutable():
     xs = [torch.randn(layout.tokens, 2, 8) for _ in range(3)]
     slots = tuple(vsa_kernels.to_slots(x, layout.slot_row, layout.row_slot)
                   for x in xs)
-    q_route, k_route, _, _, _ = vsa_kernels.block_means(*slots, layout.block_sizes, layout.coarse_blocks)
+    q_route, k_route, _, _, _ = vsa_kernels.routing_and_coarse_means(*slots, layout.block_sizes, layout.coarse_blocks)
     template = layout.routing_indices
     saved = template.clone()
     expected = core.route(q_route, k_route, layout.groups, template,

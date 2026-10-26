@@ -9,59 +9,49 @@ from vsa_layout import BLOCK
 
 
 @triton.jit(do_not_specialize=["TOKENS"])
-def _reorder_tokens_kernel(INPUTS, OUTPUTS, ROWS, TOKENS,
-                           WIDTHS: tl.constexpr, INVERSE: tl.constexpr, TILE: tl.constexpr):
+def _reorder_tokens_kernel(X, OUT, ROWS, TOKENS,
+                           WIDTH: tl.constexpr, INVERSE: tl.constexpr, TILE: tl.constexpr):
     offsets = tl.program_id(0) * TILE + tl.arange(0, TILE)
-    for i in tl.static_range(len(WIDTHS)):
-        width = WIDTHS[i]
-        if tl.program_id(0) * TILE < TOKENS * width:
-            valid = offsets < TOKENS * width
-            row, col = offsets // width, offsets % width
-            original = tl.load(ROWS + row, valid, other=0)
-            mapped = original * width + col
-            if INVERSE:
-                values = tl.load(INPUTS[i] + offsets, valid, other=0)
-                # ROWS is a full permutation: every destination is written once.
-                tl.store(OUTPUTS[i] + mapped, values, valid)
-            else:
-                values = tl.load(INPUTS[i] + mapped, valid, other=0)
-                tl.store(OUTPUTS[i] + offsets, values, valid)
+    valid = offsets < TOKENS * WIDTH
+    row, col = offsets // WIDTH, offsets % WIDTH
+    original = tl.load(ROWS + row, valid, other=0)
+    mapped = original * WIDTH + col
+    if INVERSE:
+        values = tl.load(X + offsets, valid, other=0)
+        # ROWS is a full permutation: every destination is written once.
+        tl.store(OUT + mapped, values, valid)
+    else:
+        values = tl.load(X + mapped, valid, other=0)
+        tl.store(OUT + offsets, values, valid)
 
 
-def _reorder_tokens(tensors, input_rows, inverse):
-    if not tensors:
-        return ()
-    tensors = tuple(x.contiguous() for x in tensors)
-    outputs = tuple(torch.empty_like(x) for x in tensors)
-    widths = tuple(math.prod(x.shape[1:]) for x in tensors)
-    count = input_rows.numel() * max(widths)
+def _reorder_tokens(x, input_rows, inverse):
+    x = x.contiguous()
+    out = torch.empty_like(x)
+    width = math.prod(x.shape[1:])
+    count = x.numel()
     if count:
         _reorder_tokens_kernel[(triton.cdiv(count, 1024),)](
-            tensors, outputs, input_rows, input_rows.numel(), widths, inverse, 1024)
-    return outputs
+            x, out, input_rows, input_rows.numel(), width, inverse, 1024)
+    return out
 
 
 class _TokenReorder(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input_rows, inverse, *tensors):
+    def forward(ctx, x, input_rows, inverse):
         ctx.save_for_backward(input_rows)
         ctx.inverse = inverse
-        ctx.set_materialize_grads(False)
-        return _reorder_tokens(tensors, input_rows, inverse)
+        return _reorder_tokens(x, input_rows, inverse)
 
     @staticmethod
-    def backward(ctx, *grads):
+    def backward(ctx, grad):
         input_rows, = ctx.saved_tensors
-        active = tuple(grad for grad in grads if grad is not None)
-        restored = iter(reorder_tokens(active, input_rows, inverse=not ctx.inverse))
-        return (None, None, *(next(restored) if grad is not None else None for grad in grads))
+        return reorder_tokens(grad, input_rows, inverse=not ctx.inverse), None, None
 
 
-def reorder_tokens(tensors, input_rows, *, inverse=False):
-    """One fused launch for all tensor permutations, with the inverse adjoint."""
-    if not tensors:
-        return ()
-    return _TokenReorder.apply(input_rows, inverse, *tensors)
+def reorder_tokens(x, input_rows, *, inverse=False):
+    """Permute one token tensor in one launch, with the inverse adjoint."""
+    return _TokenReorder.apply(x, input_rows, inverse)
 
 
 @triton.jit(do_not_specialize=["N"])

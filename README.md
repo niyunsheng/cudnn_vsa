@@ -81,44 +81,45 @@ positional coordinates and dO. Outputs and gradients preserve that order.
 
 For raster data, call `to_block_order` once before the entire VSA stack.
 This repository provides the fused reorder kernel separately from
-`vsa_attention`: it permutes all supplied tensors in one kernel launch,
-preserving their shapes and dtypes and adding **no padding**. Inputs that are
+`vsa_attention`: it permutes one token tensor in one kernel launch,
+preserving its shape and dtype and adding **no padding**. Inputs that are
 already in block order go directly to attention. Keep that order across layers.
 
-Both `to_block_order` and `to_raster_order` return a tuple, including for one
-tensor. They accept contiguous CUDA `[T, ...]` tensors on the layout's device,
-with different row shapes and floating-point or integer dtypes. Use a full
-block layout. For a complete model, call
-`to_block_order(hidden_states, positions, vsa_layout=layout)` before generating
-the layers' Q/K/V/gate; those projections then inherit block order. The
-operator-level example below starts from already projected raster tensors:
+`to_block_order(x, vsa_layout=layout)` takes and returns a single contiguous
+CUDA `[T, ...]` tensor. The inverse `to_raster_order(x, vsa_layout=layout)` has
+the same interface. Both require a full layout with `input_order="block"`:
+the layout describes the block order even when `x` enters in raster order.
+Call the forward helper at the stack's input boundary and the inverse helper
+at its output boundary if raster output is needed. Subsequent token-wise
+projections produce Q/K/V/gate in block order directly. Positional coordinates
+must follow the same order; callers can generate them in block order or
+convert their coordinate tensor separately.
 
 ```python
 import torch
 from vsa import to_block_order, to_raster_order, vsa_attention
 from vsa_layout import Segment, build_vsa_layout
 
-H, D = 2, 128
+H, D, C = 2, 128, 256
 layout = build_vsa_layout(
     [[Segment("video", (5, 9, 11), sparsity=0.9), Segment("text", 67)]],
     head_num=H, input_order="block", device="cuda",
 )
-q, k, v, gate = [
-    torch.randn(layout.tokens, H, D, device="cuda", dtype=torch.bfloat16,
-                requires_grad=True)
-    for _ in range(4)
-]
-position_ids = torch.arange(layout.tokens, device="cuda")
+tokens = torch.randn(layout.tokens, C, device="cuda", dtype=torch.bfloat16,
+                     requires_grad=True)
+projection = torch.nn.Linear(C, 4 * H * D, device="cuda", dtype=torch.bfloat16)
 
-# One fused reorder before attention; partial blocks add no input padding.
-q, k, v, gate, position_ids = to_block_order(
-    q, k, v, gate, position_ids, vsa_layout=layout,
-)
-assert q.shape[0] == layout.tokens  # 562 valid tokens, not 1280 padded slots.
+# One reorder at the input boundary, before the layers' projections.
+tokens_block = to_block_order(tokens, vsa_layout=layout)
+assert tokens_block.shape == tokens.shape  # 562 valid tokens, no input padding.
+
+# One example VSA layer; intermediate layers retain block order.
+projected = projection(tokens_block).view(layout.tokens, 4, H, D)
+q, k, v, gate = (x.contiguous() for x in projected.unbind(1))
 out = vsa_attention(q, k, v, gate, layout)
 
-# Keep block order between layers; restore only if the model output needs it.
-(out_raster,) = to_raster_order(out, vsa_layout=layout)
+# Restore once at the output boundary if raster output is required.
+out_raster = to_raster_order(out, vsa_layout=layout)
 out_raster.backward(torch.randn_like(out_raster))
 ```
 
@@ -260,7 +261,7 @@ operator measurements, not end-to-end training results.
 ## Tests
 
 The tests cover both input orders against independent token math, fused
-reorder round trips with mixed tensor shapes/dtypes, padding and their adjoints,
+single-tensor reorder round trips across row shapes/dtypes, padding and their adjoints,
 and CUDA Graph replay of reorder/attention/restore with original and changed
 inputs. GPU tests are skipped when CUDA is unavailable.
 

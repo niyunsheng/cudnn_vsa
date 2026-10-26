@@ -6,43 +6,39 @@ import vsa_kernels
 from vsa_layout import VSALayout
 
 
-def _reorder_tokens(tensors, layout, inverse):
+def _reorder_tokens(x, layout, inverse):
     if not isinstance(layout, VSALayout) or layout.input_order != "block":
         raise ValueError('Token reordering requires a full VSALayout with input_order="block"')
-    if not tensors:
-        raise ValueError("At least one tensor is required")
-    for x in tensors:
-        if not isinstance(x, torch.Tensor) or x.ndim < 1 or x.shape[0] != layout.tokens:
-            raise ValueError("Each tensor must have shape [layout.tokens, ...]")
-        if any(size == 0 for size in x.shape[1:]) or not x.is_contiguous():
-            raise ValueError("Token-reorder tensors must be contiguous with nonempty row dimensions")
-        if x.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64,
-                           torch.int8, torch.uint8, torch.int16, torch.int32, torch.int64, torch.bool):
-            raise ValueError("Unsupported token-reorder dtype")
-        if not x.is_cuda or x.device != layout.input_rows.device:
-            raise ValueError("Token-reorder tensors and layout must be on the same CUDA device")
-    return vsa_kernels.reorder_tokens(tensors, layout.input_rows, inverse=inverse)
+    if not isinstance(x, torch.Tensor) or x.ndim < 1 or x.shape[0] != layout.tokens:
+        raise ValueError("Expected one tensor with shape [layout.tokens, ...]")
+    if any(size == 0 for size in x.shape[1:]) or not x.is_contiguous():
+        raise ValueError("Token-reorder input must be contiguous with nonempty row dimensions")
+    if x.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64,
+                       torch.int8, torch.uint8, torch.int16, torch.int32, torch.int64, torch.bool):
+        raise ValueError("Unsupported token-reorder dtype")
+    if not x.is_cuda or x.device != layout.input_rows.device:
+        raise ValueError("Token-reorder input and layout must be on the same CUDA device")
+    return vsa_kernels.reorder_tokens(x, layout.input_rows, inverse=inverse)
 
 
-def to_block_order(*tensors, vsa_layout):
-    """Fuse raster-to-compact-block reordering without padding; return a tuple.
+def to_block_order(x, *, vsa_layout):
+    """Reorder one raster tensor into compact blocks, without padding.
 
-    Accept contiguous CUDA [T, ...] tensors with different row shapes/dtypes,
-    such as hidden states, Q/K/V/gate and integer positions. Use a full block
-    layout and call once before the VSA stack.
-    Every tensor retains its shape and dtype; gradients invert the permutation.
+    Accept and return one contiguous CUDA [T, ...] tensor, preserving its shape
+    and dtype. Use a full block layout and call once at the stack's input
+    boundary. Gradients apply the inverse permutation.
     Already block-ordered inputs do not need this conversion.
     """
-    return _reorder_tokens(tensors, vsa_layout, inverse=False)
+    return _reorder_tokens(x, vsa_layout, inverse=False)
 
 
-def to_raster_order(*tensors, vsa_layout):
-    """Restore compact block tensors to raster order, without padding.
+def to_raster_order(x, *, vsa_layout):
+    """Restore one compact block tensor to raster order, without padding.
 
-    Return a tuple, including for one tensor. Use the same full block layout
-    as to_block_order, after the VSA stack if the caller needs raster outputs.
+    Return one tensor with the same shape and dtype. Use the same full block
+    layout as to_block_order at the stack's output boundary if needed.
     """
-    return _reorder_tokens(tensors, vsa_layout, inverse=True)
+    return _reorder_tokens(x, vsa_layout, inverse=True)
 
 
 def _validate(q, k, v, gate):

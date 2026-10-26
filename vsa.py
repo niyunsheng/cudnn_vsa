@@ -73,8 +73,8 @@ def vsa_attention(q, k, v, gate, vsa_layout, *, scale=None, ring_cp_group=None,
 
     An explicit ring_cp_group requires a RingVSALayout with compact local
     block inputs, including size-one groups. Pass group-local rank/size to
-    build_ring_vsa_layout; the caller owns whole-block sharding and any
-    external Ulysses transformations. ring_cp_batch_p2p=None chooses batched
+    build_vsa_layout with input_order="block"; the caller owns whole-block
+    sharding and any external Ulysses transformations. ring_cp_batch_p2p=None chooses batched
     P2P for device-bound groups and individual P2P for lazy groups.
     ring_cp_bwd_bucket_size="auto" selects the measured SM100/H2/local-128-
     block/single-sample setting; None uses the backend default, and a positive

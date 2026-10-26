@@ -4,16 +4,20 @@ from vsa_layout import Segment, build_vsa_layout
 
 
 @pytest.mark.parametrize("head_num", [0, -1, 1.5, True, None])
-def test_layout_rejects_invalid_head_num(head_num):
+@pytest.mark.parametrize("ring", [False, True])
+def test_layout_rejects_invalid_head_num(head_num, ring):
+    kwargs = dict(ring_size=2, ring_rank=0, input_order="block") if ring else {}
     with pytest.raises(ValueError, match="head_num"):
-        build_vsa_layout([[Segment("video", (1, 2, 3))]], head_num=head_num)
+        build_vsa_layout([[Segment("video", (1, 2, 3))]], head_num=head_num, **kwargs)
 
 
 @pytest.mark.parametrize("dense_query_full", [None, 1, "False"])
-def test_layout_rejects_invalid_dense_query_full(dense_query_full):
+@pytest.mark.parametrize("ring", [False, True])
+def test_layout_rejects_invalid_dense_query_full(dense_query_full, ring):
+    kwargs = dict(ring_size=2, ring_rank=0, input_order="block") if ring else {}
     with pytest.raises(ValueError, match="dense_query_full"):
         build_vsa_layout([[Segment("video", (1, 2, 3))]], head_num=2,
-                         dense_query_full=dense_query_full)
+                         dense_query_full=dense_query_full, **kwargs)
 
 
 @pytest.mark.parametrize("samples", [

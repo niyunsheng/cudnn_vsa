@@ -147,14 +147,21 @@ fine-before-coarse schedule. The core does not import the public entry.
 ## Ring context parallelism
 
 Use the same `vsa_attention` entry with a `RingVSALayout` and an explicit
-`ring_cp_group`. Build the layout with `build_ring_vsa_layout(samples,
-head_num=H, ring_size=dist.get_world_size(group), ring_rank=dist.get_rank(group),
-device=device)`, then call
+`ring_cp_group`. Build the layout with `build_vsa_layout(samples,
+head_num=H, input_order="block", ring_size=dist.get_world_size(group),
+ring_rank=dist.get_rank(group), device=device)`, then call
 `vsa_attention(q, k, v, gate, layout, ring_cp_group=group)`.
 All group ranks use identical global sample/segment metadata and the same
 heads. Layout rank and size refer to that group, including interleaved groups.
 The caller creates and owns the process group; `ring_cp_group=None` uses
 single-device attention.
+
+`build_vsa_layout` is the only public layout builder. Omit `ring_size` and
+`ring_rank` to build a full `VSALayout`; provide both to build a `RingVSALayout`.
+An explicit `ring_size=1` still builds a ring shard. Ring construction requires
+`input_order="block"`; the default for full layouts remains `"raster"`.
+The builder works on CPU without distributed initialization. Full layouts
+remain necessary for the boundary reorder helpers.
 
 ### Compact input and block ownership
 
@@ -229,6 +236,55 @@ Unused slots are zero-filled and excluded from attention and pooling. The
 caller supplies 234 valid tokens in total, not 576 slot rows. Q/K/V/gate and
 positions use the same local order; the output and its gradients retain it.
 
+### Routing and top-k
+
+The routing code follows this sequence:
+
+1. `_build_sample_blocks` in [vsa_layout.py](vsa_layout.py) records a separate
+   budget for each numeric-sparsity video region: `keep = max(1, ceil((1 -
+   sparsity) * region_blocks))`. Dense KV blocks are always included. These
+   budgets and sample boundaries are static; selected video block IDs change
+   with Q/K on each forward call.
+2. `ring_attention_slots` in [vsa_core.py](vsa_core.py) computes local Q/K/V
+   block means in FP32, dividing by valid token counts. Padding is zero and
+   dummy blocks have zero means. Pooled K/V is all-gathered in rank order,
+   then `layout.global_to_gather` restores global block order and removes
+   dummy blocks. Routing uses local Q means and globally ordered K means.
+3. `ring_route` visits each sample's local Q block range and calls the shared
+   `_route_group`. For each video KV region and head, it forms FP32 scores
+   `Q_mean @ K_mean.T`, with TF32 and autocast disabled, then selects that
+   region's `keep` largest scores independently for every Q block. Routing
+   uses unscaled dot products; attention applies its softmax scale later.
+   Every peer's candidate blocks in that region participate in this one
+   selection. No score or top-k-index collective is needed because each Q
+   block has one owner and the K means are already global.
+4. `topk(..., sorted=False)` chooses region-relative IDs; `selected.sort(-1)`
+   sorts those IDs, and `+ start` converts them to global block IDs. Dense
+   keys and fully retained regions come from the layout's template. With
+   `dense_query_full=True`, dense Q rows restore their full-sample template;
+   sparse video Q rows keep their regional budgets. Routing runs under
+   `no_grad`: gradients flow through the selected fine attention and the
+   coarse branch, not through discrete top-k decisions.
+5. `partition_indices` in [vsa_kernels.py](vsa_kernels.py) groups selected IDs
+   by `owner = b % R`, translates them to `local_block = b // R`, and records
+   each peer's valid count. A peer may contribute zero selected keys. These
+   per-peer lists drive fine attention as K/V shards arrive.
+
+For sample A above, four video blocks at sparsity 0.5 give `keep=2`. Suppose
+one head of query block `b3` has these scores:
+
+```text
+Video KV block       b1    b2    b3    b4
+Q_mean @ K_mean.T   0.2   0.8   0.1   0.9
+Selected video IDs        b2          b4
+Final global IDs:   [b0, b2, b4]   (b0 is the always-visible text block)
+```
+
+For R=3, the peer lists are rank 0 `[0]` (global `b0`), rank 1 `[1]` (global
+`b4`) and rank 2 `[0]` (global `b2`). A Q block in sample A never considers B's
+`b5/b6`. With multiple video regions, each region gets its own top-k budget;
+there is no single top-k across all video regions in the pack.
+
 ### Execution
 
 Pool local Q/K/V in FP32 and all-gather pooled K/V for global per-region top-k
@@ -263,6 +319,12 @@ sample isolation through the block lists. The **transport** just moves
 buffers; it does not interpret FHW coordinates or infer THD sample boundaries.
 Partial outputs are weighted using their log-sum-exp normalizers so the final
 fine output has one softmax normalization over all selected KV blocks.
+
+After enqueuing the fine pass, `coarse_attention` uses local pooled Q and
+global pooled K/V, converted to BF16, with separate per-sample Q/KV boundaries.
+Coarse attention covers all blocks in each participating sample, independently
+of the fine top-k lists. `vsa_attention` restores compact valid rows and merges
+`fine + gate * coarse[query_block]`. Entirely dense samples use fine only.
 
 Backward traverses the ring in reverse, using the final fine output and
 log-sum-exp, and accumulates dQ/dK/dV in FP32. The pooled-mean gather has a

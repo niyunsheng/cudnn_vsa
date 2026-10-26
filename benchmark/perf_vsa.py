@@ -14,7 +14,7 @@ from .utils import (backward, barrier, capture_graph, check_tensors, environment
                     packed_geometry_and_flops, profile_step, summarize)
 from tests.reference import reference_pack
 from vsa import vsa_attention
-from vsa_layout import build_ring_vsa_layout, build_vsa_layout
+from vsa_layout import build_vsa_layout
 
 
 def _bucket_argument(value):
@@ -111,8 +111,8 @@ def run_case(name, heads, args, group):
     kwargs = dict(head_num=heads, device="cuda", dense_query_full=args.dense_query_full)
     full = build_vsa_layout(samples, **kwargs)
     if group is not None:
-        local = build_ring_vsa_layout(samples, **kwargs, ring_size=size, ring_rank=rank,
-                                      input_order=args.input_order)
+        local = build_vsa_layout(samples, **kwargs, ring_size=size, ring_rank=rank,
+                                input_order=args.input_order)
     else:
         local = full if args.input_order == "raster" else build_vsa_layout(samples, **kwargs, input_order="block")
     global_xs, global_dy = make_inputs(heads, samples=samples, seed=937 if args.ring else 2026)

@@ -257,8 +257,8 @@ def _build_sample_blocks(segments, *, token_offset, block_offset):
 
 
 def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
-                     input_order="raster") -> VSALayout:
-    """Public layout builder: ordered samples of Segments -> VSALayout.
+                     input_order="raster", ring_size=None, ring_rank=None) -> "VSALayout | RingVSALayout":
+    """Build a full layout or an explicitly requested ring shard from Segments.
 
     input_order="raster" (the default) concatenates samples/segments
     in their original order, with FHW raster order inside each video.
@@ -277,10 +277,36 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
     None-sparsity KV is always fully visible. Coarse and gate rules are unchanged.
     head_num fixes the Q/K/V head count and the prepared BSA template shapes.
     Reuse the layout across calls with the same geometry, policy, heads and device.
+
+    Omit ring_size/ring_rank for a full VSALayout. Provide both as group-local
+    integers for a RingVSALayout, including ring_size=1. Ring shards require
+    input_order="block" and contain only valid owned-block rows without padding.
+    Reorder/distribute whole blocks at the dataset/model boundary. The builder
+    needs no process group or distributed initialization; pass the matching
+    explicit ring_cp_group to vsa_attention. Boundary reorder helpers still
+    require a full block VSALayout.
     """
     if input_order not in ("raster", "block"):
         raise ValueError('input_order must be "raster" or "block"')
+    if (ring_size is None) != (ring_rank is None):
+        raise ValueError("ring_size and ring_rank must be provided together")
+    is_ring = ring_size is not None
+    if is_ring:
+        if input_order != "block":
+            raise ValueError('Ring input_order must be "block" (compact, without padding)')
+        for name, number, minimum in (("head_num", head_num, 1), ("ring_size", ring_size, 1),
+                                      ("ring_rank", ring_rank, 0)):
+            if isinstance(number, bool) or not isinstance(number, int) or number < minimum:
+                raise ValueError(f"{name} must be an integer >= {minimum}")
+        if ring_rank >= ring_size:
+            raise ValueError("ring_rank must be smaller than ring_size")
+        if not isinstance(dense_query_full, bool):
+            raise ValueError("dense_query_full must be a bool")
     samples, block_rows, groups, sample_slices = _plan_samples(samples)
+    if is_ring:
+        return _finalize_ring_layout(samples, block_rows, groups, sample_slices,
+                                     head_num=head_num, ring_size=ring_size, ring_rank=ring_rank,
+                                     dense_query_full=dense_query_full, device=device)
     return _finalize_layout(samples, block_rows, groups, sample_slices,
                             head_num=head_num, dense_query_full=dense_query_full, device=device,
                             input_order=input_order)
@@ -373,30 +399,9 @@ class RingVSALayout:
         return self.input_order == "block" and self.tokens == self.padded_tokens
 
 
-def build_ring_vsa_layout(samples, *, head_num, ring_size, ring_rank,
-                          dense_query_full=False, device="cpu", input_order="block") -> RingVSALayout:
-    """Distribute complete sample-local VSA blocks cyclically across a ring.
-
-    This builder requires no distributed initialization. Pass group-local rank
-    and size, then pass that same explicit process group to ``vsa_attention``.
-    A peer can own no rows of a particular sample, or even no real blocks.
-    Only input_order="block" is supported, including a size-one ring. Reorder
-    FHW tokens once before the VSA stack (to_block_order accepts a full block
-    VSALayout), then distribute whole blocks at the dataset/model boundary.
-    Inputs are compact owned-block rows without padding; input_rows maps them
-    to global raster coordinates.
-    """
-    if input_order != "block":
-        raise ValueError('Ring input_order must be "block" (compact, without padding)')
-    for name, number, minimum in (("head_num", head_num, 1), ("ring_size", ring_size, 1),
-                                  ("ring_rank", ring_rank, 0)):
-        if isinstance(number, bool) or not isinstance(number, int) or number < minimum:
-            raise ValueError(f"{name} must be an integer >= {minimum}")
-    if ring_rank >= ring_size:
-        raise ValueError("ring_rank must be smaller than ring_size")
-    if not isinstance(dense_query_full, bool):
-        raise ValueError("dense_query_full must be a bool")
-    samples, global_rows, groups, sample_slices = _plan_samples(samples)
+def _finalize_ring_layout(samples, global_rows, groups, sample_slices, *, head_num,
+                          ring_size, ring_rank, dense_query_full, device) -> RingVSALayout:
+    """Materialize cyclic ownership, local slots and global routing metadata."""
     total = len(global_rows)
     capacity = (total + ring_size - 1) // ring_size
     owned = list(range(ring_rank, total, ring_size))
@@ -471,4 +476,4 @@ def build_ring_vsa_layout(samples, *, head_num, ring_size, ring_rank,
         row_coarse=tensor([block_to_coarse[s // BLOCK] for s in inverse]),
         coarse_rows=slot_row.view(capacity, BLOCK)[coarse_blocks],
         dense_only=all(g.dense_only for g in groups), dense_query_full=dense_query_full,
-        input_order=input_order)
+        input_order="block")

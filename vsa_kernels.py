@@ -8,6 +8,52 @@ import triton.language as tl
 from vsa_layout import BLOCK
 
 
+@triton.jit(do_not_specialize=["TOKENS"])
+def _reorder_tokens_kernel(X, OUT, ROWS, TOKENS,
+                           WIDTH: tl.constexpr, INVERSE: tl.constexpr, TILE: tl.constexpr):
+    offsets = tl.program_id(0) * TILE + tl.arange(0, TILE)
+    valid = offsets < TOKENS * WIDTH
+    row, col = offsets // WIDTH, offsets % WIDTH
+    original = tl.load(ROWS + row, valid, other=0)
+    mapped = original * WIDTH + col
+    if INVERSE:
+        values = tl.load(X + offsets, valid, other=0)
+        # ROWS is a full permutation: every destination is written once.
+        tl.store(OUT + mapped, values, valid)
+    else:
+        values = tl.load(X + mapped, valid, other=0)
+        tl.store(OUT + offsets, values, valid)
+
+
+def _reorder_tokens(x, input_rows, inverse):
+    x = x.contiguous()
+    out = torch.empty_like(x)
+    width = math.prod(x.shape[1:])
+    count = x.numel()
+    if count:
+        _reorder_tokens_kernel[(triton.cdiv(count, 1024),)](
+            x, out, input_rows, input_rows.numel(), width, inverse, 1024)
+    return out
+
+
+class _TokenReorder(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, input_rows, inverse):
+        ctx.save_for_backward(input_rows)
+        ctx.inverse = inverse
+        return _reorder_tokens(x, input_rows, inverse)
+
+    @staticmethod
+    def backward(ctx, grad):
+        input_rows, = ctx.saved_tensors
+        return reorder_tokens(grad, input_rows, inverse=not ctx.inverse), None, None
+
+
+def reorder_tokens(x, input_rows, *, inverse=False):
+    """Permute one token tensor in one launch, with the inverse adjoint."""
+    return _TokenReorder.apply(x, input_rows, inverse)
+
+
 @triton.jit(do_not_specialize=["N"])
 def _gather(X, MAP, OUT, N, WIDTH: tl.constexpr, BLOCK: tl.constexpr):
     # Batch-dependent lengths reuse the same kernel for a fixed row width.
@@ -49,6 +95,48 @@ def to_slots(x, slot_row, row_slot):
 def from_slots(x, slot_row, row_slot):
     """Restore original rows; slot_row is the backward map."""
     return SlotGather.apply(x, row_slot, slot_row)
+
+
+@triton.jit(do_not_specialize=["N"])
+def _gather_qkv(Q, K, V, MAP, OUT, N, WIDTH: tl.constexpr, TILE: tl.constexpr):
+    offsets = tl.program_id(0) * TILE + tl.arange(0, TILE)
+    rows, cols = offsets // WIDTH, offsets % WIDTH
+    source = tl.load(MAP + rows, mask=offsets < N, other=-1)
+    valid = (offsets < N) & (source >= 0)
+    address = source * WIDTH + cols
+    q = tl.load(Q + address, valid, other=0)
+    k = tl.load(K + address, valid, other=0)
+    v = tl.load(V + address, valid, other=0)
+    tl.store(OUT + offsets, q, offsets < N)
+    tl.store(OUT + N + offsets, k, offsets < N)
+    tl.store(OUT + 2 * N + offsets, v, offsets < N)
+
+
+def gather_qkv(q, k, v, row_map):
+    q, k, v = (x.contiguous() for x in (q, k, v))
+    out = torch.empty((3, row_map.numel(), *q.shape[1:]), device=q.device, dtype=q.dtype)
+    count = out[0].numel()
+    if count:
+        _gather_qkv[(triton.cdiv(count, 1024),)](
+            q, k, v, row_map, out, count, WIDTH=math.prod(q.shape[1:]), TILE=1024)
+    return tuple(out.unbind(0))
+
+
+class _QKVSlotGather(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, slot_row, row_slot):
+        ctx.save_for_backward(row_slot)
+        return gather_qkv(q, k, v, slot_row)
+
+    @staticmethod
+    def backward(ctx, dq, dk, dv):
+        row_slot, = ctx.saved_tensors
+        return (*gather_qkv(dq, dk, dv, row_slot), None, None)
+
+
+def to_slots_qkv(q, k, v, slot_row, row_slot):
+    """Pad compact Q/K/V together, sharing the map and launch in both directions."""
+    return _QKVSlotGather.apply(q, k, v, slot_row, row_slot)
 
 
 @torch.compile(fullgraph=True)

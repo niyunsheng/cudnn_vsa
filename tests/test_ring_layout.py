@@ -8,6 +8,7 @@ from vsa_core import route
 from vsa_layout import Segment, build_ring_vsa_layout, build_vsa_layout
 from vsa_kernels import partition_indices
 from vsa_core import ring_route
+from vsa import to_block_order, to_raster_order
 
 
 PACK = (
@@ -116,3 +117,11 @@ def test_size_one_ring_is_still_compact_block_order():
         build_ring_vsa_layout(PACK, head_num=2, ring_size=1, ring_rank=0, input_order="raster")
     with pytest.raises(ValueError, match='input_order must be "block"'):
         replace(ring, input_order="raster")
+
+
+@pytest.mark.parametrize("convert", [to_block_order, to_raster_order])
+@pytest.mark.parametrize("size", [1, 2])
+def test_boundary_reorder_requires_full_layout(convert, size):
+    shard = build_ring_vsa_layout(PACK, head_num=2, ring_size=size, ring_rank=0)
+    with pytest.raises(ValueError, match="full VSALayout"):
+        convert(torch.empty(shard.tokens, 32), vsa_layout=shard)

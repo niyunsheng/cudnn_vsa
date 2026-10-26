@@ -260,7 +260,7 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
                      input_order="raster") -> VSALayout:
     """Public layout builder: ordered samples of Segments -> VSALayout.
 
-    input_order="raster" (the non-ring default) concatenates samples/segments
+    input_order="raster" (the default) concatenates samples/segments
     in their original order, with FHW raster order inside each video.
     input_order="block" accepts valid rows in canonical block order without
     padding; the caller reorders once before the stack of VSA layers.
@@ -381,9 +381,10 @@ def build_ring_vsa_layout(samples, *, head_num, ring_size, ring_rank,
     and size, then pass that same explicit process group to ``vsa_attention``.
     A peer can own no rows of a particular sample, or even no real blocks.
     Only input_order="block" is supported, including a size-one ring. Reorder
-    FHW tokens once outside this library before the VSA stack and distribute
-    whole blocks at the dataset/model boundary. Inputs are compact owned-block
-    rows without padding; input_rows maps them to global raster coordinates.
+    FHW tokens once before the VSA stack (to_block_order accepts a full block
+    VSALayout), then distribute whole blocks at the dataset/model boundary.
+    Inputs are compact owned-block rows without padding; input_rows maps them
+    to global raster coordinates.
     """
     if input_order != "block":
         raise ValueError('Ring input_order must be "block" (compact, without padding)')

@@ -73,7 +73,7 @@ def _route_group(q, k, group, index, template, *, key_offset=0, dense_rows=0):
 
 @torch.no_grad()
 def route(q, k, groups, template, *, dense_query_full):
-    """CP1 routing: Q/K contain compact means of non-fine-only samples."""
+    """Route Q/K compact means of samples that include coarse attention."""
     if not any(g.kept < g.blocks for g in groups):
         return template
     index = template.clone()

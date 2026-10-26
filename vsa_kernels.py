@@ -8,6 +8,52 @@ import triton.language as tl
 from vsa_layout import BLOCK
 
 
+@triton.jit(do_not_specialize=["TOKENS"])
+def _reorder_tokens_kernel(X, OUT, ROWS, TOKENS,
+                           WIDTH: tl.constexpr, INVERSE: tl.constexpr, TILE: tl.constexpr):
+    offsets = tl.program_id(0) * TILE + tl.arange(0, TILE)
+    valid = offsets < TOKENS * WIDTH
+    row, col = offsets // WIDTH, offsets % WIDTH
+    original = tl.load(ROWS + row, valid, other=0)
+    mapped = original * WIDTH + col
+    if INVERSE:
+        values = tl.load(X + offsets, valid, other=0)
+        # ROWS is a full permutation: every destination is written once.
+        tl.store(OUT + mapped, values, valid)
+    else:
+        values = tl.load(X + mapped, valid, other=0)
+        tl.store(OUT + offsets, values, valid)
+
+
+def _reorder_tokens(x, input_rows, inverse):
+    x = x.contiguous()
+    out = torch.empty_like(x)
+    width = math.prod(x.shape[1:])
+    count = x.numel()
+    if count:
+        _reorder_tokens_kernel[(triton.cdiv(count, 1024),)](
+            x, out, input_rows, input_rows.numel(), width, inverse, 1024)
+    return out
+
+
+class _TokenReorder(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, input_rows, inverse):
+        ctx.save_for_backward(input_rows)
+        ctx.inverse = inverse
+        return _reorder_tokens(x, input_rows, inverse)
+
+    @staticmethod
+    def backward(ctx, grad):
+        input_rows, = ctx.saved_tensors
+        return reorder_tokens(grad, input_rows, inverse=not ctx.inverse), None, None
+
+
+def reorder_tokens(x, input_rows, *, inverse=False):
+    """Permute one token tensor in one launch, with the inverse adjoint."""
+    return _TokenReorder.apply(x, input_rows, inverse)
+
+
 @triton.jit(do_not_specialize=["N"])
 def _gather(X, MAP, OUT, N, WIDTH: tl.constexpr, BLOCK: tl.constexpr):
     # Batch-dependent lengths reuse the same kernel for a fixed row width.
@@ -93,25 +139,19 @@ def to_slots_qkv(q, k, v, slot_row, row_slot):
     return _QKVSlotGather.apply(q, k, v, slot_row, row_slot)
 
 
-def _block_means_fp32(q, k, v, block_sizes, blocks=None):
-    shape = (block_sizes.numel(), BLOCK, *q.shape[1:])
-    sizes = block_sizes if blocks is None else block_sizes[blocks]
-    denominator = sizes.clamp_min(1)[:, None, None]
-    values = (x.view(shape) if blocks is None else x.view(shape)[blocks] for x in (q, k, v))
-    return tuple(x.sum(1, dtype=torch.float32) / denominator for x in values)
-
-
 @torch.compile(fullgraph=True)
 def block_means(q, k, v, block_sizes, coarse_blocks):
-    """Detached FP32 routing means and differentiable BF16 coarse means."""
-    qm, km, vm = _block_means_fp32(q, k, v, block_sizes, coarse_blocks)
-    return qm.detach(), km.detach(), qm.to(q.dtype), km.to(k.dtype), vm.to(v.dtype)
+    """Return detached FP32 routing Q/K and differentiable coarse Q/K/V.
 
-
-@torch.compile(fullgraph=True)
-def ring_block_means(q, k, v, block_sizes):
-    """All local means in FP32, including zero-filled dummy ring blocks."""
-    return _block_means_fp32(q, k, v, block_sizes)
+    Coarse means use the input dtype (BF16 in VSA). Include all regions of
+    VSA samples and exclude entire fine-only samples.
+    """
+    q_mean, k_mean, v_mean = (
+        x.view(block_sizes.numel(), BLOCK, *x.shape[1:])[coarse_blocks].sum(1, dtype=torch.float32)
+        / block_sizes[coarse_blocks, None, None] for x in (q, k, v)
+    )
+    return (q_mean.detach(), k_mean.detach(),
+            q_mean.to(q.dtype), k_mean.to(k.dtype), v_mean.to(v.dtype))
 
 
 @triton.jit(do_not_specialize=["N", "COARSE_N"])
@@ -197,6 +237,14 @@ def fine_coarse_gate_add(fine, gate, coarse, row_coarse, coarse_rows):
     in FP32 and cast once on store, without a materialized FP32 coarse copy.
     """
     return _FineCoarseGateAdd.apply(fine, gate, coarse, row_coarse, coarse_rows)
+
+
+@torch.compile(fullgraph=True)
+def ring_block_means(q, k, v, block_sizes):
+    """All local means in FP32, including zero-filled dummy ring blocks."""
+    shape = (block_sizes.numel(), BLOCK, *q.shape[1:])
+    denominator = block_sizes.clamp_min(1)[:, None, None]
+    return tuple(x.view(shape).sum(1, dtype=torch.float32) / denominator for x in (q, k, v))
 
 
 def _align_peers(tensor):

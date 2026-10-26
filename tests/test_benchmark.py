@@ -127,6 +127,7 @@ def test_unified_cli_defaults_and_layouts():
     assert (single.cases, single.heads, single.input_order) == (["default"], [2, 4], "raster")
     assert (single.warmup, single.repeats, single.profile) == (5, 80, True)
     assert (ring.heads, ring.input_order, ring.warmup, ring.repeats, ring.profile) == ([2], "block", 3, 30, False)
+    assert parse_args(["--ring", "--heads", "1", "8"]).heads == [1, 8]
     assert parse_args(["--input-order", "block", "--no-profile"]).input_order == "block"
     args = parse_args(["--ring", "--heads", "2", "4", "--bwd-bucket-size", "backend", "--output", "run.json"])
     assert args.bwd_bucket_size is None and args.heads == [2, 4] and args.output.name == "run.json"
@@ -135,6 +136,7 @@ def test_unified_cli_defaults_and_layouts():
 @pytest.mark.parametrize("argv", [
     ["--ring", "--input-order", "raster"], ["--ring-size", "2"], ["--batch-p2p"],
     ["--ring", "--ring-size", "0"], ["--ring", "--bwd-bucket-size", "0"],
+    ["--heads", "0"], ["--heads", "-1"],
     ["--warmup", "0"], ["--repeats", "0"], ["--eps", "nan"],
 ])
 def test_unified_cli_rejects_invalid_options_before_cuda(argv):
@@ -167,3 +169,10 @@ def test_distributed_mfu_is_per_gpu():
     flops = {"forward": 2e12, "backward": 4e12, "total": 6e12}
     result = summarize(samples, flops, 2500, world_size=4)
     assert all(row["tflops"] == 250 and row["mfu_percent"] == 10 for row in result.values())
+
+
+def test_custom_head_count_inputs():
+    xs, dy = make_inputs(1, device="cpu", samples=benchmark_inputs.CASES["dense"])
+    assert all(x.shape == (184, 1, HEAD_DIM) for x in (*xs, dy))
+    with pytest.raises(ValueError, match="Head count must be positive"):
+        make_inputs(0, device="cpu")

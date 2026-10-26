@@ -61,8 +61,8 @@ def make_inputs(heads=2, *, device="cuda", dtype=torch.bfloat16, seed=2026, samp
 
     Timing uses autograd.grad, so neither backend accumulates into leaf .grad.
     """
-    if heads not in HEAD_COUNTS:
-        raise ValueError(f"Timed inputs require heads in {HEAD_COUNTS}")
+    if heads < 1:
+        raise ValueError("Head count must be positive")
     samples = make_geometry() if samples is None else samples
     tokens = sum(seg.tokens for sample in samples for seg in sample)
     generator = torch.Generator(device=device).manual_seed(seed)

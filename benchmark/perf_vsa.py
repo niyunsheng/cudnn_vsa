@@ -36,7 +36,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ring", action="store_true", help="Run under torchrun with explicit NCCL groups")
     parser.add_argument("--cases", nargs="+", choices=("default", *CASES))
-    parser.add_argument("--heads", nargs="+", type=int, choices=HEAD_COUNTS)
+    parser.add_argument("--heads", nargs="+", type=int)
     parser.add_argument("--input-order", choices=("raster", "block"))
     parser.add_argument("--dense-query-full", action="store_true")
     parser.add_argument("--eps", type=float, default=1e-5)
@@ -63,6 +63,8 @@ def parse_args(argv=None):
     args.cases = args.cases or (["ragged", "empty_peers", "dense", "single64k", "thd64k"]
                                if args.ring else ["default"])
     args.heads = args.heads or ([2] if args.ring else list(HEAD_COUNTS))
+    if min(args.heads) < 1:
+        parser.error("Head counts must be positive")
     args.input_order = args.input_order or ("block" if args.ring else "raster")
     if args.ring and args.input_order != "block":
         parser.error("--ring requires --input-order block")

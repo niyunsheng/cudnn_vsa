@@ -284,7 +284,7 @@ outside timing. The comparison writes `benchmark/results/compare.json`.
 
 `benchmark.perf_vsa` also runs distributed workloads with `--ring` (commands
 below). Both modes share input generation, numerical checks, graph capture and
-timing. `--cases` selects workloads, `--heads` accepts 2 and/or 4, `--check-only`
+timing. `--cases` selects workloads, `--heads` selects one or more head counts, `--check-only`
 runs reference and retained-backward checks, and `--output` accepts a JSON file
 or directory. The `vsa-perf/v4` JSON uses `<case>-h<heads>` keys; each case records
 checks, global useful FLOPs and per-GPU throughput/MFU. Ring timing samples are

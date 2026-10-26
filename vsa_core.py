@@ -72,7 +72,7 @@ def _route_group(q, k, group, index, template, *, key_offset=0, dense_rows=0):
 
 @torch.no_grad()
 def route(q, k, groups, template, *, dense_query_full):
-    """CP1 routing: Q/K contain compact means of non-fine-only samples."""
+    """Route Q/K compact means of samples that include coarse attention."""
     if not any(g.kept < g.blocks for g in groups):
         return template
     index = template.clone()
@@ -103,7 +103,7 @@ def attention_slots(q, k, v, layout, *, scale=None):
     """Internal cuDNN BSA fine and FA4 coarse attention.
 
     Returns fine in slot order and compact coarse (None for entirely dense packs).
-    No projection, CP communication, row conversion or training-framework imports.
+    No projection, row conversion or training-framework imports.
     """
     scale = q.shape[-1]**-0.5 if scale is None else scale
     indices = layout.routing_indices

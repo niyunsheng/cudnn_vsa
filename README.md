@@ -88,7 +88,7 @@ already in block order go directly to attention. Keep that order across layers.
 Both `to_block_order` and `to_raster_order` return a tuple, including for one
 tensor. They accept contiguous CUDA `[T, ...]` tensors on the layout's device,
 with different row shapes and floating-point or integer dtypes. Use a full
-block layout before any sequence sharding. For a complete model, call
+block layout. For a complete model, call
 `to_block_order(hidden_states, positions, vsa_layout=layout)` before generating
 the layers' Q/K/V/gate; those projections then inherit block order. The
 operator-level example below starts from already projected raster tensors:

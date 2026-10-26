@@ -29,7 +29,7 @@ def to_block_order(*tensors, vsa_layout):
 
     Accept contiguous CUDA [T, ...] tensors with different row shapes/dtypes,
     such as hidden states, Q/K/V/gate and integer positions. Use a full block
-    layout and call once before the VSA stack, before any sequence sharding.
+    layout and call once before the VSA stack.
     Every tensor retains its shape and dtype; gradients invert the permutation.
     Already block-ordered inputs do not need this conversion.
     """

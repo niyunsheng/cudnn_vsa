@@ -108,3 +108,62 @@ def test_mfu_counts_valid_isolated_pairs_and_no_image_coarse(heads, dense_query_
     assert [g["padded_tokens"] for g in geometry] == [192, 128, 128]
     for record, sample in zip(geometry, SAMPLES):
         assert record["segments"] == [{"kind": s.kind, "size": s.size, "sparsity": s.sparsity} for s in sample]
+
+
+@pytest.mark.parametrize("case", ["ragged", "empty_peers", "fine_only_peer", "dense"])
+def test_named_inputs_preserve_seeded_reference(case):
+    samples = benchmark_inputs.case_geometry(case)
+    xs, dy = make_inputs(2, device="cpu", samples=samples, seed=937)
+    tokens = sum(seg.tokens for sample in samples for seg in sample)
+    torch.manual_seed(937)
+    expected = [torch.randn(tokens, 2, HEAD_DIM, dtype=torch.bfloat16) for _ in range(5)]
+    for actual, reference in zip((*xs, dy), expected):
+        torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+
+
+def test_unified_cli_defaults_and_layouts():
+    from benchmark.perf_vsa import parse_args
+    single, ring = parse_args([]), parse_args(["--ring"])
+    assert (single.cases, single.heads, single.input_order) == (["default"], [2, 4], "raster")
+    assert (single.warmup, single.repeats, single.profile) == (5, 80, True)
+    assert (ring.heads, ring.input_order, ring.warmup, ring.repeats, ring.profile) == ([2], "block", 3, 30, False)
+    assert parse_args(["--input-order", "block", "--no-profile"]).input_order == "block"
+    args = parse_args(["--ring", "--heads", "2", "4", "--bwd-bucket-size", "backend", "--output", "run.json"])
+    assert args.bwd_bucket_size is None and args.heads == [2, 4] and args.output.name == "run.json"
+
+
+@pytest.mark.parametrize("argv", [
+    ["--ring", "--input-order", "raster"], ["--ring-size", "2"], ["--batch-p2p"],
+    ["--ring", "--ring-size", "0"], ["--ring", "--bwd-bucket-size", "0"],
+    ["--warmup", "0"], ["--repeats", "0"], ["--eps", "nan"],
+])
+def test_unified_cli_rejects_invalid_options_before_cuda(argv):
+    from benchmark.perf_vsa import parse_args
+    with pytest.raises(SystemExit) as error:
+        parse_args(argv)
+    assert error.value.code == 2
+
+
+def test_shared_validation_handles_empty_unused_and_retained_gradients():
+    from benchmark.utils import backward, check_tensors, forward_backward, similarity
+    q, unused = torch.randn(3, requires_grad=True), torch.randn(3, requires_grad=True)
+    dy = torch.ones_like(q)
+    actual = forward_backward(lambda q, unused: q.square(), (q, unused), dy, retain_graph=True)
+    assert torch.equal(actual[1], 2*q) and torch.count_nonzero(actual[2]) == 0
+    repeated = (actual[0], *backward(actual[0], (q, unused), dy))
+    assert check_tensors(repeated, actual, 1e-5)["passed"]
+    empty = torch.empty(0, 2, 128)
+    assert check_tensors((empty,), (empty,), 1e-5)["passed"]
+    with pytest.raises(ValueError, match="Shape mismatch"):
+        similarity(empty, torch.empty(0, 4, 128))
+    with pytest.raises(ValueError, match="numbers of tensors"):
+        check_tensors((q,), (), 1e-5)
+    with pytest.raises(AssertionError):
+        check_tensors((q,), (-q,), 1e-5)
+
+
+def test_distributed_mfu_is_per_gpu():
+    samples = [{"forward": 2., "backward": 4., "total": 6.}]
+    flops = {"forward": 2e12, "backward": 4e12, "total": 6e12}
+    result = summarize(samples, flops, 2500, world_size=4)
+    assert all(row["tflops"] == 250 and row["mfu_percent"] == 10 for row in result.values())

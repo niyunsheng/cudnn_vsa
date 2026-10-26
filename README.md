@@ -276,8 +276,20 @@ python -m benchmark.compare --peak-tflops 2500 --warmup 30 --repeats 500 --round
 
 Both use CUDA Graph and validate replay against eager execution. Timing covers
 packing, pooling, routing, fine, coarse, restoration and merge.
-`benchmark/results/perf_vsa/` contains `perf.json` and `vsa-h{2,4}.trace.json`;
-traces are collected after timing. The comparison writes `benchmark/results/compare.json`.
+`benchmark/results/perf_vsa/` contains `perf.json` and
+`perf-default-h{2,4}-rank0.trace.json`; traces are collected after timing.
+Use `--input-order block` to measure compact block inputs, `--eager` for eager
+execution, or `--no-profile` to omit traces. Input generation/reordering is
+outside timing. The comparison writes `benchmark/results/compare.json`.
+
+`benchmark.perf_vsa` also runs distributed workloads with `--ring` (commands
+below). Both modes share input generation, numerical checks, graph capture and
+timing. `--cases` selects workloads, `--heads` accepts 2 and/or 4, `--check-only`
+runs reference and retained-backward checks, and `--output` accepts a JSON file
+or directory. The `vsa-perf/v4` JSON uses `<case>-h<heads>` keys; each case records
+checks, global useful FLOPs and per-GPU throughput/MFU. Ring timing samples are
+reduced across ranks before summarizing. Ring defaults to H=2 and omits traces;
+add `--profile` to save a trace per rank.
 
 MFU counts each method's valid attention GEMM FLOPs; backward is twice forward.
 Padding, routing and non-GEMM operations are excluded from the FLOP numerator.
@@ -321,19 +333,19 @@ original/changed inputs are checked before timing. Repeat with
 
 ```bash
 # Ragged samples, partial blocks and ranks with no valid tokens.
-torchrun --standalone --nproc-per-node=8 --module benchmark.ring \
+torchrun --standalone --nproc-per-node=8 --module benchmark.perf_vsa --ring \
   --cases ragged empty_peers dense
 # Interleaved groups; repeat with --ring-size 1 and 4.
-torchrun --standalone --nproc-per-node=8 --module benchmark.ring \
+torchrun --standalone --nproc-per-node=8 --module benchmark.perf_vsa --ring \
   --ring-size 2 --cases ragged empty_peers dense
 # Device-bound groups and batched P2P.
-torchrun --standalone --nproc-per-node=8 --module benchmark.ring \
+torchrun --standalone --nproc-per-node=8 --module benchmark.perf_vsa --ring \
   --eager-group --cases ragged empty_peers dense
 # Single/packed 64k workloads, plus timing after numerical checks.
-torchrun --standalone --nproc-per-node=8 --module benchmark.ring \
+torchrun --standalone --nproc-per-node=8 --module benchmark.perf_vsa --ring \
   --high-priority-group --cases single64k thd64k --warmup 30 --repeats 500
 # Strict reproduction of the known fine-only-sample precision limit.
-torchrun --standalone --nproc-per-node=8 --module benchmark.ring \
+torchrun --standalone --nproc-per-node=8 --module benchmark.perf_vsa --ring \
   --ring-size 2 --cases fine_only_peer --check-only
 ```
 

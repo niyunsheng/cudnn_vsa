@@ -183,14 +183,86 @@ Generate or convert positions consistently. Equal contiguous token slices of
 the full stream do not implement cyclic block ownership. Any Ulysses all-to-all
 is also caller-owned and must preserve the required local block order.
 
+### Worked example: two samples on three ranks
+
+Pack these independent samples, with R=3:
+
+- **A:** sparse video `(4, 6, 8)` with `sparsity=0.5`, then 20 text tokens.
+  Block order places text first: `b0` has 20 tokens; the four video tiles
+  `b1..b4` have 64, 64, 32 and 32 tokens.
+- **B:** a dense image `(1, 3, 5)` with `sparsity=None`, then 7 text tokens.
+  Both segments are dense, so their declared order is retained: `b5` has
+  15 image tokens and `b6` has 7 text tokens.
+
+Block IDs continue across samples. A has five blocks and B has two; neither
+count is divisible by R. Arrows below show the one-time distribution at the
+dataset/model boundary. The rank boxes contain **only valid input tokens**.
+
+```mermaid
+flowchart LR
+    A["Sample A: b0, b1, b2, b3, b4<br/>212 tokens"]
+    B["Sample B: b5, b6<br/>22 tokens"]
+    R0["rank 0: b0 | b3 | b6<br/>59 tokens"]
+    R1["rank 1: b1 | b4<br/>96 tokens"]
+    R2["rank 2: b2 | b5<br/>79 tokens"]
+    A -->|b0, b3| R0
+    A -->|b1, b4| R1
+    A -->|b2| R2
+    B -->|b6| R0
+    B -->|b5| R2
+```
+
+Each rank concatenates its blocks in increasing global-ID order, preserving
+valid-token order within each block. For example, rank 0 supplies 20 tokens
+from `b0`, then 32 from `b3`, then 7 from `b6`, with no gaps. B starts at `b5`
+on rank 2; ownership does not restart at rank 0 for each sample.
+
+Attention internally allocates `ceil(7 / 3) = 3` blocks of 64 slots per rank:
+
+| Group rank | Global block IDs in local slot order | Valid sizes per slot block | Compact input rows | Internal slot rows |
+| --- | --- | --- | ---: | ---: |
+| 0 | `b0, b3, b6` | `20, 32, 7` | 59 | 192 |
+| 1 | `b1, b4, dummy` | `64, 32, 0` | 96 | 192 |
+| 2 | `b2, b5, dummy` | `64, 15, 0` | 79 | 192 |
+
+Unused slots are zero-filled and excluded from attention and pooling. The
+caller supplies 234 valid tokens in total, not 576 slot rows. Q/K/V/gate and
+positions use the same local order; the output and its gradients retain it.
+
 ### Execution
 
 Pool local Q/K/V in FP32 and all-gather pooled K/V for global per-region top-k
 routing and coarse attention. Fine attention keeps Q local and circulates
 BF16 K/V shards. Selected global block IDs are partitioned by owner and
 translated into local slot IDs; partial outputs and log-sum-exp are merged
-in FP32. The ring transport uses these IDs and valid block sizes, while the
+in FP32. Fine-attention kernels use these IDs and valid block sizes; the
 layout and router enforce sample boundaries and KV budgets.
+
+For the example above, let `KV_r` be rank r's entire internal K/V shard,
+including its slot padding. Q stays on its original rank throughout fine
+attention; K/V moves to the next group rank:
+
+```mermaid
+flowchart LR
+    R0["rank 0<br/>Q0 stays local"] -->|K/V| R1["rank 1<br/>Q1 stays local"]
+    R1 -->|K/V| R2["rank 2<br/>Q2 stays local"]
+    R2 -->|K/V| R0
+```
+
+| Fine-attention step | Rank 0 uses | Rank 1 uses | Rank 2 uses |
+| --- | --- | --- | --- |
+| 0: own shard | `Q0, KV0` | `Q1, KV1` | `Q2, KV2` |
+| 1: after one hop | `Q0, KV2` | `Q1, KV0` | `Q2, KV1` |
+| 2: after two hops | `Q0, KV1` | `Q1, KV2` | `Q2, KV0` |
+
+Each step evaluates only the selected KV blocks owned by that peer. For
+example, global `b5` maps to owner `5 % 3 = 2`, local block `5 // 3 = 1`.
+When rank 0 receives `KV2`, its B query block `b6` may attend to B's `b5`;
+its A query blocks cannot attend to `b5`. The **layout/router** enforce this
+sample isolation through the block lists. The **transport** just moves
+buffers; it does not interpret FHW coordinates or infer THD sample boundaries.
+Partial outputs are weighted using their log-sum-exp normalizers so the final
+fine output has one softmax normalization over all selected KV blocks.
 
 Backward traverses the ring in reverse, using the final fine output and
 log-sum-exp, and accumulates dQ/dK/dV in FP32. The pooled-mean gather has a
@@ -204,6 +276,42 @@ Caller-created high-priority NCCL groups can improve overlap.
 SM100, H=2, one sample and 128 physical local blocks; other shapes use the
 backend default. Pass `None` for the backend default everywhere, or a positive
 integer to select a bucket size.
+
+### Why this design
+
+- **Keep the sparse-attention unit intact.** Pooling, routing and cuDNN BSA
+  operate on whole blocks. A contiguous FHW sequence shard can split one
+  4×4×4 tile across ranks. Ordering and distributing whole blocks once at the
+  dataset/model boundary gives every block a single owner; subsequent layers
+  can pool and project local tokens directly. Compact input also keeps slot
+  padding out of the surrounding projections and MLPs.
+- **Use a simple, reusable ownership map.** `owner = b % R` and
+  `local_block = b // R` let every rank translate global routing decisions
+  without exchanging token-location maps on each layer. Consecutive blocks
+  from a long sample spread across ranks. Continuing the cycle across samples
+  distributes the total block count with at most one block's difference
+  between ranks, including short samples and partial tiles. Token counts and
+  compute can still differ, as the example shows.
+- **Keep global routing information small.** Local Q blocks need pooled K
+  from candidate blocks across the full sample to preserve the per-region
+  top-k budgets. Coarse attention also needs pooled K/V. Gathering one summary
+  per block provides that view, while fine attention streams token-level K/V
+  through two receive/compute buffers instead of storing all peers' full K/V
+  at once. Q, output accumulation and dQ stay local.
+- **Keep communication shapes predictable.** Equal internal slot capacities
+  make P2P transfers match and support CUDA Graph reuse. Valid sizes and
+  routing counts exclude partial/dummy slots from the math. Sample boundaries
+  remain explicit metadata even when one rank holds blocks from several
+  samples; empty ranks still participate in the communication schedule.
+
+The tradeoff is that fine attention circulates **whole padded K/V shards**,
+even when routing selects few blocks from a peer. Sparsity reduces attention
+work but does not proportionally reduce these transferred bytes. Pooled K/V
+is still gathered globally, and additional ranks add communication steps.
+Cyclic ownership is therefore a simple block-count distribution, not a
+guarantee of balanced compute or higher MFU for every workload.
+The cyclic rule is a layout policy: another whole-block partition would need
+corresponding ownership and index mappings in this implementation.
 
 ## Attention semantics
 

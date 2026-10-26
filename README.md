@@ -347,6 +347,9 @@ torchrun --standalone --nproc-per-node=8 --module benchmark.perf_vsa --ring \
 # Strict reproduction of the known fine-only-sample precision limit.
 torchrun --standalone --nproc-per-node=8 --module benchmark.perf_vsa --ring \
   --ring-size 2 --cases fine_only_peer --check-only
+# Strict empty-peer precision reproduction with one attention head.
+torchrun --standalone --nproc-per-node=4 --module benchmark.perf_vsa --ring \
+  --heads 1 --cases empty_peers --check-only
 ```
 
 Ring input defaults to block order and rejects raster order. For multiple
@@ -362,6 +365,8 @@ The strict `fine_only_peer` case has a known BF16 precision limitation: dK
 for a six-token fine-only sample can fall below the unchanged 0.99999 native
 reference similarity threshold. The command above reports failure when it
 reproduces the limit. This case remains part of the validation surface.
+The H=1, R=4 `empty_peers` case also has a BF16 dQ precision limit below the
+same threshold. Both commands retain their strict checks and report failure.
 
 [MIT License](LICENSE).
 

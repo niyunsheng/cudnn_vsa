@@ -201,15 +201,16 @@ handled; a dense image inside a VSA sample still participates in coarse.
 
 ## Performance
 
-The benchmark uses the sample above: 121 frames,
-4× temporal and 16× spatial compression, 2048 text tokens per sample,
-124944 tokens total, H=2/4, D=128, video sparsity 0.9, `dense_query_full=False`.
+The benchmark packs one 720p 5-second video and two independent 720p images,
+each with text: 121 video frames, 4× temporal and 16× spatial compression,
+2048 text tokens per sample, 124944 tokens total, H=2/4, D=128, video sparsity
+0.9, `dense_query_full=False`. VSA uses the default `input_order="raster"`.
 
 ```bash
 # VSA forward/backward time, MFU and torch traces.
 python -m benchmark.perf_vsa --peak-tflops 2500
 # FA4 full vs VSA, alternating order on the same GPU.
-python -m benchmark.compare --peak-tflops 2500
+python -m benchmark.compare --peak-tflops 2500 --warmup 30 --repeats 500 --rounds 2
 ```
 
 Both use CUDA Graph and validate replay against eager execution. Timing covers
@@ -221,42 +222,19 @@ MFU counts each method's valid attention GEMM FLOPs; backward is twice forward.
 Padding, routing and non-GEMM operations are excluded from the FLOP numerator.
 Set `--peak-tflops` to your GPU's dense BF16 peak.
 
-The table below is a baseline measured before shared-core extraction and
-compact block input support.
-
-Environment: GB200 (2500 TFLOP/s BF16), PyTorch 2.12, CUDA 13.2, cuDNN 9.22 / frontend 1.28.0, Triton 3.6, CuTe 4.6.2, FA4 4.0.0b35.
+Environment: GB200 (2500 TFLOP/s BF16), PyTorch 2.12.0a0/NV26.04, CUDA 13.2, cuDNN 9.22 / frontend 1.28.0, Triton 3.6, CuTe 4.6.2, FA4 4.0.0b35.
 
 | Method | H | Forward ms | Forward MFU | Backward ms | Backward MFU | F+B ms | F+B MFU |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| FA4 full | 2 | 9.201 | 57.78% | 25.363 | 41.92% | 34.460 | 46.28% |
-| cuDNN VSA | 2 | 2.338 | 25.10% | 6.702 | 17.51% | 9.044 | 19.47% |
-| FA4 full | 4 | 18.535 | 57.37% | 50.575 | 42.05% | 69.102 | 46.16% |
-| cuDNN VSA | 4 | 4.582 | 25.61% | 13.166 | 17.82% | 17.756 | 19.82% |
+| FA4 full | 2 | 9.319 | 57.05% | 25.652 | 41.45% | 34.959 | 45.62% |
+| cuDNN VSA (raster) | 2 | 2.364 | 24.83% | 6.753 | 17.38% | 9.117 | 19.31% |
+| FA4 full | 4 | 18.790 | 56.59% | 51.389 | 41.38% | 70.210 | 45.43% |
+| cuDNN VSA (raster) | 4 | 4.726 | 24.82% | 13.444 | 17.45% | 18.164 | 19.38% |
 
-CUDA Graph, 5 warmups, 80 timed replays; each time column is an independent
-median. FA4 full and VSA were measured in separate runs with the same workload
-and environment.
-
-### Shared core and input layouts
-
-The shared-core implementation was compared with the original raster-input
-implementation on the same GB200, using separate baseline/candidate/candidate/
-baseline runs for raster and block inputs. Each case used 30 warmups and
-500 timed CUDA Graph replays. The eight
-cases cover single/packed 720p5s, H2/H4 and aligned 64k under both dense-query
-policies. Software: PyTorch 2.12.0a0/NV26.04, CUDA 13.2, cuDNN frontend 1.28.0,
-CuTe 4.6.2 and FA4 4.0.0b35. Relative MFU changes are:
-
-| Candidate input | Forward | Backward | Total |
-| --- | ---: | ---: | ---: |
-| Raster | -0.166% to +0.520% | -0.450% to +0.113% | -0.205% to +0.104% |
-| Block | +1.690% to +11.735% | +0.163% to +4.312% | +0.527% to +6.313% |
-
-Raster packed 720p5s/H2 with `dense_query_full=True` loses 0.205% total MFU
-and 0.450% backward MFU. Its total-time control/repeat drift is 0.029% / 0.083%,
-so a universal no-regression claim is not supported. Block timings exclude
-the caller's one-time model-boundary permutation; these are standalone
-operator measurements, not end-to-end training results.
+CUDA Graph, 30 warmups per measurement, two rounds of 500 timed replays per
+method. FA4 full and VSA alternate order on the same GPU. Each time column is
+an independent median over 1000 replays. These are standalone operator
+measurements; raster-to-slot reordering and padding are included in VSA time.
 
 ## Tests
 

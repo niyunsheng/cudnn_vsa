@@ -61,3 +61,31 @@ CUDA input orders, and original/changed-input CUDA Graph replay. Full and
 partial blocks, multiple samples, multiple video segments and dense samples
 are covered. Existing routing, attention and kernel tests exercise the
 extracted core. These correctness checks do not establish MFU parity.
+
+### PR A validation, 2026-10-25
+
+Runtime revision `9cf46a2` passes 99 CPU tests (40 CUDA skips, two optional
+FastVideo tests deselected) and 139 GPU tests (two optional FastVideo tests
+deselected). Forty additional CPU routing comparisons match original main
+exactly. SLURM 8296435 completes with exit 0 on GB200, including both input
+orders, gradients and original/changed-input CUDA Graph replay.
+
+Two separate main/candidate/candidate/main comparisons measure candidate
+raster and candidate block against original main `e5976aa` raster. All arms
+run serially on the same GPU, with 30 warmups and 500 timed replays per case.
+Cases cover single/packed 720p5s, H2/H4 and aligned 64k under both dense-query
+policies. Software is PyTorch 2.12.0a0/NV26.04, CUDA 13.2, cuDNN frontend
+1.28.0, CuTe 4.6.2 and FA4 4.0.0b35. Source hashes match the tested revisions.
+
+Relative MFU changes across the eight cases are:
+
+| Candidate input | Forward | Backward | Total |
+| --- | ---: | ---: | ---: |
+| Raster | -0.166% to +0.520% | -0.450% to +0.113% | -0.205% to +0.104% |
+| Block | +1.690% to +11.735% | +0.163% to +4.312% | +0.527% to +6.313% |
+
+Raster packed 720p5s/H2 with `dense_query_full=True` loses 0.205% total MFU
+and 0.450% backward MFU. Its total-time control/repeat drift is 0.029% / 0.083%,
+so a universal no-regression claim is not supported. Block timings exclude
+the caller's one-time model-boundary permutation; these are standalone
+operator measurements, not end-to-end training results.

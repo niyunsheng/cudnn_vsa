@@ -43,8 +43,9 @@ out.backward(torch.randn_like(out))
 ```
 
 Each inner list is one joint sample; different samples cannot attend to each
-other. Inputs follow the sample and segment order in `samples`. Each sample
-contains at least one video, with optional additional video/image, text, audio
+other. With the default raster order, inputs follow the sample and segment
+order in `samples`. Each sample contains at least one video, with optional
+additional video/image, text, audio
 or keyframe segments. Video sizes are `(F, H, W)` token grids in raster order;
 `F=1` is an image. Other segment kinds take token counts and use `sparsity=None`.
 Reuse the layout across layers with the same geometry and settings.
@@ -57,16 +58,36 @@ Reuse the layout across layers with the same geometry and settings.
 | `"block"` | Compact canonical blocks, no padding | Add padding only; skip copies for full blocks |
 
 Pass `input_order="block"` to `build_vsa_layout` when the caller already
-supplies block-ordered tokens. Each sample places dense segment blocks first,
-followed by sparse video tiles. `layout.input_rows` maps these rows back to
-the original raster stream. Apply the same ordering to Q/K/V, gate, positional
-coordinates and dO. Outputs and gradients preserve the supplied token order.
+supplies block-ordered tokens. Samples stay in declared order. Within each
+sample, dense segments come first in chunks of at most 64 tokens, followed by
+numeric-sparsity video segments in 4×4×4 tiles. Segment order is preserved
+within each category; blocks never cross segment or sample boundaries.
+`layout.input_rows[i]` gives the original raster row for supplied row `i`
+(an identity map for raster inputs). Apply the same ordering to Q/K/V, gate,
+positional coordinates and dO. Outputs and gradients preserve that order.
 The one-time FHW-to-block reorder belongs before the entire VSA stack, outside
 this library; inputs never contain padding. Reuse the layout across layers.
-See [input layouts and module responsibilities](docs/input_layout.md).
+
+Internally, blocks occupy 64 slots: `slot_row` maps slots to input rows, using
+`-1` for padding, and `row_slot` is the inverse map for valid rows. Block inputs
+use fused Q/K/V padding and fused dQ/dK/dV restoration; padding is zero and
+excluded from means and attention. `slots_are_input` skips conversion for
+full block inputs. Full raster blocks still require the FHW permutation.
 
 Add this directory to `PYTHONPATH`, or copy `vsa.py`, `vsa_core.py`,
 `vsa_layout.py` and `vsa_kernels.py` into your project and adjust imports.
+
+## Code structure
+
+| File | Responsibility |
+| --- | --- |
+| `vsa.py` | Public entry: validation, slot conversion, row restoration and gated coarse merge |
+| `vsa_core.py` | Per-region routing, cuDNN BSA forward/backward, FA4 coarse attention and execution order |
+| `vsa_layout.py` | Static sample/block geometry, row maps, routing templates and coarse boundaries |
+| `vsa_kernels.py` | Slot gathers, fused Q/K/V padding, FP32 pooling and gated merge kernels |
+
+Both input orders share the core's attention math, per-region budgets and
+fine-before-coarse schedule. The core does not import the public entry.
 
 ## Attention semantics
 
@@ -161,6 +182,26 @@ CUDA Graph, 5 warmups, 80 timed replays; each time column is an independent
 median. FA4 full and VSA were measured in separate runs with the same workload
 and environment.
 
+### Shared core and input layouts, 2026-10-25
+
+Revision `9cf46a2` was compared with original main `e5976aa` raster on the same
+GB200, using separate main/candidate/candidate/main runs for raster and block
+inputs. Each case used 30 warmups and 500 timed CUDA Graph replays. The eight
+cases cover single/packed 720p5s, H2/H4 and aligned 64k under both dense-query
+policies. Software: PyTorch 2.12.0a0/NV26.04, CUDA 13.2, cuDNN frontend 1.28.0,
+CuTe 4.6.2 and FA4 4.0.0b35. Relative MFU changes are:
+
+| Candidate input | Forward | Backward | Total |
+| --- | ---: | ---: | ---: |
+| Raster | -0.166% to +0.520% | -0.450% to +0.113% | -0.205% to +0.104% |
+| Block | +1.690% to +11.735% | +0.163% to +4.312% | +0.527% to +6.313% |
+
+Raster packed 720p5s/H2 with `dense_query_full=True` loses 0.205% total MFU
+and 0.450% backward MFU. Its total-time control/repeat drift is 0.029% / 0.083%,
+so a universal no-regression claim is not supported. Block timings exclude
+the caller's one-time model-boundary permutation; these are standalone
+operator measurements, not end-to-end training results.
+
 ## Tests
 
 The tests cover both input orders against independent token math, fused padding
@@ -175,6 +216,14 @@ python -m pytest -q -m 'not fastvideo'
 python -m pip install -r tests/requirements-fastvideo.txt
 python -m pytest -q tests/test_fastvideo.py
 ```
+
+Revision `9cf46a2`: 99 CPU tests passed (40 CUDA skips, two optional FastVideo
+tests deselected); 139 GPU tests passed (two optional tests deselected).
+Forty additional routing comparisons matched main exactly. SLURM 8296435
+completed with exit 0; eight benchmark files passed 960 output/gradient/replay
+comparisons, with runtime/benchmark source hashes verified. The GPU unit suite
+provides the small native-reference checks; benchmarks compare each input
+order with its implementation's raster execution and validate graph replay.
 
 [MIT License](LICENSE).
 

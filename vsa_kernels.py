@@ -51,6 +51,48 @@ def from_slots(x, slot_row, row_slot):
     return SlotGather.apply(x, row_slot, slot_row)
 
 
+@triton.jit(do_not_specialize=["N"])
+def _gather_qkv(Q, K, V, MAP, OUT, N, WIDTH: tl.constexpr, TILE: tl.constexpr):
+    offsets = tl.program_id(0) * TILE + tl.arange(0, TILE)
+    rows, cols = offsets // WIDTH, offsets % WIDTH
+    source = tl.load(MAP + rows, mask=offsets < N, other=-1)
+    valid = (offsets < N) & (source >= 0)
+    address = source * WIDTH + cols
+    q = tl.load(Q + address, valid, other=0)
+    k = tl.load(K + address, valid, other=0)
+    v = tl.load(V + address, valid, other=0)
+    tl.store(OUT + offsets, q, offsets < N)
+    tl.store(OUT + N + offsets, k, offsets < N)
+    tl.store(OUT + 2 * N + offsets, v, offsets < N)
+
+
+def gather_qkv(q, k, v, row_map):
+    q, k, v = (x.contiguous() for x in (q, k, v))
+    out = torch.empty((3, row_map.numel(), *q.shape[1:]), device=q.device, dtype=q.dtype)
+    count = out[0].numel()
+    if count:
+        _gather_qkv[(triton.cdiv(count, 1024),)](
+            q, k, v, row_map, out, count, WIDTH=math.prod(q.shape[1:]), TILE=1024)
+    return tuple(out.unbind(0))
+
+
+class _QKVSlotGather(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, slot_row, row_slot):
+        ctx.save_for_backward(row_slot)
+        return gather_qkv(q, k, v, slot_row)
+
+    @staticmethod
+    def backward(ctx, dq, dk, dv):
+        row_slot, = ctx.saved_tensors
+        return (*gather_qkv(dq, dk, dv, row_slot), None, None)
+
+
+def to_slots_qkv(q, k, v, slot_row, row_slot):
+    """Pad compact Q/K/V together, sharing the map and launch in both directions."""
+    return _QKVSlotGather.apply(q, k, v, slot_row, row_slot)
+
+
 @torch.compile(fullgraph=True)
 def block_means(q, k, v, block_sizes, coarse_blocks):
     """Return detached FP32 routing Q/K and differentiable coarse Q/K/V.

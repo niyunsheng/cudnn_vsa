@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 import torch
-from vsa import route
+from vsa_core import route
 import vsa_kernels
 
 ROOT = Path(__file__).resolve().parent.parent

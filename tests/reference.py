@@ -3,7 +3,8 @@ from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
-import vsa as core
+import vsa_core as core
+from vsa import _validate
 import vsa_kernels
 from vsa_layout import build_vsa_layout
 from benchmark.utils import similarity
@@ -83,13 +84,13 @@ def cpu_attention(q, k, v, gate, vsa_layout, *, scale=None):
     Requires the cpu_kernels fixture. This is not the public entry: its CUDA/BF16
     contract is tested separately.
     """
-    core._validate(q, k, v, gate)
+    _validate(q, k, v, gate)
     layout = vsa_layout
     slots = tuple(vsa_kernels.to_slots(x, layout.slot_row, layout.row_slot)
                   for x in (q, k, v))
     with patch.object(core.BlockSparseAttention, "apply", dense_fine), \
          patch.object(core, "coarse_attention", dense_coarse):
-        fine, coarse = core._attention_slots(*slots, layout, scale=scale)
+        fine, coarse = core.attention_slots(*slots, layout, scale=scale)
     out = vsa_kernels.from_slots(fine, layout.slot_row, layout.row_slot)
     if coarse is not None:
         out = vsa_kernels.fine_coarse_gate_add(

@@ -74,7 +74,10 @@ class VSALayout:
 
     Construction lives in build_vsa_layout. __post_init__ builds contiguous
     BSA routing templates for head_num heads and inverse coarse-row groups.
-    Dynamic Q/K routing lives in vsa.route and does not modify these templates.
+    Dynamic Q/K routing lives in vsa_core.route and does not modify these templates.
+    input_order="raster" means original sample/segment order (FHW for video):
+    slot conversion permutes and pads. "block" means compact canonical blocks:
+    slot conversion only pads, or is an identity when every block is full.
     """
     samples: tuple[tuple[Segment, ...], ...]
     head_num: int
@@ -86,6 +89,8 @@ class VSALayout:
     coarse_cu_seqlens: torch.Tensor
     coarse_lengths: tuple[int, ...]
     row_coarse: torch.Tensor
+    input_rows: torch.Tensor
+    input_order: str = "raster"
     dense_query_full: bool = False
     sample_slices: tuple = ()
     routing_indices: torch.Tensor = field(init=False, repr=False)
@@ -94,6 +99,8 @@ class VSALayout:
 
     def __post_init__(self):
         """Build routing templates and coarse-row groups before attention runs."""
+        if self.input_order not in ("raster", "block"):
+            raise ValueError('input_order must be "raster" or "block"')
         if not isinstance(self.head_num, int) or isinstance(self.head_num, bool) or self.head_num <= 0:
             raise ValueError("head_num must be a positive integer")
         if not isinstance(self.dense_query_full, bool):
@@ -145,6 +152,10 @@ class VSALayout:
         return self.padded_tokens == self.tokens
 
     @property
+    def slots_are_input(self):
+        return self.input_order == "block" and self.all_blocks_full
+
+    @property
     def dense_only(self):
         return not self.coarse_lengths
 
@@ -154,12 +165,22 @@ class VSALayout:
 
 
 def _finalize_layout(samples, block_rows, groups, sample_slices, *, head_num,
-                     dense_query_full, device) -> VSALayout:
+                     dense_query_full, device, input_order="raster") -> VSALayout:
     """Materialize padding, inverse maps and coarse metadata from planned blocks.
 
     Each block lists its valid original token rows. Block order, sample bounds
     and KV budgets are already fixed; this stage only derives runtime metadata.
     """
+    token_count = sum(map(len, block_rows))
+    input_rows = (list(range(token_count)) if input_order == "raster" else
+                  [row for rows in block_rows for row in rows])
+    if input_order == "block":
+        offset = 0
+        compact_blocks = []
+        for rows in block_rows:
+            compact_blocks.append(list(range(offset, offset + len(rows))))
+            offset += len(rows)
+        block_rows = compact_blocks
     slots = [r for rows in block_rows for r in rows + [-1] * (BLOCK-len(rows))]
     inverse = [0] * sum(len(rows) for rows in block_rows)
     for slot, row in enumerate(slots):
@@ -188,6 +209,8 @@ def _finalize_layout(samples, block_rows, groups, sample_slices, *, head_num,
         coarse_cu_seqlens=tensor(cu, torch.int32),
         coarse_lengths=tuple(b-a for a, b in zip(cu, cu[1:])),
         row_coarse=tensor([block_to_coarse[s//BLOCK] for s in inverse], torch.int64),
+        input_rows=tensor(input_rows, torch.int64),
+        input_order=input_order,
         sample_slices=tuple(sample_slices),
     )
 
@@ -233,11 +256,17 @@ def _build_sample_blocks(segments, *, token_offset, block_offset):
     return block_rows, group, tuple(segment_slices)
 
 
-def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu") -> VSALayout:
+def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
+                     input_order="raster") -> VSALayout:
     """Public layout builder: ordered samples of Segments -> VSALayout.
 
-    Concatenate samples in list order and segments in their original order;
-    video/image rows use FHW raster order. Samples never attend to each other.
+    input_order="raster" (the non-ring default) concatenates samples/segments
+    in their original order, with FHW raster order inside each video.
+    input_order="block" accepts valid rows in canonical block order without
+    padding; the caller reorders once before the stack of VSA layers.
+    input_rows maps either ordering to the original raster stream. The layout
+    records the input order explicitly; it is never inferred from tensor shape.
+    Samples never attend to each other.
     Each sample requires at least one video segment. None sparsity preserves
     segment-internal row order and adds only padding, regardless of frame count.
     Numeric sparsity enables FHW tiling and an independent KV budget per region.
@@ -249,6 +278,16 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu")
     head_num fixes the Q/K/V head count and the prepared BSA template shapes.
     Reuse the layout across calls with the same geometry, policy, heads and device.
     """
+    if input_order not in ("raster", "block"):
+        raise ValueError('input_order must be "raster" or "block"')
+    samples, block_rows, groups, sample_slices = _plan_samples(samples)
+    return _finalize_layout(samples, block_rows, groups, sample_slices,
+                            head_num=head_num, dense_query_full=dense_query_full, device=device,
+                            input_order=input_order)
+
+
+def _plan_samples(samples):
+    """Plan global blocks on the host without allocating a routing table."""
     try:
         samples = tuple(tuple(sample) for sample in samples)
     except TypeError as error:
@@ -268,5 +307,4 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu")
         groups.append(group)
         sample_slices.append(segment_slices)
         token_offset = segment_slices[-1].stop
-    return _finalize_layout(samples, block_rows, groups, sample_slices,
-                            head_num=head_num, dense_query_full=dense_query_full, device=device)
+    return samples, block_rows, groups, sample_slices

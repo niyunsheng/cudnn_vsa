@@ -49,8 +49,24 @@ or keyframe segments. Video sizes are `(F, H, W)` token grids in raster order;
 `F=1` is an image. Other segment kinds take token counts and use `sparsity=None`.
 Reuse the layout across layers with the same geometry and settings.
 
-Add this directory to `PYTHONPATH`, or copy `vsa.py`, `vsa_layout.py` and
-`vsa_kernels.py` into your project and adjust imports.
+`layout.input_order` explicitly declares the token order:
+
+| `input_order` | Input tokens | Slot conversion |
+| --- | --- | --- |
+| `"raster"` (default) | Original sample/segment order, video in FHW order | Reorder into blocks and add padding |
+| `"block"` | Compact canonical blocks, no padding | Add padding only; skip copies for full blocks |
+
+Pass `input_order="block"` to `build_vsa_layout` when the caller already
+supplies block-ordered tokens. Each sample places dense segment blocks first,
+followed by sparse video tiles. `layout.input_rows` maps these rows back to
+the original raster stream. Apply the same ordering to Q/K/V, gate, positional
+coordinates and dO. Outputs and gradients preserve the supplied token order.
+The one-time FHW-to-block reorder belongs before the entire VSA stack, outside
+this library; inputs never contain padding. Reuse the layout across layers.
+See [input layouts and module responsibilities](docs/input_layout.md).
+
+Add this directory to `PYTHONPATH`, or copy `vsa.py`, `vsa_core.py`,
+`vsa_layout.py` and `vsa_kernels.py` into your project and adjust imports.
 
 ## Attention semantics
 
@@ -129,6 +145,9 @@ MFU counts each method's valid attention GEMM FLOPs; backward is twice forward.
 Padding, routing and non-GEMM operations are excluded from the FLOP numerator.
 Set `--peak-tflops` to your GPU's dense BF16 peak.
 
+The table below records the original release (`e5976aa`); it does not measure
+the shared-core/input-layout changes.
+
 Environment: GB200 (2500 TFLOP/s BF16), PyTorch 2.12, CUDA 13.2, cuDNN 9.22 / frontend 1.28.0, Triton 3.6, CuTe 4.6.2, FA4 4.0.0b35.
 
 | Method | H | Forward ms | Forward MFU | Backward ms | Backward MFU | F+B ms | F+B MFU |
@@ -143,6 +162,10 @@ median. FA4 full and VSA were measured in separate runs with the same workload
 and environment.
 
 ## Tests
+
+The tests cover both input orders against independent token math, fused padding
+and its adjoint, and CUDA Graph replay with original and changed inputs. GPU
+tests are skipped when CUDA is unavailable.
 
 ```bash
 python -m pip install 'pytest>=8'

@@ -3,9 +3,10 @@ from functools import partial
 
 import pytest
 import torch
-import vsa as core
+import vsa_core as core
 import vsa_kernels
-from vsa import route, vsa_attention
+from vsa import vsa_attention
+from vsa_core import route
 from vsa_layout import Segment, build_vsa_layout
 
 from tests import reference
@@ -163,7 +164,7 @@ def test_gpu_backend_never_silently_falls_back():
 
 @pytest.mark.parametrize("scale", [None, .2])
 def test_coarse_uses_one_fa4_varlen_call(monkeypatch, scale):
-    import vsa as core
+    import vsa_core as core
 
     layout = build_vsa_layout([
         [Segment("video", (4, 4, 8), .5), Segment("text", 3)],
@@ -245,7 +246,7 @@ def test_segment_sparsity_controls_kv_columns_including_cross_video_attention(de
 @pytest.mark.parametrize("frames,sizes", [(1, [64, 17, 64, 1]), (2, [64, 64, 34, 64, 1])])
 def test_none_sparsity_only_pads_and_uses_full_fine(monkeypatch, frames, sizes):
     import importlib
-    core = importlib.import_module("vsa")
+    core = importlib.import_module("vsa_core")
     layout = build_vsa_layout([(Segment("video", (frames, 9, 9), sparsity=None), Segment("text", 65))], head_num=2)
     assert layout.dense_only and layout.groups[0].video_spans == ()
     assert layout.block_sizes.tolist() == sizes
@@ -300,7 +301,7 @@ def test_numeric_sparsity_enables_image_vsa(sparsity, keep):
 def test_bsa_forward_backward_contract(monkeypatch, full):
     from types import SimpleNamespace
 
-    import vsa as core
+    import vsa_core as core
 
     sizes = None if full else torch.tensor([63], dtype=torch.int32)
     index = torch.zeros((1, 2, 1, 1), dtype=torch.int32)

@@ -52,7 +52,6 @@ Reuse the layout across layers with the same geometry and settings.
 
 Add this directory to `PYTHONPATH`, or copy `vsa.py`, `vsa_core.py`,
 `vsa_layout.py` and `vsa_kernels.py` into your project and adjust imports.
-Include `vsa_ring.py` when using ring context parallelism.
 
 ## Input order
 
@@ -138,10 +137,9 @@ full block inputs. Full raster blocks still require the FHW permutation.
 | File | Responsibility |
 | --- | --- |
 | `vsa.py` | Public attention entry and explicit block/raster reorder helpers |
-| `vsa_core.py` | Per-region routing, cuDNN BSA forward/backward, FA4 coarse attention and execution order |
+| `vsa_core.py` | Routing, cuDNN BSA/FA4 calls, single-device execution and ring communication/autograd |
 | `vsa_layout.py` | Static sample/block geometry, row maps, routing templates and coarse boundaries |
 | `vsa_kernels.py` | Fused token reordering, slot gathers, Q/K/V padding, FP32 pooling and gated merge kernels |
-| `vsa_ring.py` | Process-group runtime, pooled-mean collectives and ring forward/backward scheduling |
 
 Both input orders share the core's attention math, per-region budgets and
 fine-before-coarse schedule. The core does not import the public entry.

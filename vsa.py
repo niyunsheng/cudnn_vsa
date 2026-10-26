@@ -102,9 +102,8 @@ def vsa_attention(q, k, v, gate, vsa_layout, *, scale=None, ring_cp_group=None,
         q_slots, k_slots, v_slots = (
             vsa_kernels.to_slots(x, layout.slot_row, layout.row_slot) for x in (q, k, v))
     if is_ring:
-        from vsa_ring import attention_slots
         scale = q.shape[-1]**-0.5 if scale is None else scale
-        fine, coarse = attention_slots(
+        fine, coarse = vsa_core.ring_attention_slots(
             q_slots, k_slots, v_slots, layout, ring_cp_group, scale=scale,
             batch_p2p=ring_cp_batch_p2p, bwd_bucket_size=ring_cp_bwd_bucket_size)
     else:

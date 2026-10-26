@@ -166,8 +166,8 @@ MFU counts each method's valid attention GEMM FLOPs; backward is twice forward.
 Padding, routing and non-GEMM operations are excluded from the FLOP numerator.
 Set `--peak-tflops` to your GPU's dense BF16 peak.
 
-The table below records the original release (`e5976aa`); it does not measure
-the shared-core/input-layout changes.
+The table below is a baseline measured before shared-core extraction and
+compact block input support.
 
 Environment: GB200 (2500 TFLOP/s BF16), PyTorch 2.12, CUDA 13.2, cuDNN 9.22 / frontend 1.28.0, Triton 3.6, CuTe 4.6.2, FA4 4.0.0b35.
 
@@ -182,11 +182,12 @@ CUDA Graph, 5 warmups, 80 timed replays; each time column is an independent
 median. FA4 full and VSA were measured in separate runs with the same workload
 and environment.
 
-### Shared core and input layouts, 2026-10-25
+### Shared core and input layouts
 
-Revision `9cf46a2` was compared with original main `e5976aa` raster on the same
-GB200, using separate main/candidate/candidate/main runs for raster and block
-inputs. Each case used 30 warmups and 500 timed CUDA Graph replays. The eight
+The shared-core implementation was compared with the original raster-input
+implementation on the same GB200, using separate baseline/candidate/candidate/
+baseline runs for raster and block inputs. Each case used 30 warmups and
+500 timed CUDA Graph replays. The eight
 cases cover single/packed 720p5s, H2/H4 and aligned 64k under both dense-query
 policies. Software: PyTorch 2.12.0a0/NV26.04, CUDA 13.2, cuDNN frontend 1.28.0,
 CuTe 4.6.2 and FA4 4.0.0b35. Relative MFU changes are:
@@ -216,14 +217,6 @@ python -m pytest -q -m 'not fastvideo'
 python -m pip install -r tests/requirements-fastvideo.txt
 python -m pytest -q tests/test_fastvideo.py
 ```
-
-Revision `9cf46a2`: 99 CPU tests passed (40 CUDA skips, two optional FastVideo
-tests deselected); 139 GPU tests passed (two optional tests deselected).
-Forty additional routing comparisons matched main exactly. SLURM 8296435
-completed with exit 0; eight benchmark files passed 960 output/gradient/replay
-comparisons, with runtime/benchmark source hashes verified. The GPU unit suite
-provides the small native-reference checks; benchmarks compare each input
-order with its implementation's raster execution and validate graph replay.
 
 [MIT License](LICENSE).
 

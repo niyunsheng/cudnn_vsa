@@ -1,5 +1,6 @@
 """Routing, packed attention, precision and backend call contracts."""
 from functools import partial
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,6 +14,47 @@ from tests import reference
 from tests.reference import cpu_attention, dense_attention, modality_slices, pool, routing_mask, sample_input
 
 pytestmark = pytest.mark.usefixtures("cpu_kernels")
+
+
+@pytest.mark.parametrize("size", [1, 2])
+@pytest.mark.parametrize("used", ["both", "k", "v", "zero"])
+def test_pooled_transport_preserves_fp32_gradients(monkeypatch, size, used):
+    runtime = SimpleNamespace(size=size, group=object())
+    wire_dtypes, reductions = [], []
+
+    def gather(out, value, *, group):
+        assert group is runtime.group
+        wire_dtypes.append(value.dtype)
+        assert value.element_size() * value.numel() == 2 * 1 * 2 * 6
+        out.copy_(torch.cat([value] * size))
+
+    def reduce_scatter(out, grad, *, group):
+        assert group is runtime.group and grad.dtype == torch.float32
+        assert grad.is_contiguous()
+        reductions.append(grad.shape)
+        # A remote rank contributes 1/256 of the local derivative. The sum
+        # 1 + 1/256 must survive until FP32 pooling, without BF16 rounding.
+        contribution = grad[:out.shape[0]]
+        out.copy_(contribution + contribution / 256)
+
+    monkeypatch.setattr(core.dist, "all_gather_into_tensor", gather)
+    monkeypatch.setattr(core.dist, "reduce_scatter_tensor", reduce_scatter)
+    k, v = [torch.tensor([1.001, -0.003, 3.14159, 0.0]).view(2, 1, 2).requires_grad_()
+            for _ in range(2)]
+    kg, vg = core._GatherMeans.apply(k, v, runtime)
+    assert kg.dtype == torch.float32 and vg.dtype == torch.bfloat16
+    torch.testing.assert_close(kg, torch.cat([k] * size), atol=0, rtol=0)
+    torch.testing.assert_close(vg, torch.cat([v.bfloat16()] * size), atol=0, rtol=0)
+    loss = {"both": lambda: kg.sum() + vg.float().sum(),
+            "k": lambda: kg.sum(), "v": lambda: vg.float().sum(),
+            "zero": lambda: (kg.sum() + vg.float().sum()) * 0}[used]()
+    dk, dv = torch.autograd.grad(loss, (k, v))
+    for name, grad in (("k", dk), ("v", dv)):
+        expected = (1 if size == 1 else 1 + 1/256) if used in ("both", name) else 0
+        assert grad.dtype == torch.float32
+        torch.testing.assert_close(grad, torch.full_like(grad, expected), atol=0, rtol=0)
+    assert wire_dtypes == ([] if size == 1 else [torch.uint8])
+    assert len(reductions) == (0 if size == 1 else 1)
 
 SAMPLES = (
     (Segment("video", (2, 3, 5), None), Segment("text", 7)),

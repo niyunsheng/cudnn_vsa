@@ -291,7 +291,13 @@ Single-device and ring execution share `block_means`, which returns
 differentiable FP32 Q/K/V means. Single-device execution selects coarse blocks
 and fuses routing detach and coarse dtype conversion in `routing_and_coarse_means`.
 Ring execution pools all local slots, including zero-filled dummy blocks;
-`_GatherMeans` only communicates the resulting K/V means and their gradients.
+`_GatherMeans` communicates K means in FP32 for routing and V means in BF16
+for coarse attention, packing their raw bytes into one all-gather. This byte
+packing preserves each field's bits without quantizing K. V is cast inside the
+communication autograd boundary; backward combines dK/dV into one FP32
+reduce-scatter SUM and returns FP32 gradients to pooling. Forward pooled K/V
+payload is 25% smaller than sending both in FP32; the forward and backward
+collective counts remain one each. End-to-end latency must still be measured.
 
 Pool local Q/K/V in FP32 and all-gather pooled K/V for global per-region top-k
 routing and coarse attention. Fine attention keeps Q local and circulates
@@ -327,7 +333,8 @@ Partial outputs are weighted using their log-sum-exp normalizers so the final
 fine output has one softmax normalization over all selected KV blocks.
 
 After enqueuing the fine pass, `coarse_attention` uses local pooled Q and
-global pooled K/V, converted to BF16, with separate per-sample Q/KV boundaries.
+global pooled K/V in BF16, with separate per-sample Q/KV boundaries. Q/K means
+are cast at the coarse boundary; V means already arrive in BF16.
 Coarse attention covers all blocks in each participating sample, independently
 of the fine top-k lists. `vsa_attention` restores compact valid rows and merges
 `fine + gate * coarse[query_block]`. Entirely dense samples use fine only.

@@ -216,25 +216,34 @@ def _ring_exchange(runtime, pairs, *, reverse=False):
 
 
 class _GatherMeans(torch.autograd.Function):
-    """All-gather already-pooled K/V, with a reduce-scatter SUM adjoint."""
+    """Gather FP32 K / BF16 V, returning FP32 pooled gradients after SUM."""
 
     @staticmethod
-    def forward(ctx, means, runtime):
+    def forward(ctx, k, v, runtime):
         ctx.runtime = runtime
+        # Cast inside this boundary so reduced dV reaches FP32 pooling directly.
+        v = v.to(torch.bfloat16)
         if runtime.size == 1:
-            return means
-        gathered = means.new_empty((runtime.size * means.shape[0], *means.shape[1:]))
-        dist.all_gather_into_tensor(gathered, means.contiguous(), group=runtime.group)
-        return gathered
+            return k, v
+        # Preserve each field's bits in one collective, without dtype promotion.
+        # D=128 keeps both reinterpreted fields naturally aligned.
+        key_bytes = k.shape[-1] * k.element_size()
+        packed = torch.cat((k.contiguous().view(torch.uint8), v.contiguous().view(torch.uint8)), dim=-1)
+        gathered = packed.new_empty((runtime.size * packed.shape[0], *packed.shape[1:]))
+        dist.all_gather_into_tensor(gathered, packed, group=runtime.group)
+        return (gathered[..., :key_bytes].view(torch.float32),
+                gathered[..., key_bytes:].view(torch.bfloat16))
 
     @staticmethod
-    def backward(ctx, grad):
+    def backward(ctx, dk, dv):
         runtime = ctx.runtime
         if runtime.size == 1:
-            return grad, None
+            return dk.float(), dv.float(), None
+        # Unused outputs receive materialized zero gradients on every rank.
+        grad = torch.stack((dk.float(), dv.float()), dim=1)
         local = grad.new_empty((grad.shape[0] // runtime.size, *grad.shape[1:]))
-        dist.reduce_scatter_tensor(local, grad.contiguous(), group=runtime.group)
-        return local, None
+        dist.reduce_scatter_tensor(local, grad, group=runtime.group)
+        return local[:, 0], local[:, 1], None
 
 
 class _RingFine(torch.autograd.Function):
@@ -312,25 +321,26 @@ def ring_attention_slots(q, k, v, layout, group, *, scale, batch_p2p=None, bwd_b
     """Return local fine slots and compact coarse output; row handling is caller-owned."""
     runtime = _ring_runtime(layout, group, q.device, batch_p2p, bwd_bucket_size)
     indices = layout.routing_indices
-    means = None
     if not layout.dense_only:
         qm, km, vm = vsa_kernels.block_means(q, k, v, layout.block_sizes)
-        gathered = _GatherMeans.apply(torch.stack((km, vm), dim=1), runtime)
-        means = gathered.index_select(0, layout.global_to_gather)
-        indices = ring_route(qm.detach(), means[:, 0].detach(), layout)
+        km, vm = _GatherMeans.apply(km, vm, runtime)
+        km = km.index_select(0, layout.global_to_gather)
+        vm = vm.index_select(0, layout.global_to_gather)
+        indices = ring_route(qm.detach(), km.detach(), layout)
     peer_indices, peer_counts = vsa_kernels.partition_indices(
         indices, layout.routing_counts, runtime.size, layout.blocks)
     fine = _RingFine.apply(q, k, v, peer_indices, peer_counts, layout, runtime, scale)
-    if means is None:
+    if layout.dense_only:
         return fine, None
     if layout.coarse_blocks.numel() == 0:
         # Peers without coarse queries must still run the gather's reduce-scatter
         # adjoint. Keep the zero dependency in autograd; never skip the collective.
-        return fine + means.sum() * 0, None
+        return fine + (km.sum() + vm.float().sum()) * 0, None
     cq = qm.index_select(0, layout.coarse_blocks).to(q.dtype)
-    ckv = means.index_select(0, layout.coarse_kv_blocks).to(q.dtype)
+    ck = km.index_select(0, layout.coarse_kv_blocks).to(q.dtype)
+    cv = vm.index_select(0, layout.coarse_kv_blocks)
     coarse = coarse_attention(
-        cq, ckv[:, 0].contiguous(), ckv[:, 1].contiguous(),
+        cq, ck, cv,
         layout.coarse_cu_q, layout.coarse_max_q, scale,
         cu_seqlens_kv=layout.coarse_cu_kv, max_seqlen_kv=layout.coarse_max_kv)
     return fine, coarse

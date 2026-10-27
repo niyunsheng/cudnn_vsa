@@ -1,4 +1,4 @@
-"""One 720p 5-second video and two independent 720p images, each with text."""
+"""Shared single-device and distributed VSA workloads and seeded inputs."""
 import math
 from itertools import accumulate
 
@@ -23,14 +23,48 @@ def make_geometry():
             for t, rate in [(frames, VIDEO_SPARSITY), *([(1, None)]*NUM_IMAGES)]]
 
 
-def make_inputs(heads=2, *, device="cuda", dtype=torch.bfloat16, seed=2026):
+CASES = {
+    "single64k": ((Segment("video", (16, 60, 64), .9), Segment("text", 4096)),),
+    "thd64k": (
+        (Segment("video", (12, 48, 64), .9), Segment("text", 2048)),
+        (Segment("video", (8, 40, 64), .9), Segment("text", 2048)),
+        (Segment("video", (1, 32, 64)), Segment("text", 2048))),
+    # 720p, 30 s at 24 fps: 721 frames -> 181 temporal latents;
+    # spatial VAE compression 8 and 2x2 patches give 45x80 token rows.
+    "single720p30s": (
+        (Segment("video", (181, 45, 80), .9), Segment("text", 2048)),),
+    "thd720p30s": (
+        (Segment("video", (181, 45, 80), .9), Segment("text", 2048)),
+        (Segment("video", (1, 45, 80)), Segment("text", 2048))),
+    "ragged": (
+        (Segment("video", (5, 9, 11), .7), Segment("text", 67)),
+        (Segment("text", 3), Segment("video", (1, 3, 5))),
+        (Segment("video", (4, 8, 12), .5), Segment("video", (5, 4, 7), .9),
+         Segment("audio", 17), Segment("text", 0))),
+    # Three partial blocks: valid for ring sizes up to three.
+    "partial_blocks": ((Segment("video", (1, 3, 5), .9), Segment("text", 7)),),
+    # With ring_size=2, rank 1 owns only a fine-only sample but must still
+    # participate in the coarse gather adjoint. Larger groups are invalid.
+    "fine_only_peer": ((Segment("video", (1, 2, 3), .5),),
+                       (Segment("video", (1, 2, 3)),)),
+    "dense": ((Segment("video", (1, 9, 11)), Segment("text", 67)),
+              (Segment("video", (1, 3, 5)), Segment("text", 3))),
+}
+
+
+def case_geometry(name):
+    """Resolve a named workload; default matches the FA4 comparison."""
+    return make_geometry() if name == "default" else CASES[name]
+
+
+def make_inputs(heads=2, *, device="cuda", dtype=torch.bfloat16, seed=2026, samples=None):
     """Return (q, k, v, gate), dy; both backends share the same input leaves.
 
     Timing uses autograd.grad, so neither backend accumulates into leaf .grad.
     """
-    if heads not in HEAD_COUNTS:
-        raise ValueError(f"Timed inputs require heads in {HEAD_COUNTS}")
-    samples = make_geometry()
+    if heads < 1:
+        raise ValueError("Head count must be positive")
+    samples = make_geometry() if samples is None else samples
     tokens = sum(seg.tokens for sample in samples for seg in sample)
     generator = torch.Generator(device=device).manual_seed(seed)
     xs = [torch.randn(tokens, heads, HEAD_DIM, device=device, dtype=dtype, generator=generator)

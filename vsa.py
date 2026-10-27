@@ -3,7 +3,7 @@ import torch
 
 import vsa_core
 import vsa_kernels
-from vsa_layout import VSALayout
+from vsa_layout import RingVSALayout, VSALayout
 
 
 def _reorder_tokens(x, layout, inverse):
@@ -55,7 +55,8 @@ def _validate(q, k, v, gate):
             raise ValueError("Q/K/V/gate must be contiguous; materialize projections before calling attention")
 
 
-def vsa_attention(q, k, v, gate, vsa_layout, *, scale=None):
+def vsa_attention(q, k, v, gate, vsa_layout, *, scale=None, ring_cp_group=None,
+                  ring_cp_batch_p2p=None, ring_cp_bwd_bucket_size="auto"):
     """[T,H,D] Q/K/V/gate -> O in the caller's original row order.
 
     Pass the current batch's prepared layout on every call. Q's head count must
@@ -67,9 +68,21 @@ def vsa_attention(q, k, v, gate, vsa_layout, *, scale=None):
     Inputs follow layout.input_order: raster or compact block-major, without
     padding. Output uses the same order; Q/K/V/gate must share that order.
     The caller reorders tokens and positions once before the entire VSA stack.
+
+    An explicit ring_cp_group requires a RingVSALayout with compact local
+    block inputs, including size-one groups. Pass group-local rank/size to
+    build_vsa_layout with input_order="block"; the caller owns whole-block
+    sharding and any external Ulysses transformations. ring_cp_batch_p2p=None chooses batched
+    P2P for device-bound groups and individual P2P for lazy groups.
+    ring_cp_bwd_bucket_size="auto" selects the measured SM100/H2/local-128-
+    block/single-sample setting; None uses the backend default, and a positive
+    integer overrides it.
     """
-    _validate(q, k, v, gate)
     layout = vsa_layout
+    is_ring = ring_cp_group is not None
+    if is_ring != isinstance(layout, RingVSALayout):
+        raise ValueError("RingVSALayout requires an explicit ring_cp_group, and vice versa")
+    _validate(q, k, v, gate)
     if q.shape[0] != layout.tokens:
         raise ValueError("Expected [layout.tokens, heads, head_dim] inputs")
     if q.shape[1] != layout.head_num:
@@ -86,10 +99,19 @@ def vsa_attention(q, k, v, gate, vsa_layout, *, scale=None):
     else:
         q_slots, k_slots, v_slots = (
             vsa_kernels.to_slots(x, layout.slot_row, layout.row_slot) for x in (q, k, v))
-    fine, coarse = vsa_core.attention_slots(q_slots, k_slots, v_slots, layout, scale=scale)
+    if is_ring:
+        scale = q.shape[-1]**-0.5 if scale is None else scale
+        fine, coarse = vsa_core.ring_attention_slots(
+            q_slots, k_slots, v_slots, layout, ring_cp_group, scale=scale,
+            batch_p2p=ring_cp_batch_p2p, bwd_bucket_size=ring_cp_bwd_bucket_size)
+    else:
+        fine, coarse = vsa_core.attention_slots(q_slots, k_slots, v_slots, layout, scale=scale)
     out = fine if layout.slots_are_input else vsa_kernels.from_slots(
         fine, layout.slot_row, layout.row_slot)
     if coarse is not None:
         out = vsa_kernels.fine_coarse_gate_add(
             out, gate, coarse, layout.row_coarse, layout.coarse_rows)
+    elif is_ring and not layout.dense_only:
+        # Fine-only peers still need a zero gate gradient, including NaN gates.
+        out = out + gate.masked_fill(torch.ones_like(gate, dtype=torch.bool), 0).sum() * 0
     return out.contiguous()

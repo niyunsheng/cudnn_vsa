@@ -1,5 +1,6 @@
 """Routing, packed attention, precision and backend call contracts."""
 from functools import partial
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,6 +14,47 @@ from tests import reference
 from tests.reference import cpu_attention, dense_attention, modality_slices, pool, routing_mask, sample_input
 
 pytestmark = pytest.mark.usefixtures("cpu_kernels")
+
+
+@pytest.mark.parametrize("size", [1, 2])
+@pytest.mark.parametrize("used", ["both", "k", "v", "zero"])
+def test_pooled_transport_preserves_fp32_gradients(monkeypatch, size, used):
+    runtime = SimpleNamespace(size=size, group=object())
+    wire_dtypes, reductions = [], []
+
+    def gather(out, value, *, group):
+        assert group is runtime.group
+        wire_dtypes.append(value.dtype)
+        assert value.element_size() * value.numel() == 2 * 1 * 2 * 6
+        out.copy_(torch.cat([value] * size))
+
+    def reduce_scatter(out, grad, *, group):
+        assert group is runtime.group and grad.dtype == torch.float32
+        assert grad.is_contiguous()
+        reductions.append(grad.shape)
+        # A remote rank contributes 1/256 of the local derivative. The sum
+        # 1 + 1/256 must survive until FP32 pooling, without BF16 rounding.
+        contribution = grad[:out.shape[0]]
+        out.copy_(contribution + contribution / 256)
+
+    monkeypatch.setattr(core.dist, "all_gather_into_tensor", gather)
+    monkeypatch.setattr(core.dist, "reduce_scatter_tensor", reduce_scatter)
+    k, v = [torch.tensor([1.001, -0.003, 3.14159, 0.0]).view(2, 1, 2).requires_grad_()
+            for _ in range(2)]
+    kg, vg = core._GatherMeans.apply(k, v, runtime)
+    assert kg.dtype == torch.float32 and vg.dtype == torch.bfloat16
+    torch.testing.assert_close(kg, torch.cat([k] * size), atol=0, rtol=0)
+    torch.testing.assert_close(vg, torch.cat([v.bfloat16()] * size), atol=0, rtol=0)
+    loss = {"both": lambda: kg.sum() + vg.float().sum(),
+            "k": lambda: kg.sum(), "v": lambda: vg.float().sum(),
+            "zero": lambda: (kg.sum() + vg.float().sum()) * 0}[used]()
+    dk, dv = torch.autograd.grad(loss, (k, v))
+    for name, grad in (("k", dk), ("v", dv)):
+        expected = (1 if size == 1 else 1 + 1/256) if used in ("both", name) else 0
+        assert grad.dtype == torch.float32
+        torch.testing.assert_close(grad, torch.full_like(grad, expected), atol=0, rtol=0)
+    assert wire_dtypes == ([] if size == 1 else [torch.uint8])
+    assert len(reductions) == (0 if size == 1 else 1)
 
 SAMPLES = (
     (Segment("video", (2, 3, 5), None), Segment("text", 7)),
@@ -122,7 +164,7 @@ def test_exempt_routing_and_all_modality_coarse():
     slots = [vsa_kernels.to_slots(t, layout.slot_row, layout.row_slot) for t in (q, k, v)]
     means = [pool(t, layout) for t in slots]
     scores = means[0] @ means[1].transpose(-2, -1) / 8**0.5
-    q_route, k_route, _, _, _ = vsa_kernels.block_means(*slots, layout.block_sizes, layout.coarse_blocks)
+    q_route, k_route, _, _, _ = vsa_kernels.routing_and_coarse_means(*slots, layout.block_sizes, layout.coarse_blocks)
     indices = route(q_route, k_route, layout.groups, layout.routing_indices,
         dense_query_full=layout.dense_query_full)
     mask = routing_mask(indices, layout.routing_counts)[0]
@@ -186,6 +228,23 @@ def test_coarse_uses_one_fa4_varlen_call(monkeypatch, scale):
     assert kwargs["max_seqlen_q"] == kwargs["max_seqlen_k"] == 3
     assert kwargs["softmax_scale"] == (128**-0.5 if scale is None else scale)
     assert kwargs["causal"] is False
+
+
+def test_coarse_preserves_asymmetric_ring_boundaries(monkeypatch):
+    cu_q = torch.tensor([0, 1, 3], dtype=torch.int32)
+    cu_kv = torch.tensor([0, 4, 7], dtype=torch.int32)
+    q = torch.randn(3, 2, 128, dtype=torch.bfloat16)
+    k, v = (torch.randn(7, 2, 128, dtype=torch.bfloat16) for _ in range(2))
+    def fake_fa4(query, key, value, **kwargs):
+        assert query is q and key is k and value is v
+        assert kwargs["cu_seqlens_q"] is cu_q
+        assert kwargs["cu_seqlens_k"] is cu_kv
+        assert (kwargs["max_seqlen_q"], kwargs["max_seqlen_k"]) == (2, 4)
+        assert kwargs["softmax_scale"] == .125
+        return query, None
+    monkeypatch.setattr(core, "flash_attn_varlen_func", fake_fa4)
+    assert core.coarse_attention(q, k, v, cu_q, 2, .125,
+                                 cu_seqlens_kv=cu_kv, max_seqlen_kv=4) is q
 
 
 @pytest.mark.parametrize("dense_query_full", [True, False])
@@ -400,7 +459,7 @@ def test_packed_calls_and_metadata_exclude_whole_dense_samples(monkeypatch):
     assert calls == ["fine", "coarse"]
     slots = tuple(vsa_kernels.to_slots(x, layout.slot_row, layout.row_slot)
                   for x in xs[:3])
-    q_route, k_route, q_coarse, k_coarse, v_coarse = vsa_kernels.block_means(
+    q_route, k_route, q_coarse, k_coarse, v_coarse = vsa_kernels.routing_and_coarse_means(
         *slots, layout.block_sizes, layout.coarse_blocks)
     for routing, coarse in ((q_route, q_coarse), (k_route, k_coarse)):
         assert routing.dtype == torch.float32 and not routing.requires_grad
@@ -451,7 +510,7 @@ def test_fp32_routing_survives_autocast_and_templates_are_immutable():
     xs = [torch.randn(layout.tokens, 2, 8) for _ in range(3)]
     slots = tuple(vsa_kernels.to_slots(x, layout.slot_row, layout.row_slot)
                   for x in xs)
-    q_route, k_route, _, _, _ = vsa_kernels.block_means(*slots, layout.block_sizes, layout.coarse_blocks)
+    q_route, k_route, _, _, _ = vsa_kernels.routing_and_coarse_means(*slots, layout.block_sizes, layout.coarse_blocks)
     template = layout.routing_indices
     saved = template.clone()
     expected = core.route(q_route, k_route, layout.groups, template,

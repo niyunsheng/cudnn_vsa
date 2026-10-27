@@ -14,6 +14,33 @@ SAMPLES = (
 )
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("selected", [None, [3, 0], [2], []])
+def test_block_means_preserve_fp32_precision_selection_and_gradients(dtype, selected):
+    sizes = torch.tensor([3, 64, 0, 7], dtype=torch.int32)
+    xs = [torch.randn(4 * 64, 2, 8, dtype=dtype, requires_grad=True) for _ in range(3)]
+    valid = torch.arange(64)[None, :] < sizes[:, None]
+    masked = [x.view(4, 64, 2, 8).masked_fill(~valid[:, :, None, None], 0).flatten(0, 1)
+              for x in xs]
+    blocks = None if selected is None else torch.tensor(selected, dtype=torch.int64)
+    got = vsa_kernels.block_means(*masked, sizes, blocks)
+    refs = [x.detach().float().requires_grad_() for x in xs]
+    expected = [torch.stack((x[:3].mean(0), x[64:128].mean(0),
+                            x[128:128].sum(0), x[192:199].mean(0))) for x in refs]
+    if blocks is not None:
+        expected = [x[blocks] for x in expected]
+    weights = [torch.randn_like(x) for x in expected]
+    for actual, target in zip(got, expected):
+        assert actual.dtype == torch.float32 and actual.requires_grad
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, target)
+    grad = torch.autograd.grad(got, xs, weights)
+    expected_grad = torch.autograd.grad(expected, refs, weights)
+    for actual, target in zip(grad, expected_grad):
+        torch.testing.assert_close(actual, target.to(dtype))
+        assert not actual.view(4, 64, 2, 8)[~valid].count_nonzero()
+
+
 def test_sample_major_tiling_maps_and_gather_adjoint():
     # Unequal samples, an image with no text, and a second ragged video.
     samples = [[Segment("video", (4, 4, 8), .9), Segment("text", 3)],

@@ -5,14 +5,20 @@ import statistics
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
+import torch.distributed as dist
 from vsa_core import route
 import vsa_kernels
 
 ROOT = Path(__file__).resolve().parent.parent
 
 def similarity(a, b):
+    if a.shape != b.shape:
+        raise ValueError(f"Shape mismatch: {a.shape} != {b.shape}")
+    if not a.numel():
+        return {"cosine": 1., "tensor_similarity": 1., "max_abs": 0., "relative_l2": 0.}
     a, b = a.detach().flatten().double(), b.detach().flatten().double()
     aa, bb, ab = (a*a).sum().item(), (b*b).sum().item(), (a*b).sum().item()
     return {
@@ -32,7 +38,7 @@ def packed_geometry_and_flops(layout, xs, dim):
         q_slots, k_slots, v_slots = (
             vsa_kernels.to_slots(x, layout.slot_row, layout.row_slot) for x in xs[:3]
         )
-        q_route, k_route, _, _, _ = vsa_kernels.block_means(
+        q_route, k_route, _, _, _ = vsa_kernels.routing_and_coarse_means(
             q_slots, k_slots, v_slots, layout.block_sizes, layout.coarse_blocks)
         indices = route(q_route, k_route, layout.groups, indices,
             dense_query_full=layout.dense_query_full)
@@ -68,23 +74,71 @@ def packed_geometry_and_flops(layout, xs, dim):
     return records, totals
 
 
-def capture_graph(fn, leaves, dy, warmup, eps):
-    """Capture complete forward/backward; validate replay with changed inputs."""
+def barrier(group):
+    if group is not None:
+        # Identify the GPU without forcing eager communicator creation.
+        dist.barrier(group=group, device_ids=[torch.cuda.current_device()])
+
+
+def check_tensors(actual, expected, eps, *, group=None, label="parity"):
+    if len(actual) != len(expected):
+        raise ValueError("Different numbers of tensors to compare")
+    metrics = {name: similarity(a, b) for name, a, b in
+               zip(("out", "dq", "dk", "dv", "dgate"), actual, expected)}
+    passed = all(min(m["cosine"], m["tensor_similarity"]) >= 1-eps for m in metrics.values())
+    check = {"passed": passed, "metrics": metrics}
+    if group is not None:
+        ranks = [None] * dist.get_world_size(group)
+        dist.all_gather_object(ranks, check, group=group)
+        check = {**check, "passed": all(c["passed"] for c in ranks), "ranks": ranks}
+    if not check["passed"]:
+        raise AssertionError(f"{label}: {check}")
+    return check
+
+
+def backward(out, leaves, dy, *, retain_graph=False):
+    grads = torch.autograd.grad(out, leaves, dy, allow_unused=True, retain_graph=retain_graph)
+    return tuple(torch.zeros_like(x) if g is None else g for x, g in zip(leaves, grads))
+
+
+def forward_backward(fn, leaves, dy, events=None, *, retain_graph=False):
+    if events:
+        events[0].record()
+    out = fn(*leaves)
+    if events:
+        events[1].record()
+    grads = backward(out, leaves, dy, retain_graph=retain_graph)
+    if events:
+        events[2].record()
+    return (out, *grads)
+
+
+class CapturedGraph(NamedTuple):
+    graph: torch.cuda.CUDAGraph
+    out: torch.Tensor
+    grads: tuple
+    events: list
+    leaves: tuple
+    dy: torch.Tensor
+
+
+def capture_graph(fn, leaves, dy, warmup, eps, *, group=None):
+    """Own capture buffers and check replay against eager with changed inputs."""
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     events = [torch.cuda.Event(enable_timing=True, external=True) for _ in range(3)]
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.stream(stream):
+        # Create fresh leaves on their autograd stream, even after eager checks.
+        leaves = tuple(x.detach().clone().requires_grad_() for x in leaves)
+        dy = dy.clone()
         for _ in range(warmup):
-            out = fn(*leaves)
-            grads = torch.autograd.grad(out, leaves, dy)
-            del out, grads
-        with torch.cuda.graph(graph, stream=stream):
-            events[0].record()
-            out = fn(*leaves)
-            events[1].record()
-            grads = torch.autograd.grad(out, leaves, dy)
-            events[2].record()
+            forward_backward(fn, leaves, dy)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    barrier(group)
+    with torch.cuda.graph(graph, stream=stream):
+        actual = forward_backward(fn, leaves, dy, events)
     torch.cuda.current_stream().wait_stream(stream)
     saved = [x.detach().clone() for x in (*leaves, dy)]
     checks = []
@@ -94,47 +148,70 @@ def capture_graph(fn, leaves, dy, warmup, eps):
                 with torch.no_grad():
                     for x in (*leaves, dy):
                         x.normal_()
-            expected = fn(*leaves)
-            expected_grads = torch.autograd.grad(expected, leaves, dy)
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                expected = forward_backward(fn, leaves, dy)
+            torch.cuda.current_stream().wait_stream(stream)
             graph.replay()
-            metrics = {name: similarity(a, b) for name, a, b in
-                       zip(("out", "dq", "dk", "dv", "dgate"), (out, *grads), (expected, *expected_grads))}
-            passed = all(min(m["cosine"], m["tensor_similarity"]) >= 1-eps for m in metrics.values())
-            checks.append({"changed_inputs": changed, "passed": passed, "metrics": metrics})
-            if not passed:
-                raise AssertionError(checks[-1])
-            del expected, expected_grads
+            check = check_tensors(actual, expected, eps, group=group,
+                                  label=f"graph changed={changed}")
+            checks.append({"changed_inputs": changed, **check})
     finally:
         with torch.no_grad():
             for x, original in zip((*leaves, dy), saved):
                 x.copy_(original)
     graph.replay()
     torch.cuda.synchronize()
-    return (graph, out, grads, events), checks
+    return CapturedGraph(graph, actual[0], actual[1:], events, leaves, dy), checks
 
 
-def measure_graph(captured, warmup, repeats):
-    """CUDA-event times inside one full F+B graph; compilation/capture excluded."""
-    graph, out, grads, events = captured  # Keep output/gradient storage alive.
+def _measure(replay, events, warmup, repeats, group):
     for _ in range(warmup):
-        graph.replay()
+        replay()
     torch.cuda.synchronize()
-    samples = []
+    barrier(group)
+    timings = []
     for _ in range(repeats):
-        graph.replay()
+        replay()
         events[-1].synchronize()
         start, middle, end = events
-        samples.append({"forward": start.elapsed_time(middle),
-                        "backward": middle.elapsed_time(end), "total": start.elapsed_time(end)})
-    return samples
+        timings.append([start.elapsed_time(middle), middle.elapsed_time(end), start.elapsed_time(end)])
+    if group is not None:
+        # Reduce each observation before taking medians, not the rank medians.
+        durations = torch.tensor(timings, device="cuda", dtype=torch.float64)
+        dist.all_reduce(durations, op=dist.ReduceOp.MAX, group=group)
+        timings = durations.cpu().tolist()
+    return [dict(zip(("forward", "backward", "total"), row)) for row in timings]
 
 
-def summarize(samples, flops, peak_tflops):
-    """Independent phase medians and useful-FLOP MFU against a dense GPU peak."""
+def measure_graph(captured, warmup, repeats, *, group=None):
+    """CUDA-event times inside one full F+B graph; compilation/capture excluded."""
+    return _measure(captured.graph.replay, captured.events, warmup, repeats, group)
+
+
+def measure_eager(fn, leaves, dy, warmup, repeats, *, group=None):
+    events = [torch.cuda.Event(enable_timing=True) for _ in range(3)]
+    return _measure(lambda: forward_backward(fn, leaves, dy, events), events, warmup, repeats, group)
+
+
+def profile_step(replay, path, *, group=None):
+    """Profile an additional step after timing, excluding profiler startup skew."""
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                           torch.profiler.ProfilerActivity.CUDA]) as prof:
+        barrier(group)
+        torch.cuda.synchronize()
+        with torch.profiler.record_function("ProfilerStep#0"):
+            replay()
+            torch.cuda.synchronize()
+    prof.export_chrome_trace(str(path))
+
+
+def summarize(samples, flops, peak_tflops, *, world_size=1):
+    """Independent phase medians and useful-FLOP throughput/MFU per GPU."""
     result = {}
     for phase in ("forward", "backward", "total"):
         elapsed = statistics.median(row[phase] for row in samples)
-        tflops = flops[phase] / elapsed / 1e9
+        tflops = flops[phase] / elapsed / 1e9 / world_size
         result[phase] = {"median_ms": elapsed, "tflops": tflops,
                          "mfu_percent": 100 * tflops / peak_tflops}
     return result

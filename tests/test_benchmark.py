@@ -110,7 +110,7 @@ def test_mfu_counts_valid_isolated_pairs_and_no_image_coarse(heads, dense_query_
         assert record["segments"] == [{"kind": s.kind, "size": s.size, "sparsity": s.sparsity} for s in sample]
 
 
-@pytest.mark.parametrize("case", ["ragged", "empty_peers", "fine_only_peer", "dense"])
+@pytest.mark.parametrize("case", ["ragged", "partial_blocks", "fine_only_peer", "dense"])
 def test_named_inputs_preserve_seeded_reference(case):
     samples = benchmark_inputs.case_geometry(case)
     xs, dy = make_inputs(2, device="cpu", samples=samples, seed=937)
@@ -127,6 +127,7 @@ def test_unified_cli_defaults_and_layouts():
     assert (single.cases, single.heads, single.input_order) == (["default"], [2, 4], "raster")
     assert (single.warmup, single.repeats, single.profile) == (5, 80, True)
     assert (ring.heads, ring.input_order, ring.warmup, ring.repeats, ring.profile) == ([2], "block", 3, 30, False)
+    assert ring.cases == ["ragged", "single64k", "thd64k"]
     assert parse_args(["--ring", "--heads", "1", "8"]).heads == [1, 8]
     assert parse_args(["--input-order", "block", "--no-profile"]).input_order == "block"
     args = parse_args(["--ring", "--heads", "2", "4", "--bwd-bucket-size", "backend", "--output", "run.json"])

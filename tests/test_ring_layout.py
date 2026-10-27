@@ -8,7 +8,7 @@ from vsa_core import route
 from vsa_layout import RingVSALayout, VSALayout, Segment, build_vsa_layout
 from vsa_kernels import partition_indices
 from vsa_core import ring_route
-from vsa import to_block_order, to_raster_order
+from vsa import to_block_order, to_raster_order, vsa_attention
 
 
 PACK = (
@@ -19,7 +19,7 @@ PACK = (
 )
 
 
-@pytest.mark.parametrize("size", [1, 2, 8, 64])
+@pytest.mark.parametrize("size", [1, 2, 8])
 @pytest.mark.parametrize("dense_query_full", [False, True])
 def test_thd_partition(size, dense_query_full):
     full = build_vsa_layout(PACK, head_num=2, dense_query_full=dense_query_full)
@@ -30,6 +30,7 @@ def test_thd_partition(size, dense_query_full):
         ids = local.block_ids[local.block_ids >= 0]
         assert ids.tolist() == list(range(rank, full.blocks, size))
         assert local.input_order == "block"
+        assert local.tokens > 0
         assert local.slot_row[local.slot_row >= 0].tolist() == list(range(local.tokens))
         assert local.slots_are_input == (local.tokens == local.padded_tokens)
         assert local.padded_tokens == ((full.blocks + size - 1) // size) * 64
@@ -50,6 +51,38 @@ def test_thd_partition(size, dense_query_full):
         seen.extend(local.input_rows.tolist())
     assert sorted(owners) == list(range(full.blocks))
     assert sorted(seen) == list(range(full.tokens))
+
+
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize("dense", [False, True])
+def test_ring_rejects_fewer_global_blocks_than_ranks(rank, dense):
+    # Every rank rejects, including those that would own a valid block.
+    samples = [[Segment("video", (1, 1, 1), None if dense else .5)] for _ in range(3)]
+    with pytest.raises(ValueError, match="global_blocks=3, ring_size=4"):
+        build_vsa_layout(samples, head_num=2, input_order="block",
+                         ring_size=4, ring_rank=rank, device="cuda")
+
+
+@pytest.mark.parametrize("blocks", [4, 5, 7])
+def test_ring_accepts_small_samples_and_uneven_block_counts(blocks):
+    # Each sample has one block (< CP), but the complete pack has enough.
+    samples = [[Segment("video", (1, 1, 1), .5)] for _ in range(blocks)]
+    for rank in range(4):
+        layout = build_vsa_layout(samples, head_num=2, input_order="block",
+                                  ring_size=4, ring_rank=rank)
+        owned = list(range(rank, blocks, 4))
+        assert layout.tokens == len(owned) > 0
+        assert layout.block_ids[layout.block_ids >= 0].tolist() == owned
+        assert layout.padded_tokens == ((blocks + 3) // 4) * 64
+
+
+@pytest.mark.parametrize("ring", [False, True])
+def test_attention_rejects_empty_tokens_before_cuda_or_communication(ring):
+    kwargs = dict(input_order="block", ring_size=1, ring_rank=0) if ring else {}
+    layout = build_vsa_layout([[Segment("video", (1, 1, 1))]], head_num=2, **kwargs)
+    x = torch.empty(0, 2, 128)
+    with pytest.raises(ValueError, match="positive dimensions"):
+        vsa_attention(x, x, x, x, layout, ring_cp_group=object() if ring else None)
 
 
 @pytest.mark.parametrize("dense_query_full", [False, True])

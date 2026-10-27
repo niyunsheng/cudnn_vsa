@@ -281,6 +281,8 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
     Omit ring_size/ring_rank for a full VSALayout. Provide both as group-local
     integers for a RingVSALayout, including ring_size=1. Ring shards require
     input_order="block" and contain only valid owned-block rows without padding.
+    The global block count must be at least ring_size, so every rank owns data.
+    Individual samples may have fewer blocks; no divisibility is required.
     Reorder/distribute whole blocks at the dataset/model boundary. The builder
     needs no process group or distributed initialization; pass the matching
     explicit ring_cp_group to vsa_attention. Boundary reorder helpers still
@@ -304,6 +306,10 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
             raise ValueError("dense_query_full must be a bool")
     samples, block_rows, groups, sample_slices = _plan_samples(samples)
     if is_ring:
+        if len(block_rows) < ring_size:
+            raise ValueError(
+                "Ring requires at least ring_size global blocks; "
+                f"got global_blocks={len(block_rows)}, ring_size={ring_size}")
         return _finalize_ring_layout(samples, block_rows, groups, sample_slices,
                                      head_num=head_num, ring_size=ring_size, ring_rank=ring_rank,
                                      dense_query_full=dense_query_full, device=device)

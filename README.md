@@ -175,8 +175,10 @@ the packed samples. Global block `b` belongs to group rank `b % R`, at local
 slot block `b // R`. For R=2, ranks own blocks `[0, 2, 4, ...]` and
 `[1, 3, 5, ...]`. Every block stays within one segment and sample; samples
 remain isolated during routing and attention. Neither a sample's token count
-nor its block count needs to be a multiple of R. Ranks may own different
-numbers of valid tokens or no valid tokens at all. Internal communication
+nor its block count needs to be a multiple of R. The total block count across
+the pack must be at least R; the builder rejects smaller packs on every rank.
+Each rank must have valid input tokens, although their counts may differ.
+Individual samples may have fewer than R blocks. Internal communication
 buffers use `ceil(global_blocks / R)` blocks per rank, with zero padding for
 partial and dummy blocks.
 
@@ -377,7 +379,8 @@ integer to select a bucket size.
   make P2P transfers match and support CUDA Graph reuse. Valid sizes and
   routing counts exclude partial/dummy slots from the math. Sample boundaries
   remain explicit metadata even when one rank holds blocks from several
-  samples; empty ranks still participate in the communication schedule.
+  samples. Ranks with only fine-attention queries still participate in the
+  pooled-gradient collective when other samples use coarse attention.
 
 The tradeoff is that fine attention circulates **whole padded K/V shards**,
 even when routing selects few blocks from a peer. Sparsity reduces attention
@@ -515,30 +518,28 @@ original/changed inputs are checked before timing. Repeat with
 `--dense-query-full` for the alternate dense-query policy.
 
 ```bash
-# Ragged samples, partial blocks and ranks with no valid tokens.
+# Ragged samples and partial/dummy slots; every rank owns valid blocks.
 torchrun --standalone --nproc-per-node=8 --module benchmark.perf_vsa --ring \
-  --cases ragged empty_peers dense
-# Interleaved groups; repeat with --ring-size 1 and 4.
+  --cases ragged
+# Interleaved groups; partial_blocks has three blocks and requires R<=3.
 torchrun --standalone --nproc-per-node=8 --module benchmark.perf_vsa --ring \
-  --ring-size 2 --cases ragged empty_peers dense
+  --ring-size 2 --cases ragged partial_blocks dense
 # Device-bound groups and batched P2P.
-torchrun --standalone --nproc-per-node=8 --module benchmark.perf_vsa --ring \
-  --eager-group --cases ragged empty_peers dense
+torchrun --standalone --nproc-per-node=4 --module benchmark.perf_vsa --ring \
+  --eager-group --cases ragged dense
 # Single/packed 64k workloads, plus timing after numerical checks.
 torchrun --standalone --nproc-per-node=8 --module benchmark.perf_vsa --ring \
   --high-priority-group --cases single64k thd64k --warmup 30 --repeats 500
 # Strict reproduction of the known fine-only-sample precision limit.
 torchrun --standalone --nproc-per-node=8 --module benchmark.perf_vsa --ring \
   --ring-size 2 --cases fine_only_peer --check-only
-# Strict empty-peer precision reproduction with one attention head.
-torchrun --standalone --nproc-per-node=4 --module benchmark.perf_vsa --ring \
-  --heads 1 --cases empty_peers --check-only
-# Strict empty-peer precision reproduction with four attention heads.
-torchrun --standalone --nproc-per-node=4 --module benchmark.perf_vsa --ring \
-  --heads 4 --cases empty_peers --check-only
 ```
 
-Ring input defaults to block order and rejects raster order. For multiple
+Ring input defaults to block order and rejects raster order. The default ring
+cases are `ragged`, `single64k` and `thd64k`. Each chosen case must contain at
+least R global blocks; undersized packs raise an error instead of creating
+empty ranks. The small `partial_blocks`, `fine_only_peer` and `dense` cases
+contain three, two and six blocks respectively. For multiple
 nodes, replace `--standalone` with the usual torchrun rendezvous arguments.
 Each JSON result records numerical/graph checks and source hashes. Distributed
 timing takes the maximum latency across ranks for each replay; per-GPU MFU
@@ -551,9 +552,6 @@ The strict `fine_only_peer` case has a known BF16 precision limitation: dK
 for a six-token fine-only sample can fall below the unchanged 0.99999 native
 reference similarity threshold. The command above reports failure when it
 reproduces the limit. This case remains part of the validation surface.
-The R=4 `empty_peers` case also has BF16 precision limits below the same
-threshold: dQ at H=1 and dV at H=4. These commands retain their strict checks
-and report failure.
 
 [MIT License](LICENSE).
 

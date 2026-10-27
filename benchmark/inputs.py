@@ -41,9 +41,10 @@ CASES = {
         (Segment("text", 3), Segment("video", (1, 3, 5))),
         (Segment("video", (4, 8, 12), .5), Segment("video", (5, 4, 7), .9),
          Segment("audio", 17), Segment("text", 0))),
-    "empty_peers": ((Segment("video", (1, 3, 5), .9), Segment("text", 7)),),
-    # With ring_size >= 2, rank 1 owns only a fine-only sample; ranks >= 2
-    # have no valid tokens. All must participate in the coarse gather adjoint.
+    # Three partial blocks: valid for ring sizes up to three.
+    "partial_blocks": ((Segment("video", (1, 3, 5), .9), Segment("text", 7)),),
+    # With ring_size=2, rank 1 owns only a fine-only sample but must still
+    # participate in the coarse gather adjoint. Larger groups are invalid.
     "fine_only_peer": ((Segment("video", (1, 2, 3), .5),),
                        (Segment("video", (1, 2, 3)),)),
     "dense": ((Segment("video", (1, 9, 11)), Segment("text", 67)),

@@ -60,7 +60,7 @@ def parse_args(argv=None):
     if not args.ring and (args.ring_size is not None or args.eager_group or args.high_priority_group
                          or args.batch_p2p is not None or args.bwd_bucket_size != "auto"):
         parser.error("Ring transport options require --ring")
-    args.cases = args.cases or (["ragged", "empty_peers", "dense", "single64k", "thd64k"]
+    args.cases = args.cases or (["ragged", "single64k", "thd64k"]
                                if args.ring else ["default"])
     args.heads = args.heads or ([2] if args.ring else list(HEAD_COUNTS))
     if min(args.heads) < 1:

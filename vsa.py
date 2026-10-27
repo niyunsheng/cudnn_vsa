@@ -41,14 +41,12 @@ def to_raster_order(x, *, vsa_layout):
     return _reorder_tokens(x, vsa_layout, inverse=True)
 
 
-def _validate(q, k, v, gate, *, allow_empty=False):
+def _validate(q, k, v, gate):
     if q is None or k is None or v is None:
         raise ValueError("Q, K and V are required separate tensors")
     if gate is None:
         raise ValueError("VSA requires a gate tensor; use FA4 full attention without a gate")
-    if q.ndim != 3 or any(n <= 0 for n in q.shape[1:]) or (
-        q.shape[0] == 0 and not allow_empty
-    ):
+    if q.ndim != 3 or any(n <= 0 for n in q.shape):
         raise ValueError("Q/K/V must have shape [tokens, heads, head_dim] with positive dimensions")
     for x in (q, k, v, gate):
         if x.shape != q.shape or x.dtype != q.dtype or x.device != q.device:
@@ -84,7 +82,7 @@ def vsa_attention(q, k, v, gate, vsa_layout, *, scale=None, ring_cp_group=None,
     is_ring = ring_cp_group is not None
     if is_ring != isinstance(layout, RingVSALayout):
         raise ValueError("RingVSALayout requires an explicit ring_cp_group, and vice versa")
-    _validate(q, k, v, gate, allow_empty=is_ring)
+    _validate(q, k, v, gate)
     if q.shape[0] != layout.tokens:
         raise ValueError("Expected [layout.tokens, heads, head_dim] inputs")
     if q.shape[1] != layout.head_num:

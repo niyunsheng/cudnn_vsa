@@ -36,6 +36,11 @@ CASES = {
     "thd720p30s": (
         (Segment("video", (181, 45, 80), .9), Segment("text", 2048)),
         (Segment("video", (1, 45, 80)), Segment("text", 2048))),
+    # Match the DiT 720p44s U32/R4 attention shape after the Ulysses exchange:
+    # one video, one independent image and two text segments, 961696 tokens.
+    "thd720p44s": (
+        (Segment("video", (265, 45, 80), .9), Segment("text", 2048)),
+        (Segment("video", (1, 45, 80)), Segment("text", 2048))),
     "ragged": (
         (Segment("video", (5, 9, 11), .7), Segment("text", 67)),
         (Segment("text", 3), Segment("video", (1, 3, 5))),

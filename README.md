@@ -477,6 +477,56 @@ checks, global useful FLOPs and per-GPU throughput/MFU. Ring timing samples are
 reduced across ranks before summarizing. Ring defaults to H=2 and omits traces;
 add `--profile` to save a trace per rank.
 
+### Standalone Ring4 profile at the 720p44s shape
+
+The `thd720p44s` case matches the attention geometry inside the 128-GPU
+DiT U32/R4 configuration, after the Ulysses exchange. It runs only VSA:
+pooling, routing, fine/coarse attention, gated merge and their backward,
+with Ring communication. QKV/output projections, Ulysses, MoE and optimizer
+work are outside this benchmark.
+
+| Setting | Value |
+|---|---|
+| Video token grid | `265 x 45 x 80`, sparsity `0.9` |
+| Independent image token grid | `1 x 45 x 80`, dense attention |
+| Text | 2048 tokens per sample |
+| Global packed tokens | 961696: video/text 956048, image/text 5648 |
+| Ring size / heads / head dimension | `4 / 1 / 128` |
+| Compact input tokens at Ring ranks 0/1/2/3 | `240436 / 240420 / 240420 / 240420` |
+| Input order / precision | Compact block order / BF16 |
+
+One head is correct here: the model's 32 heads have already been divided by
+U32. Each Ring rank therefore receives about 240k tokens for that head,
+not the approximately 7.5k rows before the Ulysses exchange. Input tensors
+have no padding; VSA manages its internal 64-token attention slots.
+
+```bash
+torchrun --standalone --nproc-per-node=4 --module benchmark.perf_vsa --ring \
+  --ring-size 4 --heads 1 --cases thd720p44s --batch-p2p \
+  --bwd-bucket-size backend --warmup 10 --repeats 50 --profile \
+  --peak-tflops 2500 --output benchmark/results/ring4_720p44s/perf.json
+```
+
+CUDA Graph is enabled by default. This command validates outputs and all
+input gradients against single-device VSA, retained backward, and graph
+replay with original/changed inputs before timing. It writes
+`perf-group0.json` and `perf-group0-thd720p44s-h1-rank{0,1,2,3}.trace.json`.
+Each trace captures one additional full forward/backward replay after the
+timed samples. JSON reports phase latency, TFLOP/s/GPU and MFU together.
+Inputs are seeded random tensors; matching geometry does not reproduce a
+particular model layer's routing decisions.
+
+The example uses four GPUs on one host. To measure a Ring spanning hosts,
+use one process per host and the normal torchrun rendezvous arguments,
+keeping the same benchmark flags. Record the actual fabric placement:
+single-host NVLink overlap is not representative of a Ring crossing NVLink
+domains, and a four-GPU run does not reproduce 32 concurrent Ring groups.
+Standalone useful-FLOP MFU counts valid attention pairs only; the DiT model
+ledger also includes projections/MoE and counts physical fine-attention
+block slots, so their MFU values have different numerators.
+
+### FLOP accounting and single-device measurements
+
 MFU counts each method's valid attention GEMM FLOPs; backward is twice forward.
 Padding, routing and non-GEMM operations are excluded from the FLOP numerator.
 Set `--peak-tflops` to your GPU's dense BF16 peak.

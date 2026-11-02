@@ -97,12 +97,12 @@ def route(q, k, groups, template, *, dense_query_full):
 def ring_route(q, k, layout):
     """Ring routing: local Q means and globally ordered K means, same math."""
     index = layout.routing_indices.clone()
-    for g, begin, end in layout.local_groups:
+    for g, begin, end in layout.ring.local_groups:
         if g.dense_only or g.kept == g.blocks:
             continue
         dense_end = min(end, max(begin, (
-            g.start + g.dense_blocks_num - layout.ring_rank
-            + layout.ring_size - 1) // layout.ring_size))
+            g.start + g.dense_blocks_num - layout.ring.rank
+            + layout.ring.size - 1) // layout.ring.size))
         _route_group(q[begin:end], k, g, index[:, :, begin:end],
                      layout.routing_indices[:, :, begin:end],
                      dense_rows=dense_end-begin if layout.dense_query_full else 0)
@@ -141,8 +141,8 @@ def attention_slots(q, k, v, layout, *, scale=None):
     # covers coarse's host setup. Both run on the current stream; no sync here.
     coarse = None
     if not layout.dense_only:
-        coarse = coarse_attention(q_coarse, k_coarse, v_coarse, layout.coarse_cu_seqlens,
-                                  max(layout.coarse_lengths), scale=scale)
+        coarse = coarse_attention(q_coarse, k_coarse, v_coarse, layout.coarse_cu_q,
+                                  layout.coarse_max_q, scale=scale)
     return fine, coarse
 
 
@@ -175,15 +175,15 @@ def _ring_runtime(layout, group, device, batch_p2p, bwd_bucket_size):
     ):
         raise ValueError('ring_cp_bwd_bucket_size must be "auto", a positive integer or None')
     key = (group, device, batch_p2p, bwd_bucket_size)
-    if key not in layout._runtime:
+    if key not in layout.ring._runtime:
         size, rank = dist.get_world_size(group), dist.get_rank(group)
-        if (size, rank) != (layout.ring_size, layout.ring_rank):
+        if (size, rank) != (layout.ring.size, layout.ring.rank):
             raise ValueError("Ring layout rank/size differ from the supplied process group")
         ranks = dist.get_process_group_ranks(group)
-        layout._runtime[key] = _RingRuntime(
+        layout.ring._runtime[key] = _RingRuntime(
             group, rank, size, torch.cuda.Stream(device=device), batch_p2p,
             bwd_bucket_size, tuple(ranks))
-    return layout._runtime[key]
+    return layout.ring._runtime[key]
 
 
 def _ring_exchange(runtime, pairs, *, reverse=False):
@@ -258,7 +258,7 @@ class _RingFine(torch.autograd.Function):
         next_lse = torch.empty_like(lse)
         for step in range(steps):
             owner = (runtime.rank - step) % runtime.size
-            sizes = layout.peer_block_sizes[owner]
+            sizes = layout.ring.peer_block_sizes[owner]
             current = buffers[step % len(buffers)]
             if step + 1 < steps:
                 _ring_exchange(runtime, [(current, buffers[(step + 1) % 2])])
@@ -295,7 +295,7 @@ class _RingFine(torch.autograd.Function):
         for step in range(steps):
             forward_step = steps - 1 - step
             owner = (runtime.rank - forward_step) % runtime.size
-            sizes = layout.peer_block_sizes[owner]
+            sizes = layout.ring.peer_block_sizes[owner]
             current = buffers[step % len(buffers)]
             pairs = []
             if step + 1 < steps:
@@ -324,8 +324,8 @@ def ring_attention_slots(q, k, v, layout, group, *, scale, batch_p2p=None, bwd_b
     if not layout.dense_only:
         qm, km, vm = vsa_kernels.block_means(q, k, v, layout.block_sizes)
         km, vm = _GatherMeans.apply(km, vm, runtime)
-        km = km.index_select(0, layout.global_to_gather)
-        vm = vm.index_select(0, layout.global_to_gather)
+        km = km.index_select(0, layout.ring.global_to_gather)
+        vm = vm.index_select(0, layout.ring.global_to_gather)
         indices = ring_route(qm.detach(), km.detach(), layout)
     peer_indices, peer_counts = vsa_kernels.partition_indices(
         indices, layout.routing_counts, runtime.size, layout.blocks)

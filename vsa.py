@@ -3,11 +3,12 @@ import torch
 
 import vsa_core
 import vsa_kernels
-from vsa_layout import RingVSALayout, VSALayout
+from vsa_layout import VSALayout
 
 
 def _reorder_tokens(x, layout, inverse):
-    if not isinstance(layout, VSALayout) or layout.input_order != "block":
+    if (not isinstance(layout, VSALayout) or layout.ring is not None
+            or layout.input_order != "block"):
         raise ValueError('Token reordering requires a full VSALayout with input_order="block"')
     if not isinstance(x, torch.Tensor) or x.ndim < 1 or x.shape[0] != layout.tokens:
         raise ValueError("Expected one tensor with shape [layout.tokens, ...]")
@@ -69,7 +70,7 @@ def vsa_attention(q, k, v, gate, vsa_layout, *, scale=None, ring_cp_group=None,
     padding. Output uses the same order; Q/K/V/gate must share that order.
     The caller reorders tokens and positions once before the entire VSA stack.
 
-    An explicit ring_cp_group requires a RingVSALayout with compact local
+    An explicit ring_cp_group requires layout.ring metadata with compact local
     block inputs, including size-one groups. Pass group-local rank/size to
     build_vsa_layout with input_order="block"; the caller owns whole-block
     sharding and any external Ulysses transformations. ring_cp_batch_p2p=None chooses batched
@@ -80,8 +81,10 @@ def vsa_attention(q, k, v, gate, vsa_layout, *, scale=None, ring_cp_group=None,
     """
     layout = vsa_layout
     is_ring = ring_cp_group is not None
-    if is_ring != isinstance(layout, RingVSALayout):
-        raise ValueError("RingVSALayout requires an explicit ring_cp_group, and vice versa")
+    if not isinstance(layout, VSALayout):
+        raise ValueError("Expected a VSALayout from build_vsa_layout")
+    if is_ring != (layout.ring is not None):
+        raise ValueError("Ring layout metadata requires an explicit ring_cp_group, and vice versa")
     _validate(q, k, v, gate)
     if q.shape[0] != layout.tokens:
         raise ValueError("Expected [layout.tokens, heads, head_dim] inputs")

@@ -220,10 +220,10 @@ def test_coarse_uses_one_fa4_varlen_call(monkeypatch, scale):
         assert all(a is b for a, b in zip((q, k, v), xs))
         return v, None
     monkeypatch.setattr(core, "flash_attn_varlen_func", fake_fa4)
-    assert core.coarse_attention(*xs, layout.coarse_cu_seqlens, max(layout.coarse_lengths), scale) is xs[2]
+    assert core.coarse_attention(*xs, layout.coarse_cu_q, layout.coarse_max_q, scale) is xs[2]
     assert len(calls) == 1
     kwargs = calls[0]
-    assert kwargs["cu_seqlens_q"] is kwargs["cu_seqlens_k"] is layout.coarse_cu_seqlens
+    assert kwargs["cu_seqlens_q"] is kwargs["cu_seqlens_k"] is layout.coarse_cu_q
     assert kwargs["cu_seqlens_q"].tolist() == [0, 3, 4]
     assert kwargs["max_seqlen_q"] == kwargs["max_seqlen_k"] == 3
     assert kwargs["softmax_scale"] == (128**-0.5 if scale is None else scale)
@@ -342,7 +342,7 @@ def test_numeric_sparsity_enables_image_vsa(sparsity, keep):
     assert not layout.dense_only
     assert layout.groups[0].video_spans == ((1, 5, keep),)
     assert layout.block_sizes.tolist() == [7, 16, 16, 16, 16]
-    assert layout.coarse_lengths == (5,)
+    assert layout.coarse_cu_q.tolist() == [0, 5]
     torch.manual_seed(725)
     xs = [torch.randn(layout.tokens, 2, 8, requires_grad=True) for _ in range(4)]
     refs = [x.detach().clone().requires_grad_() for x in xs]

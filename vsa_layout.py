@@ -69,6 +69,20 @@ class SampleBlocks:
 
 
 @dataclass
+class _RingMetadata:
+    """Distribution metadata only; all local attention geometry lives in VSALayout."""
+    size: int
+    rank: int
+    global_blocks: int
+    global_tokens: int
+    local_groups: tuple[tuple[SampleBlocks, int, int], ...]
+    block_ids: torch.Tensor
+    peer_block_sizes: torch.Tensor
+    global_to_gather: torch.Tensor
+    _runtime: dict = field(default_factory=dict, repr=False)
+
+
+@dataclass
 class VSALayout:
     """Static sample/block geometry, token maps and prepared attention metadata.
 
@@ -78,6 +92,9 @@ class VSALayout:
     input_order="raster" means original sample/segment order (FHW for video):
     slot conversion permutes and pads. "block" means compact canonical blocks:
     slot conversion only pads, or is an identity when every block is full.
+    ring=None describes a full input; otherwise the same maps describe the
+    local compact shard. input_rows always indexes the global raster stream.
+    groups and sample_slices describe global samples in both modes.
     """
     samples: tuple[tuple[Segment, ...], ...]
     head_num: int
@@ -86,21 +103,28 @@ class VSALayout:
     slot_row: torch.Tensor
     groups: tuple[SampleBlocks, ...]
     coarse_blocks: torch.Tensor
-    coarse_cu_seqlens: torch.Tensor
-    coarse_lengths: tuple[int, ...]
+    coarse_kv_blocks: torch.Tensor
+    coarse_cu_q: torch.Tensor
+    coarse_cu_kv: torch.Tensor
+    coarse_max_q: int
+    coarse_max_kv: int
     row_coarse: torch.Tensor
     input_rows: torch.Tensor
     input_order: str = "raster"
     dense_query_full: bool = False
     sample_slices: tuple = ()
+    ring: _RingMetadata | None = None
     routing_indices: torch.Tensor = field(init=False, repr=False)
     routing_counts: torch.Tensor = field(init=False, repr=False)
     coarse_rows: torch.Tensor = field(init=False, repr=False)
+    dense_only: bool = field(init=False)
 
     def __post_init__(self):
         """Build routing templates and coarse-row groups before attention runs."""
         if self.input_order not in ("raster", "block"):
             raise ValueError('input_order must be "raster" or "block"')
+        if self.ring is not None and self.input_order != "block":
+            raise ValueError('Ring input_order must be "block" (compact, without padding)')
         if not isinstance(self.head_num, int) or isinstance(self.head_num, bool) or self.head_num <= 0:
             raise ValueError("head_num must be a positive integer")
         if not isinstance(self.dense_query_full, bool):
@@ -111,28 +135,36 @@ class VSALayout:
                        for g in self.groups)
         index = torch.zeros((1, self.head_num, self.blocks, capacity), device=device, dtype=torch.int32)
         counts = torch.zeros((1, self.head_num, self.blocks), device=device, dtype=torch.int32)
-        for g in self.groups:
+        local_groups = (self.ring.local_groups if self.ring is not None else
+                        ((g, g.start, g.end) for g in self.groups))
+        for g, begin, end in local_groups:
             ids = torch.arange(g.start, g.end, device=device, dtype=torch.int32)
             if g.kept == g.blocks:
-                index[:, :, g.start:g.end, :g.blocks] = ids
-                counts[:, :, g.start:g.end] = g.blocks
+                index[:, :, begin:end, :g.blocks] = ids
+                counts[:, :, begin:end] = g.blocks
                 continue
             dense_end = g.start + g.dense_blocks_num
-            routed_start = dense_end if self.dense_query_full else g.start
+            if self.ring is not None:
+                dense_end = min(end, max(begin, (
+                    dense_end - self.ring.rank + self.ring.size - 1) // self.ring.size))
+            routed_start = dense_end if self.dense_query_full else begin
             if g.dense_blocks_num:
                 if self.dense_query_full:
-                    index[:, :, g.start:dense_end, :g.blocks] = ids
-                    counts[:, :, g.start:dense_end] = g.blocks
-                index[:, :, routed_start:g.end, :g.dense_blocks_num] = ids[:g.dense_blocks_num]
-            counts[:, :, routed_start:g.end] = g.kept
+                    index[:, :, begin:dense_end, :g.blocks] = ids
+                    counts[:, :, begin:dense_end] = g.blocks
+                index[:, :, routed_start:end, :g.dense_blocks_num] = ids[:g.dense_blocks_num]
+            counts[:, :, routed_start:end] = g.kept
             cursor = g.dense_blocks_num
-            for start, end, k in g.video_spans:
-                if k == end - start:
-                    index[:, :, routed_start:g.end, cursor:cursor+k] = ids[start-g.start:end-g.start]
+            for start, span_end, k in g.video_spans:
+                if k == span_end - start:
+                    index[:, :, routed_start:end, cursor:cursor+k] = ids[start-g.start:span_end-g.start]
                 cursor += k
         self.routing_indices, self.routing_counts = index, counts
-        # Original token rows per coarse block; -1 marks padding for the merge adjoint.
+        # Input token rows per local coarse block; -1 marks padding for the merge adjoint.
         self.coarse_rows = self.slot_row.view(self.blocks, BLOCK)[self.coarse_blocks]
+        # A rank with no local coarse queries must still join pooled collectives
+        # when another rank owns a sample with VSA blocks.
+        self.dense_only = all(g.dense_only for g in self.groups)
 
     @property
     def tokens(self):
@@ -156,21 +188,48 @@ class VSALayout:
         return self.input_order == "block" and self.all_blocks_full
 
     @property
-    def dense_only(self):
-        return not self.coarse_lengths
-
-    @property
     def sample_lengths(self):
+        """Global sample token counts, including for a Ring shard."""
         return tuple(sum(r.stop-r.start for r in rows) for rows in self.sample_slices)
 
 
-def _finalize_layout(samples, block_rows, groups, sample_slices, *, head_num,
-                     dense_query_full, device, input_order="raster") -> VSALayout:
+def _finalize_layout(samples, global_rows, groups, sample_slices, *, head_num,
+                     dense_query_full, device, input_order, ring_size, ring_rank) -> VSALayout:
     """Materialize padding, inverse maps and coarse metadata from planned blocks.
 
     Each block lists its valid original token rows. Block order, sample bounds
     and KV budgets are already fixed; this stage only derives runtime metadata.
     """
+    def tensor(values, dtype=torch.int64):
+        return torch.tensor(values, device=device, dtype=dtype)
+
+    ring = None
+    block_rows = global_rows
+    local_groups = [(g, g.start, g.end) for g in groups]
+    if ring_size is not None:
+        total = len(global_rows)
+        capacity = (total + ring_size - 1) // ring_size
+        owned = list(range(ring_rank, total, ring_size))
+        block_rows = [global_rows[bid] for bid in owned]
+        block_rows += [[] for _ in range(capacity - len(owned))]
+        local_groups = []
+        for g in groups:
+            begin = max(0, (g.start - ring_rank + ring_size - 1) // ring_size)
+            end = max(0, (g.end - ring_rank + ring_size - 1) // ring_size)
+            if begin < end:
+                local_groups.append((g, begin, end))
+        sizes = [len(rows) for rows in global_rows]
+        peer_sizes = [[sizes[rank + i * ring_size] if rank + i * ring_size < total else 0
+                       for i in range(capacity)] for rank in range(ring_size)]
+        ring = _RingMetadata(
+            size=ring_size, rank=ring_rank, global_blocks=total, global_tokens=sum(sizes),
+            local_groups=tuple(local_groups),
+            block_ids=tensor(owned + [-1] * (capacity - len(owned))),
+            # Each peer slice needs a 16-byte-aligned base for the CuTe frontend.
+            peer_block_sizes=tensor([row + [0] * (-capacity % 4) for row in peer_sizes],
+                                    torch.int32)[:, :capacity],
+            global_to_gather=tensor([(bid % ring_size) * capacity + bid // ring_size
+                                     for bid in range(total)]))
     token_count = sum(map(len, block_rows))
     input_rows = (list(range(token_count)) if input_order == "raster" else
                   [row for rows in block_rows for row in rows])
@@ -182,21 +241,23 @@ def _finalize_layout(samples, block_rows, groups, sample_slices, *, head_num,
             offset += len(rows)
         block_rows = compact_blocks
     slots = [r for rows in block_rows for r in rows + [-1] * (BLOCK-len(rows))]
-    inverse = [0] * sum(len(rows) for rows in block_rows)
+    inverse = [0] * token_count
     for slot, row in enumerate(slots):
         if row >= 0:
             inverse[row] = slot
-    coarse_ids, cu = [], [0]
-    for g in groups:
+    coarse_q, coarse_kv, cu_q, cu_kv = [], [], [0], [0]
+    for g, begin, end in local_groups:
         if not g.dense_only:
-            coarse_ids.extend(range(g.start, g.end))
-            cu.append(len(coarse_ids))
+            coarse_q.extend(range(begin, end))
+            coarse_kv.extend(range(g.start, g.end))
+            cu_q.append(len(coarse_q))
+            cu_kv.append(len(coarse_kv))
     # The final coarse row is a zero sentinel for every fine-only sample row.
-    block_to_coarse = [len(coarse_ids)] * len(block_rows)
-    for i, bid in enumerate(coarse_ids):
+    block_to_coarse = [len(coarse_q)] * len(block_rows)
+    for i, bid in enumerate(coarse_q):
         block_to_coarse[bid] = i
-    def tensor(x, dtype):
-        return torch.tensor(x, device=device, dtype=dtype)
+    coarse_blocks = tensor(coarse_q)
+    coarse_cu_q = tensor(cu_q, torch.int32)
     return VSALayout(
         samples=samples,
         head_num=head_num,
@@ -205,13 +266,17 @@ def _finalize_layout(samples, block_rows, groups, sample_slices, *, head_num,
         row_slot=tensor(inverse, torch.int64),
         slot_row=tensor(slots, torch.int64),
         groups=tuple(groups),
-        coarse_blocks=tensor(coarse_ids, torch.int64),
-        coarse_cu_seqlens=tensor(cu, torch.int32),
-        coarse_lengths=tuple(b-a for a, b in zip(cu, cu[1:])),
+        coarse_blocks=coarse_blocks,
+        coarse_kv_blocks=coarse_blocks if ring is None else tensor(coarse_kv),
+        coarse_cu_q=coarse_cu_q,
+        coarse_cu_kv=coarse_cu_q if ring is None else tensor(cu_kv, torch.int32),
+        coarse_max_q=max((b-a for a, b in zip(cu_q, cu_q[1:])), default=0),
+        coarse_max_kv=max((b-a for a, b in zip(cu_kv, cu_kv[1:])), default=0),
         row_coarse=tensor([block_to_coarse[s//BLOCK] for s in inverse], torch.int64),
         input_rows=tensor(input_rows, torch.int64),
         input_order=input_order,
         sample_slices=tuple(sample_slices),
+        ring=ring,
     )
 
 
@@ -257,7 +322,7 @@ def _build_sample_blocks(segments, *, token_offset, block_offset):
 
 
 def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
-                     input_order="raster", ring_size=None, ring_rank=None) -> "VSALayout | RingVSALayout":
+                     input_order="raster", ring_size=None, ring_rank=None) -> VSALayout:
     """Build a full layout or an explicitly requested ring shard from Segments.
 
     input_order="raster" (the default) concatenates samples/segments
@@ -279,7 +344,7 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
     Reuse the layout across calls with the same geometry, policy, heads and device.
 
     Omit ring_size/ring_rank for a full VSALayout. Provide both as group-local
-    integers for a RingVSALayout, including ring_size=1. Ring shards require
+    integers to populate layout.ring, including ring_size=1. Ring shards require
     input_order="block" and contain only valid owned-block rows without padding.
     The global block count must be at least ring_size, so every rank owns data.
     Individual samples may have fewer blocks; no divisibility is required.
@@ -310,12 +375,9 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
             raise ValueError(
                 "Ring requires at least ring_size global blocks; "
                 f"got global_blocks={len(block_rows)}, ring_size={ring_size}")
-        return _finalize_ring_layout(samples, block_rows, groups, sample_slices,
-                                     head_num=head_num, ring_size=ring_size, ring_rank=ring_rank,
-                                     dense_query_full=dense_query_full, device=device)
     return _finalize_layout(samples, block_rows, groups, sample_slices,
                             head_num=head_num, dense_query_full=dense_query_full, device=device,
-                            input_order=input_order)
+                            input_order=input_order, ring_size=ring_size, ring_rank=ring_rank)
 
 
 def _plan_samples(samples):
@@ -340,146 +402,3 @@ def _plan_samples(samples):
         sample_slices.append(segment_slices)
         token_offset = segment_slices[-1].stop
     return samples, block_rows, groups, sample_slices
-
-
-@dataclass
-class RingVSALayout:
-    """Packed THD ownership after any external Ulysses all-to-all.
-
-    ``input_rows`` indexes the original global sample-major raster stream.
-    input_order is always "block": valid tokens of each owned block are
-    adjacent, with no input padding. All other row maps index this compact
-    THD input. Slot conversion only adds padding; it never reorders FHW.
-    Communication
-    buffers have ``blocks * 64`` rows, including any dummy trailing block.
-    """
-    samples: tuple
-    head_num: int
-    ring_size: int
-    ring_rank: int
-    global_blocks: int
-    global_tokens: int
-    groups: tuple
-    sample_slices: tuple
-    local_groups: tuple
-    input_rows: torch.Tensor
-    block_ids: torch.Tensor
-    block_sizes: torch.Tensor
-    peer_block_sizes: torch.Tensor
-    global_to_gather: torch.Tensor
-    slot_row: torch.Tensor
-    row_slot: torch.Tensor
-    routing_indices: torch.Tensor
-    routing_counts: torch.Tensor
-    coarse_blocks: torch.Tensor
-    coarse_kv_blocks: torch.Tensor
-    coarse_cu_q: torch.Tensor
-    coarse_cu_kv: torch.Tensor
-    coarse_max_q: int
-    coarse_max_kv: int
-    row_coarse: torch.Tensor
-    coarse_rows: torch.Tensor
-    dense_only: bool
-    dense_query_full: bool
-    input_order: str = "block"
-    _runtime: dict = field(default_factory=dict, repr=False)
-
-    def __post_init__(self):
-        if self.input_order != "block":
-            raise ValueError('Ring input_order must be "block" (compact, without padding)')
-
-    @property
-    def tokens(self):
-        return self.input_rows.numel()
-
-    @property
-    def blocks(self):
-        return self.block_ids.numel()
-
-    @property
-    def padded_tokens(self):
-        return self.blocks * BLOCK
-
-    @property
-    def slots_are_input(self):
-        return self.input_order == "block" and self.tokens == self.padded_tokens
-
-
-def _finalize_ring_layout(samples, global_rows, groups, sample_slices, *, head_num,
-                          ring_size, ring_rank, dense_query_full, device) -> RingVSALayout:
-    """Materialize cyclic ownership, local slots and global routing metadata."""
-    total = len(global_rows)
-    capacity = (total + ring_size - 1) // ring_size
-    owned = list(range(ring_rank, total, ring_size))
-    input_rows = [row for bid in owned for row in global_rows[bid]]
-    blocks, offset = [], 0
-    for bid in owned:
-        length = len(global_rows[bid])
-        blocks.append(list(range(offset, offset + length)))
-        offset += length
-    blocks += [[] for _ in range(capacity - len(blocks))]
-    slots = [row for rows in blocks for row in rows + [-1] * (BLOCK - len(rows))]
-    inverse = [0] * len(input_rows)
-    for slot, row in enumerate(slots):
-        if row >= 0:
-            inverse[row] = slot
-    max_keys = max(g.blocks if dense_query_full and g.dense_blocks_num else g.kept
-                   for g in groups)
-    index = torch.zeros((1, head_num, capacity, max_keys), dtype=torch.int32)
-    counts = torch.zeros((1, head_num, capacity), dtype=torch.int32)
-    local_groups, coarse_q, coarse_kv, cu_q, cu_kv = [], [], [], [0], [0]
-    for g in groups:
-        local_start = max(0, (g.start - ring_rank + ring_size - 1) // ring_size)
-        local_end = max(0, (g.end - ring_rank + ring_size - 1) // ring_size)
-        if local_start == local_end:
-            continue
-        local_groups.append((g, local_start, local_end))
-        for local_bid in range(local_start, local_end):
-            global_bid = ring_rank + ring_size * local_bid
-            full = g.kept == g.blocks or (
-                dense_query_full and global_bid < g.start + g.dense_blocks_num)
-            counts[:, :, local_bid] = g.blocks if full else g.kept
-            if full:
-                index[:, :, local_bid, :g.blocks] = torch.arange(g.start, g.end)
-            else:
-                cursor = g.dense_blocks_num
-                index[:, :, local_bid, :cursor] = torch.arange(g.start, g.start + cursor)
-                for start, end, keep in g.video_spans:
-                    if keep == end - start:
-                        index[:, :, local_bid, cursor:cursor + keep] = torch.arange(start, end)
-                    cursor += keep
-        if not g.dense_only:
-            coarse_q.extend(range(local_start, local_end))
-            coarse_kv.extend(range(g.start, g.end))
-            cu_q.append(len(coarse_q))
-            cu_kv.append(len(coarse_kv))
-    block_to_coarse = [len(coarse_q)] * capacity
-    for i, bid in enumerate(coarse_q):
-        block_to_coarse[bid] = i
-    sizes = [len(rows) for rows in global_rows]
-    peer_sizes = [[sizes[rank + i * ring_size] if rank + i * ring_size < total else 0
-                   for i in range(capacity)] for rank in range(ring_size)]
-    def tensor(values, dtype=torch.int64):
-        return torch.tensor(values, dtype=dtype, device=device)
-    slot_row = tensor(slots)
-    coarse_blocks = tensor(coarse_q)
-    return RingVSALayout(
-        samples=samples, head_num=head_num, ring_size=ring_size, ring_rank=ring_rank,
-        global_blocks=total, global_tokens=sum(len(rows) for rows in global_rows),
-        groups=tuple(groups), sample_slices=tuple(sample_slices), local_groups=tuple(local_groups),
-        input_rows=tensor(input_rows), block_ids=tensor(owned + [-1] * (capacity - len(owned))),
-        block_sizes=tensor(peer_sizes[ring_rank], torch.int32),
-        # Each peer slice needs a 16-byte-aligned base for the CuTe frontend.
-        peer_block_sizes=tensor([row + [0] * (-capacity % 4) for row in peer_sizes],
-                                torch.int32)[:, :capacity],
-        global_to_gather=tensor([(bid % ring_size) * capacity + bid // ring_size for bid in range(total)]),
-        slot_row=slot_row, row_slot=tensor(inverse),
-        routing_indices=index.to(device), routing_counts=counts.to(device),
-        coarse_blocks=coarse_blocks, coarse_kv_blocks=tensor(coarse_kv),
-        coarse_cu_q=tensor(cu_q, torch.int32), coarse_cu_kv=tensor(cu_kv, torch.int32),
-        coarse_max_q=max((b-a for a, b in zip(cu_q, cu_q[1:])), default=0),
-        coarse_max_kv=max((b-a for a, b in zip(cu_kv, cu_kv[1:])), default=0),
-        row_coarse=tensor([block_to_coarse[s // BLOCK] for s in inverse]),
-        coarse_rows=slot_row.view(capacity, BLOCK)[coarse_blocks],
-        dense_only=all(g.dense_only for g in groups), dense_query_full=dense_query_full,
-        input_order="block")

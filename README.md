@@ -146,7 +146,7 @@ fine-before-coarse schedule. The core does not import the public entry.
 
 ## Ring context parallelism
 
-Use the same `vsa_attention` entry with a `RingVSALayout` and an explicit
+Use the same `vsa_attention` entry with a `VSALayout` and an explicit
 `ring_cp_group`. Build the layout with `build_vsa_layout(samples,
 head_num=H, input_order="block", ring_size=dist.get_world_size(group),
 ring_rank=dist.get_rank(group), device=device)`, then call
@@ -157,11 +157,23 @@ The caller creates and owns the process group; `ring_cp_group=None` uses
 single-device attention.
 
 `build_vsa_layout` is the only public layout builder. Omit `ring_size` and
-`ring_rank` to build a full `VSALayout`; provide both to build a `RingVSALayout`.
+`ring_rank` for a full input (`layout.ring is None`); provide both for a local
+shard with distribution metadata in `layout.ring`. Both return `VSALayout`.
 An explicit `ring_size=1` still builds a ring shard. Ring construction requires
 `input_order="block"`; the default for full layouts remains `"raster"`.
 The builder works on CPU without distributed initialization. Full layouts
 remain necessary for the boundary reorder helpers.
+
+Full inputs and Ring shards share slot maps, routing-template construction and
+coarse Q/KV metadata. `tokens`, `blocks` and row/slot maps describe the input
+held locally; `groups`, `sample_slices` and `sample_lengths` describe global
+samples. `layout.ring` holds group-local `size`/`rank`, global counts, block
+ownership, peer lengths and the all-gather permutation. Coarse Q boundaries
+are local and KV boundaries cover the corresponding global samples; full
+layouts share the same Q/KV boundary and block-ID tensors. This metadata
+unification preserves the separate single-device and Ring execution paths.
+Explicit Ring metadata, including size one, requires a matching process group;
+full layouts reject a Ring group. Boundary reorder helpers reject Ring shards.
 
 ### Compact input and block ownership
 
@@ -182,7 +194,7 @@ Individual samples may have fewer than R blocks. Internal communication
 buffers use `ceil(global_blocks / R)` blocks per rank, with zero padding for
 partial and dummy blocks.
 
-`RingVSALayout.input_rows` maps local compact rows to the original global
+For a Ring shard, `layout.input_rows` maps local compact rows to the original global
 sample/segment/FHW coordinates. It is a shard map, whereas the full block
 `VSALayout.input_rows` is a permutation of all tokens. If the model starts
 in raster order, use `to_block_order` with a **full block VSALayout** once at
@@ -250,7 +262,7 @@ The routing code follows this sequence:
 2. `ring_attention_slots` in [vsa_core.py](vsa_core.py) computes local Q/K/V
    block means in FP32, dividing by valid token counts. Padding is zero and
    dummy blocks have zero means. Pooled K/V is all-gathered in rank order,
-   then `layout.global_to_gather` restores global block order and removes
+   then `layout.ring.global_to_gather` restores global block order and removes
    dummy blocks. Routing uses local Q means and globally ordered K means.
 3. `ring_route` visits each sample's local Q block range and calls the shared
    `_route_group`. For each video KV region and head, it forms FP32 scores

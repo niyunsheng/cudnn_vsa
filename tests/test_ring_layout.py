@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from vsa_core import route
-from vsa_layout import RingVSALayout, VSALayout, Segment, build_vsa_layout
+from vsa_layout import VSALayout, Segment, build_vsa_layout
 from vsa_kernels import partition_indices
 from vsa_core import ring_route
 from vsa import to_block_order, to_raster_order, vsa_attention
@@ -27,7 +27,7 @@ def test_thd_partition(size, dense_query_full):
     for rank in range(size):
         local = build_vsa_layout(PACK, head_num=2, ring_size=size, ring_rank=rank,
                                      dense_query_full=dense_query_full, input_order="block")
-        ids = local.block_ids[local.block_ids >= 0]
+        ids = local.ring.block_ids[local.ring.block_ids >= 0]
         assert ids.tolist() == list(range(rank, full.blocks, size))
         assert local.input_order == "block"
         assert local.tokens > 0
@@ -41,7 +41,7 @@ def test_thd_partition(size, dense_query_full):
                            full.slot_row.view(-1, 64)[ids])
         assert torch.equal(local.slot_row[local.row_slot], torch.arange(local.tokens))
         assert torch.equal(local.block_sizes[:len(ids)], full.block_sizes[ids])
-        assert all(row.data_ptr() % 16 == 0 for row in local.peer_block_sizes)
+        assert all(row.data_ptr() % 16 == 0 for row in local.ring.peer_block_sizes)
         assert torch.equal(local.routing_counts[:, :, :len(ids)], full.routing_counts[:, :, ids])
         assert not local.routing_counts[:, :, len(ids):].any()
         for g in full.groups:
@@ -72,7 +72,7 @@ def test_ring_accepts_small_samples_and_uneven_block_counts(blocks):
                                   ring_size=4, ring_rank=rank)
         owned = list(range(rank, blocks, 4))
         assert layout.tokens == len(owned) > 0
-        assert layout.block_ids[layout.block_ids >= 0].tolist() == owned
+        assert layout.ring.block_ids[layout.ring.block_ids >= 0].tolist() == owned
         assert layout.padded_tokens == ((blocks + 3) // 4) * 64
 
 
@@ -96,7 +96,7 @@ def test_global_topk_and_peer_lists(dense_query_full):
     for rank in range(size):
         local = build_vsa_layout(PACK, head_num=heads, ring_size=size, ring_rank=rank,
                                      dense_query_full=dense_query_full, input_order="block")
-        ids = local.block_ids[local.block_ids >= 0]
+        ids = local.ring.block_ids[local.ring.block_ids >= 0]
         query = torch.zeros(local.blocks, heads, 128)
         query[:len(ids)] = q[ids]
         actual = ring_route(query, k, local)
@@ -120,7 +120,7 @@ def test_64k_h2_ring8():
     samples = [[Segment("video", (16, 60, 64), .9), Segment("text", 4096)]]
     for rank in range(8):
         local = build_vsa_layout(samples, head_num=2, ring_size=8, ring_rank=rank, input_order="block")
-        assert local.global_tokens == 65536
+        assert local.ring.global_tokens == 65536
         assert local.tokens == 8192
         assert local.blocks == 128
         assert local.coarse_max_q == 128
@@ -144,9 +144,14 @@ def test_invalid_input_order(order):
 def test_size_one_ring_is_still_compact_block_order():
     ring = build_vsa_layout(PACK, head_num=2, ring_size=1, ring_rank=0, input_order="block")
     single = build_vsa_layout(PACK, head_num=2, input_order="block")
-    assert isinstance(ring, RingVSALayout) and isinstance(single, VSALayout)
-    for name in ("input_rows", "slot_row", "row_slot", "block_sizes"):
+    assert type(ring) is type(single) is VSALayout
+    assert ring.ring is not None and single.ring is None
+    for name in ("input_rows", "slot_row", "row_slot", "block_sizes", "routing_indices",
+                 "routing_counts", "coarse_blocks", "coarse_kv_blocks", "coarse_cu_q",
+                 "coarse_cu_kv", "row_coarse", "coarse_rows"):
         torch.testing.assert_close(getattr(ring, name), getattr(single, name), rtol=0, atol=0)
+    assert single.coarse_cu_q is single.coarse_cu_kv
+    assert single.coarse_blocks is single.coarse_kv_blocks
     with pytest.raises(ValueError, match='input_order must be "block"'):
         build_vsa_layout(PACK, head_num=2, ring_size=1, ring_rank=0, input_order="raster")
     with pytest.raises(ValueError, match='input_order must be "block"'):
@@ -178,5 +183,52 @@ def test_omitted_ring_parameters_preserve_full_layout():
     block = build_vsa_layout(PACK, head_num=2, input_order="block", ring_size=None, ring_rank=None)
     assert isinstance(raster, VSALayout) and raster.input_order == "raster"
     assert isinstance(block, VSALayout) and block.input_order == "block"
+    assert raster.ring is block.ring is None
     assert raster.tokens == block.tokens
     assert raster.input_rows.tolist() == list(range(raster.tokens))
+
+
+@pytest.mark.parametrize("size", [1, 2])
+@pytest.mark.parametrize("sharded", [False, True])
+def test_attention_rejects_layout_group_mismatch(size, sharded):
+    kwargs = dict(ring_size=size, ring_rank=0) if sharded else {}
+    layout = build_vsa_layout(PACK, head_num=2, input_order="block", **kwargs)
+    x = torch.empty(layout.tokens, 2, 128)
+    with pytest.raises(ValueError, match="explicit ring_cp_group"):
+        vsa_attention(x, x, x, x, layout, ring_cp_group=None if sharded else object())
+
+
+@pytest.mark.parametrize("rank,size", [(1, 2), (0, 4)])
+def test_ring_metadata_must_match_process_group(monkeypatch, rank, size):
+    import vsa_core as core
+
+    layout = build_vsa_layout(PACK, head_num=2, input_order="block", ring_size=2, ring_rank=0)
+    monkeypatch.setattr(core.dist, "get_world_size", lambda group: size)
+    monkeypatch.setattr(core.dist, "get_rank", lambda group: rank)
+    with pytest.raises(ValueError, match="rank/size differ"):
+        core._ring_runtime(layout, object(), torch.device("cpu"), False, None)
+
+
+def test_coarse_metadata_preserves_sample_isolation_and_global_collectives():
+    samples = [
+        [Segment("video", (4, 4, 8), .5)],  # Global blocks 0, 1: coarse.
+        [Segment("video", (1, 1, 128))],   # Global blocks 2, 3: fine only.
+        [Segment("video", (4, 4, 8), .5)],  # Global blocks 4, 5: coarse.
+    ]
+    for rank in range(4):
+        layout = build_vsa_layout(samples, head_num=2, input_order="block",
+                                  ring_size=4, ring_rank=rank)
+        # All ranks must join pooled collectives, even ranks 2/3 with no coarse Q.
+        assert not layout.dense_only
+        assert layout.sample_lengths == (128, 128, 128)
+        if rank < 2:
+            assert layout.coarse_blocks.tolist() == [0, 1]
+            assert layout.coarse_kv_blocks.tolist() == [0, 1, 4, 5]
+            assert layout.coarse_cu_q.tolist() == [0, 1, 2]
+            assert layout.coarse_cu_kv.tolist() == [0, 2, 4]
+            assert (layout.coarse_max_q, layout.coarse_max_kv) == (1, 2)
+        else:
+            assert layout.coarse_blocks.numel() == layout.coarse_kv_blocks.numel() == 0
+            assert layout.coarse_cu_q.tolist() == layout.coarse_cu_kv.tolist() == [0]
+            assert (layout.coarse_max_q, layout.coarse_max_kv) == (0, 0)
+            assert not layout.row_coarse.any()  # All valid rows use the zero sentinel.

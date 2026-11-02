@@ -139,7 +139,7 @@ def run_case(name, heads, args, group):
     if name == "default":
         record["input"] = describe()
     if group is not None:
-        record["bwd_bucket_size_effective"] = next(iter(local._runtime.values())).bwd_bucket_size
+        record["bwd_bucket_size_effective"] = next(iter(local.ring._runtime.values())).bwd_bucket_size
     del global_xs, global_dy, expected, actual, repeated
     if rank == 0:
         print(f"PARITY {name} H={heads} ring={size} input={args.input_order} PASS", flush=True)

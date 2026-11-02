@@ -111,8 +111,10 @@ def run_case(name, heads, args, group):
     kwargs = dict(head_num=heads, device="cuda", dense_query_full=args.dense_query_full)
     full = build_vsa_layout(samples, **kwargs)
     if group is not None:
-        local = build_vsa_layout(samples, **kwargs, ring_size=size, ring_rank=rank,
-                                input_order=args.input_order)
+        local = build_vsa_layout(samples, **kwargs, ring_cp_group=group,
+                                input_order=args.input_order,
+                                ring_cp_batch_p2p=args.batch_p2p,
+                                ring_cp_bwd_bucket_size=args.bwd_bucket_size)
     else:
         local = full if args.input_order == "raster" else build_vsa_layout(samples, **kwargs, input_order="block")
     global_xs, global_dy = make_inputs(heads, samples=samples, seed=937 if args.ring else 2026)
@@ -121,8 +123,7 @@ def run_case(name, heads, args, group):
             global_xs[3][full.sample_slices[1][0]] = float("nan")
     xs = tuple(x.detach()[local.input_rows].contiguous().requires_grad_() for x in global_xs)
     dy = global_dy[local.input_rows].contiguous()
-    fn = functools.partial(vsa_attention, vsa_layout=local, ring_cp_group=group,
-                           ring_cp_batch_p2p=args.batch_p2p, ring_cp_bwd_bucket_size=args.bwd_bucket_size)
+    fn = functools.partial(vsa_attention, vsa_layout=local)
     ref = (functools.partial(vsa_attention, vsa_layout=full) if full.tokens > 4096
            else reference_pack(samples, full.sample_slices, dense_query_full=args.dense_query_full))
     expected = tuple(x[local.input_rows] for x in forward_backward(ref, global_xs, global_dy))

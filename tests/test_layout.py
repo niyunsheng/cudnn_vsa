@@ -5,16 +5,16 @@ from vsa_layout import Segment, build_vsa_layout
 
 @pytest.mark.parametrize("head_num", [0, -1, 1.5, True, None])
 @pytest.mark.parametrize("ring", [False, True])
-def test_layout_rejects_invalid_head_num(head_num, ring):
-    kwargs = dict(ring_size=2, ring_rank=0, input_order="block") if ring else {}
+def test_layout_rejects_invalid_head_num(head_num, ring, metadata_group):
+    kwargs = dict(ring_cp_group=metadata_group(2, 0), input_order="block") if ring else {}
     with pytest.raises(ValueError, match="head_num"):
         build_vsa_layout([[Segment("video", (1, 2, 3))]], head_num=head_num, **kwargs)
 
 
 @pytest.mark.parametrize("dense_query_full", [None, 1, "False"])
 @pytest.mark.parametrize("ring", [False, True])
-def test_layout_rejects_invalid_dense_query_full(dense_query_full, ring):
-    kwargs = dict(ring_size=2, ring_rank=0, input_order="block") if ring else {}
+def test_layout_rejects_invalid_dense_query_full(dense_query_full, ring, metadata_group):
+    kwargs = dict(ring_cp_group=metadata_group(2, 0), input_order="block") if ring else {}
     with pytest.raises(ValueError, match="dense_query_full"):
         build_vsa_layout([[Segment("video", (1, 2, 3))]], head_num=2,
                          dense_query_full=dense_query_full, **kwargs)

@@ -3,6 +3,7 @@ import math
 from dataclasses import dataclass, field
 
 import torch
+import torch.distributed as dist
 
 BLOCK = 64
 
@@ -68,11 +69,14 @@ class SampleBlocks:
         return self.dense_blocks_num + sum(k for _, _, k in self.video_spans)
 
 
-@dataclass
+@dataclass(frozen=True)
 class _RingMetadata:
-    """Distribution metadata only; all local attention geometry lives in VSALayout."""
+    """Borrowed process group and distribution metadata for one local layout."""
+    group: dist.ProcessGroup = field(repr=False)
     size: int
     rank: int
+    batch_p2p: bool | None
+    bwd_bucket_size: str | int | None
     global_blocks: int
     global_tokens: int
     local_groups: tuple[tuple[SampleBlocks, int, int], ...]
@@ -194,7 +198,8 @@ class VSALayout:
 
 
 def _finalize_layout(samples, global_rows, groups, sample_slices, *, head_num,
-                     dense_query_full, device, input_order, ring_size, ring_rank) -> VSALayout:
+                     dense_query_full, device, input_order, ring_size, ring_rank,
+                     ring_cp_group, ring_cp_batch_p2p, ring_cp_bwd_bucket_size) -> VSALayout:
     """Materialize padding, inverse maps and coarse metadata from planned blocks.
 
     Each block lists its valid original token rows. Block order, sample bounds
@@ -222,6 +227,8 @@ def _finalize_layout(samples, global_rows, groups, sample_slices, *, head_num,
         peer_sizes = [[sizes[rank + i * ring_size] if rank + i * ring_size < total else 0
                        for i in range(capacity)] for rank in range(ring_size)]
         ring = _RingMetadata(
+            group=ring_cp_group, batch_p2p=ring_cp_batch_p2p,
+            bwd_bucket_size=ring_cp_bwd_bucket_size,
             size=ring_size, rank=ring_rank, global_blocks=total, global_tokens=sum(sizes),
             local_groups=tuple(local_groups),
             block_ids=tensor(owned + [-1] * (capacity - len(owned))),
@@ -322,7 +329,8 @@ def _build_sample_blocks(segments, *, token_offset, block_offset):
 
 
 def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
-                     input_order="raster", ring_size=None, ring_rank=None) -> VSALayout:
+                     input_order="raster", ring_cp_group=None, ring_cp_batch_p2p=None,
+                     ring_cp_bwd_bucket_size="auto") -> VSALayout:
     """Build a full layout or an explicitly requested ring shard from Segments.
 
     input_order="raster" (the default) concatenates samples/segments
@@ -343,32 +351,47 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
     head_num fixes the Q/K/V head count and the prepared BSA template shapes.
     Reuse the layout across calls with the same geometry, policy, heads and device.
 
-    Omit ring_size/ring_rank for a full VSALayout. Provide both as group-local
-    integers to populate layout.ring, including ring_size=1. Ring shards require
-    input_order="block" and contain only valid owned-block rows without padding.
+    ring_cp_group=None builds a full VSALayout without distributed initialization.
+    Pass an existing member ProcessGroup to bind a Ring shard, including size one.
+    Rank/size come from that group; layout only borrows it and never creates or
+    destroys groups. Different micro-batch layouts can share the same group.
+    Ring shards require input_order="block" and contain only valid owned-block
+    rows without padding.
     The global block count must be at least ring_size, so every rank owns data.
     Individual samples may have fewer blocks; no divisibility is required.
-    Reorder/distribute whole blocks at the dataset/model boundary. The builder
-    needs no process group or distributed initialization; pass the matching
-    explicit ring_cp_group to vsa_attention. Boundary reorder helpers still
-    require a full block VSALayout.
+    Reorder/distribute whole blocks at the dataset/model boundary. All attention
+    calls use vsa_attention(q, k, v, gate, layout), with no Ring arguments.
+    Boundary reorder helpers still require a full block VSALayout.
+    ring_cp_batch_p2p=None chooses batched P2P for device-bound groups and
+    individual P2P for lazy groups. ring_cp_bwd_bucket_size="auto" selects the
+    measured SM100/H2/local-128-block/single-sample setting; None uses the backend
+    default, and a positive integer overrides it. These options require a group.
     """
     if input_order not in ("raster", "block"):
         raise ValueError('input_order must be "raster" or "block"')
-    if (ring_size is None) != (ring_rank is None):
-        raise ValueError("ring_size and ring_rank must be provided together")
-    is_ring = ring_size is not None
+    if ring_cp_batch_p2p is not None and not isinstance(ring_cp_batch_p2p, bool):
+        raise ValueError("ring_cp_batch_p2p must be a bool or None")
+    if ring_cp_bwd_bucket_size not in (None, "auto") and (
+        isinstance(ring_cp_bwd_bucket_size, bool)
+        or not isinstance(ring_cp_bwd_bucket_size, int) or ring_cp_bwd_bucket_size < 1
+    ):
+        raise ValueError('ring_cp_bwd_bucket_size must be "auto", a positive integer or None')
+    is_ring = ring_cp_group is not None
+    ring_size = ring_rank = None
     if is_ring:
         if input_order != "block":
             raise ValueError('Ring input_order must be "block" (compact, without padding)')
-        for name, number, minimum in (("head_num", head_num, 1), ("ring_size", ring_size, 1),
-                                      ("ring_rank", ring_rank, 0)):
-            if isinstance(number, bool) or not isinstance(number, int) or number < minimum:
-                raise ValueError(f"{name} must be an integer >= {minimum}")
-        if ring_rank >= ring_size:
-            raise ValueError("ring_rank must be smaller than ring_size")
+        if not isinstance(ring_cp_group, dist.ProcessGroup):
+            raise ValueError("ring_cp_group must be a ProcessGroup containing this rank")
+        ring_size, ring_rank = ring_cp_group.size(), ring_cp_group.rank()
+        if ring_size < 1 or not 0 <= ring_rank < ring_size:
+            raise ValueError("ring_cp_group must contain this rank and have positive size")
+        if isinstance(head_num, bool) or not isinstance(head_num, int) or head_num < 1:
+            raise ValueError("head_num must be a positive integer")
         if not isinstance(dense_query_full, bool):
             raise ValueError("dense_query_full must be a bool")
+    elif ring_cp_batch_p2p is not None or ring_cp_bwd_bucket_size != "auto":
+        raise ValueError("Ring transport options require ring_cp_group")
     samples, block_rows, groups, sample_slices = _plan_samples(samples)
     if is_ring:
         if len(block_rows) < ring_size:
@@ -377,7 +400,9 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
                 f"got global_blocks={len(block_rows)}, ring_size={ring_size}")
     return _finalize_layout(samples, block_rows, groups, sample_slices,
                             head_num=head_num, dense_query_full=dense_query_full, device=device,
-                            input_order=input_order, ring_size=ring_size, ring_rank=ring_rank)
+                            input_order=input_order, ring_size=ring_size, ring_rank=ring_rank,
+                            ring_cp_group=ring_cp_group, ring_cp_batch_p2p=ring_cp_batch_p2p,
+                            ring_cp_bwd_bucket_size=ring_cp_bwd_bucket_size)
 
 
 def _plan_samples(samples):

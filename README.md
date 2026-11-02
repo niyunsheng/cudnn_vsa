@@ -146,34 +146,46 @@ fine-before-coarse schedule. The core does not import the public entry.
 
 ## Ring context parallelism
 
-Use the same `vsa_attention` entry with a `VSALayout` and an explicit
-`ring_cp_group`. Build the layout with `build_vsa_layout(samples,
-head_num=H, input_order="block", ring_size=dist.get_world_size(group),
-ring_rank=dist.get_rank(group), device=device)`, then call
-`vsa_attention(q, k, v, gate, layout, ring_cp_group=group)`.
+Ordinary VSA and Ring use the same forward API:
+
+```python
+layout = build_vsa_layout(
+    samples, head_num=H, input_order="block", device=device,
+    ring_cp_group=group,  # Existing caller-owned group; None selects ordinary VSA.
+)
+out = vsa_attention(q, k, v, gate, layout)
+```
+
+Pass the existing process group when constructing the layout. Rank and size
+come from that group; they are not separate builder arguments. Forward and
+backward use the bound group without additional Ring arguments.
 All group ranks use identical global sample/segment metadata and the same
 heads. Layout rank and size refer to that group, including interleaved groups.
-The caller creates and owns the process group; `ring_cp_group=None` uses
-single-device attention.
+The caller creates the group once during parallel initialization and owns its
+lifetime. Different micro-batches can build different layouts referencing the
+same group. Constructing or releasing a layout never creates or destroys a
+process group. Reuse a layout when geometry, policy, heads and device match.
 
-`build_vsa_layout` is the only public layout builder. Omit `ring_size` and
-`ring_rank` for a full input (`layout.ring is None`); provide both for a local
-shard with distribution metadata in `layout.ring`. Both return `VSALayout`.
-An explicit `ring_size=1` still builds a ring shard. Ring construction requires
-`input_order="block"`; the default for full layouts remains `"raster"`.
-The builder works on CPU without distributed initialization. Full layouts
-remain necessary for the boundary reorder helpers.
+`build_vsa_layout` is the only public layout builder. `ring_cp_group=None`
+builds a full input (`layout.ring is None`); a member `ProcessGroup` builds a
+local shard with its group reference and distribution metadata in `layout.ring`.
+Both return `VSALayout`. A size-one group still builds a Ring shard.
+Ring construction requires `input_order="block"`; full layouts default to
+`"raster"`.
+Full layouts work on CPU without distributed initialization; Ring layouts
+require the caller's existing group. Nonmember group handles are rejected.
+Full layouts remain necessary for the boundary reorder helpers.
 
 Full inputs and Ring shards share slot maps, routing-template construction and
 coarse Q/KV metadata. `tokens`, `blocks` and row/slot maps describe the input
 held locally; `groups`, `sample_slices` and `sample_lengths` describe global
-samples. `layout.ring` holds group-local `size`/`rank`, global counts, block
+samples. `layout.ring` holds `group`, group-local `size`/`rank`, global counts, block
 ownership, peer lengths and the all-gather permutation. Coarse Q boundaries
 are local and KV boundaries cover the corresponding global samples; full
 layouts share the same Q/KV boundary and block-ID tensors. This metadata
 unification preserves the separate single-device and Ring execution paths.
-Explicit Ring metadata, including size one, requires a matching process group;
-full layouts reject a Ring group. Boundary reorder helpers reject Ring shards.
+The group and transport options are bound at construction and cannot be
+reassigned on Ring metadata. Boundary reorder helpers reject Ring shards.
 
 ### Compact input and block ownership
 
@@ -358,6 +370,7 @@ log-sum-exp, and accumulates dQ/dK/dV in FP32. The pooled-mean gather has a
 reduce-scatter adjoint. Empty or fine-only peers still participate in the
 required collectives; saved receive buffers support retained-graph backward.
 
+Set transport options on `build_vsa_layout`, alongside `ring_cp_group`.
 `ring_cp_batch_p2p=None` uses individual P2P for lazy NCCL groups and batched
 P2P for device-bound groups. A boolean selects either mode explicitly.
 Caller-created high-priority NCCL groups can improve overlap.

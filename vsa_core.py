@@ -157,7 +157,9 @@ class _RingRuntime:
     peers: tuple
 
 
-def _ring_runtime(layout, group, device, batch_p2p, bwd_bucket_size):
+def _ring_runtime(layout, device):
+    ring = layout.ring
+    group, batch_p2p, bwd_bucket_size = ring.group, ring.batch_p2p, ring.bwd_bucket_size
     if batch_p2p is None:
         # Eager NCCL groups serialize individual P2P operations on their
         # parent communicator. Lazy groups can use independent pair comms.
@@ -170,20 +172,13 @@ def _ring_runtime(layout, group, device, batch_p2p, bwd_bucket_size):
             64 if layout.head_num == 2 and layout.blocks == 128
             and len(layout.groups) == 1
             and torch.cuda.get_device_capability(device) == (10, 0) else None)
-    if bwd_bucket_size is not None and (
-        isinstance(bwd_bucket_size, bool) or not isinstance(bwd_bucket_size, int) or bwd_bucket_size < 1
-    ):
-        raise ValueError('ring_cp_bwd_bucket_size must be "auto", a positive integer or None')
-    key = (group, device, batch_p2p, bwd_bucket_size)
-    if key not in layout.ring._runtime:
-        size, rank = dist.get_world_size(group), dist.get_rank(group)
-        if (size, rank) != (layout.ring.size, layout.ring.rank):
-            raise ValueError("Ring layout rank/size differ from the supplied process group")
+    key = (device, batch_p2p, bwd_bucket_size)
+    if key not in ring._runtime:
         ranks = dist.get_process_group_ranks(group)
-        layout.ring._runtime[key] = _RingRuntime(
-            group, rank, size, torch.cuda.Stream(device=device), batch_p2p,
+        ring._runtime[key] = _RingRuntime(
+            group, ring.rank, ring.size, torch.cuda.Stream(device=device), batch_p2p,
             bwd_bucket_size, tuple(ranks))
-    return layout.ring._runtime[key]
+    return ring._runtime[key]
 
 
 def _ring_exchange(runtime, pairs, *, reverse=False):
@@ -317,9 +312,9 @@ class _RingFine(torch.autograd.Function):
                 None, None, None, None, None)
 
 
-def ring_attention_slots(q, k, v, layout, group, *, scale, batch_p2p=None, bwd_bucket_size="auto"):
+def ring_attention_slots(q, k, v, layout, *, scale):
     """Return local fine slots and compact coarse output; row handling is caller-owned."""
-    runtime = _ring_runtime(layout, group, q.device, batch_p2p, bwd_bucket_size)
+    runtime = _ring_runtime(layout, q.device)
     indices = layout.routing_indices
     if not layout.dense_only:
         qm, km, vm = vsa_kernels.block_means(q, k, v, layout.block_sizes)

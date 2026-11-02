@@ -56,8 +56,7 @@ def _validate(q, k, v, gate):
             raise ValueError("Q/K/V/gate must be contiguous; materialize projections before calling attention")
 
 
-def vsa_attention(q, k, v, gate, vsa_layout, *, scale=None, ring_cp_group=None,
-                  ring_cp_batch_p2p=None, ring_cp_bwd_bucket_size="auto"):
+def vsa_attention(q, k, v, gate, vsa_layout, *, scale=None):
     """[T,H,D] Q/K/V/gate -> O in the caller's original row order.
 
     Pass the current batch's prepared layout on every call. Q's head count must
@@ -70,21 +69,15 @@ def vsa_attention(q, k, v, gate, vsa_layout, *, scale=None, ring_cp_group=None,
     padding. Output uses the same order; Q/K/V/gate must share that order.
     The caller reorders tokens and positions once before the entire VSA stack.
 
-    An explicit ring_cp_group requires layout.ring metadata with compact local
-    block inputs, including size-one groups. Pass group-local rank/size to
-    build_vsa_layout with input_order="block"; the caller owns whole-block
-    sharding and any external Ulysses transformations. ring_cp_batch_p2p=None chooses batched
-    P2P for device-bound groups and individual P2P for lazy groups.
-    ring_cp_bwd_bucket_size="auto" selects the measured SM100/H2/local-128-
-    block/single-sample setting; None uses the backend default, and a positive
-    integer overrides it.
+    layout.ring selects Ring execution using the group and transport options
+    bound by build_vsa_layout, including size-one groups. The caller owns the
+    group's lifetime, whole-block sharding and any external Ulysses transforms.
+    Ordinary and Ring attention use the same call signature.
     """
     layout = vsa_layout
-    is_ring = ring_cp_group is not None
     if not isinstance(layout, VSALayout):
         raise ValueError("Expected a VSALayout from build_vsa_layout")
-    if is_ring != (layout.ring is not None):
-        raise ValueError("Ring layout metadata requires an explicit ring_cp_group, and vice versa")
+    is_ring = layout.ring is not None
     _validate(q, k, v, gate)
     if q.shape[0] != layout.tokens:
         raise ValueError("Expected [layout.tokens, heads, head_dim] inputs")
@@ -105,8 +98,7 @@ def vsa_attention(q, k, v, gate, vsa_layout, *, scale=None, ring_cp_group=None,
     if is_ring:
         scale = q.shape[-1]**-0.5 if scale is None else scale
         fine, coarse = vsa_core.ring_attention_slots(
-            q_slots, k_slots, v_slots, layout, ring_cp_group, scale=scale,
-            batch_p2p=ring_cp_batch_p2p, bwd_bucket_size=ring_cp_bwd_bucket_size)
+            q_slots, k_slots, v_slots, layout, scale=scale)
     else:
         fine, coarse = vsa_core.attention_slots(q_slots, k_slots, v_slots, layout, scale=scale)
     out = fine if layout.slots_are_input else vsa_kernels.from_slots(

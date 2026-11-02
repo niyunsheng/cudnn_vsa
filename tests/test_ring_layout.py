@@ -1,8 +1,9 @@
 """THD ownership and global routing contracts, without distributed execution."""
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 import torch
+import torch.distributed as dist
 
 from vsa_core import route
 from vsa_layout import VSALayout, Segment, build_vsa_layout
@@ -21,11 +22,11 @@ PACK = (
 
 @pytest.mark.parametrize("size", [1, 2, 8])
 @pytest.mark.parametrize("dense_query_full", [False, True])
-def test_thd_partition(size, dense_query_full):
+def test_thd_partition(size, dense_query_full, metadata_group):
     full = build_vsa_layout(PACK, head_num=2, dense_query_full=dense_query_full)
     owners, seen = [], []
     for rank in range(size):
-        local = build_vsa_layout(PACK, head_num=2, ring_size=size, ring_rank=rank,
+        local = build_vsa_layout(PACK, head_num=2, ring_cp_group=metadata_group(size, rank),
                                      dense_query_full=dense_query_full, input_order="block")
         ids = local.ring.block_ids[local.ring.block_ids >= 0]
         assert ids.tolist() == list(range(rank, full.blocks, size))
@@ -55,21 +56,21 @@ def test_thd_partition(size, dense_query_full):
 
 @pytest.mark.parametrize("rank", range(4))
 @pytest.mark.parametrize("dense", [False, True])
-def test_ring_rejects_fewer_global_blocks_than_ranks(rank, dense):
+def test_ring_rejects_fewer_global_blocks_than_ranks(rank, dense, metadata_group):
     # Every rank rejects, including those that would own a valid block.
     samples = [[Segment("video", (1, 1, 1), None if dense else .5)] for _ in range(3)]
     with pytest.raises(ValueError, match="global_blocks=3, ring_size=4"):
         build_vsa_layout(samples, head_num=2, input_order="block",
-                         ring_size=4, ring_rank=rank, device="cuda")
+                         ring_cp_group=metadata_group(4, rank), device="cuda")
 
 
 @pytest.mark.parametrize("blocks", [4, 5, 7])
-def test_ring_accepts_small_samples_and_uneven_block_counts(blocks):
+def test_ring_accepts_small_samples_and_uneven_block_counts(blocks, metadata_group):
     # Each sample has one block (< CP), but the complete pack has enough.
     samples = [[Segment("video", (1, 1, 1), .5)] for _ in range(blocks)]
     for rank in range(4):
         layout = build_vsa_layout(samples, head_num=2, input_order="block",
-                                  ring_size=4, ring_rank=rank)
+                                  ring_cp_group=metadata_group(4, rank))
         owned = list(range(rank, blocks, 4))
         assert layout.tokens == len(owned) > 0
         assert layout.ring.block_ids[layout.ring.block_ids >= 0].tolist() == owned
@@ -77,16 +78,16 @@ def test_ring_accepts_small_samples_and_uneven_block_counts(blocks):
 
 
 @pytest.mark.parametrize("ring", [False, True])
-def test_attention_rejects_empty_tokens_before_cuda_or_communication(ring):
-    kwargs = dict(input_order="block", ring_size=1, ring_rank=0) if ring else {}
+def test_attention_rejects_empty_tokens_before_cuda_or_communication(ring, metadata_group):
+    kwargs = dict(input_order="block", ring_cp_group=metadata_group(1, 0)) if ring else {}
     layout = build_vsa_layout([[Segment("video", (1, 1, 1))]], head_num=2, **kwargs)
     x = torch.empty(0, 2, 128)
     with pytest.raises(ValueError, match="positive dimensions"):
-        vsa_attention(x, x, x, x, layout, ring_cp_group=object() if ring else None)
+        vsa_attention(x, x, x, x, layout)
 
 
 @pytest.mark.parametrize("dense_query_full", [False, True])
-def test_global_topk_and_peer_lists(dense_query_full):
+def test_global_topk_and_peer_lists(dense_query_full, metadata_group):
     torch.manual_seed(38)
     heads, size = 2, 8
     full = build_vsa_layout(PACK, head_num=heads, dense_query_full=dense_query_full)
@@ -94,7 +95,7 @@ def test_global_topk_and_peer_lists(dense_query_full):
     selected = route(q[full.coarse_blocks], k[full.coarse_blocks], full.groups,
                      full.routing_indices, dense_query_full=dense_query_full)
     for rank in range(size):
-        local = build_vsa_layout(PACK, head_num=heads, ring_size=size, ring_rank=rank,
+        local = build_vsa_layout(PACK, head_num=heads, ring_cp_group=metadata_group(size, rank),
                                      dense_query_full=dense_query_full, input_order="block")
         ids = local.ring.block_ids[local.ring.block_ids >= 0]
         query = torch.zeros(local.blocks, heads, 128)
@@ -116,10 +117,10 @@ def test_global_topk_and_peer_lists(dense_query_full):
                 assert sorted(gathered) == sorted(actual[0, head, row, :n].tolist())
 
 
-def test_64k_h2_ring8():
+def test_64k_h2_ring8(metadata_group):
     samples = [[Segment("video", (16, 60, 64), .9), Segment("text", 4096)]]
     for rank in range(8):
-        local = build_vsa_layout(samples, head_num=2, ring_size=8, ring_rank=rank, input_order="block")
+        local = build_vsa_layout(samples, head_num=2, ring_cp_group=metadata_group(8, rank), input_order="block")
         assert local.ring.global_tokens == 65536
         assert local.tokens == 8192
         assert local.blocks == 128
@@ -129,20 +130,20 @@ def test_64k_h2_ring8():
         assert local.slots_are_input
 
 
-@pytest.mark.parametrize("size,rank", [(0, 0), (8, 8), (8, -1), (True, 0), (1.5, 0), (8, 0.5)])
-def test_invalid_group_shape(size, rank):
-    with pytest.raises(ValueError):
-        build_vsa_layout(PACK, head_num=2, ring_size=size, ring_rank=rank, input_order="block")
+@pytest.mark.parametrize("group", [object(), False, 1, dist.GroupMember.NON_GROUP_MEMBER])
+def test_invalid_or_nonmember_group(group):
+    with pytest.raises(ValueError, match="ProcessGroup containing this rank"):
+        build_vsa_layout(PACK, head_num=2, ring_cp_group=group, input_order="block")
 
 
 @pytest.mark.parametrize("order", ["raster", "slots", "", None, 1])
-def test_invalid_input_order(order):
+def test_invalid_input_order(order, metadata_group):
     with pytest.raises(ValueError, match="input_order"):
-        build_vsa_layout(PACK, head_num=2, ring_size=8, ring_rank=0, input_order=order)
+        build_vsa_layout(PACK, head_num=2, ring_cp_group=metadata_group(8, 0), input_order=order)
 
 
-def test_size_one_ring_is_still_compact_block_order():
-    ring = build_vsa_layout(PACK, head_num=2, ring_size=1, ring_rank=0, input_order="block")
+def test_size_one_ring_is_still_compact_block_order(metadata_group):
+    ring = build_vsa_layout(PACK, head_num=2, ring_cp_group=metadata_group(1, 0), input_order="block")
     single = build_vsa_layout(PACK, head_num=2, input_order="block")
     assert type(ring) is type(single) is VSALayout
     assert ring.ring is not None and single.ring is None
@@ -153,34 +154,28 @@ def test_size_one_ring_is_still_compact_block_order():
     assert single.coarse_cu_q is single.coarse_cu_kv
     assert single.coarse_blocks is single.coarse_kv_blocks
     with pytest.raises(ValueError, match='input_order must be "block"'):
-        build_vsa_layout(PACK, head_num=2, ring_size=1, ring_rank=0, input_order="raster")
+        build_vsa_layout(PACK, head_num=2, ring_cp_group=metadata_group(1, 0), input_order="raster")
     with pytest.raises(ValueError, match='input_order must be "block"'):
         replace(ring, input_order="raster")
 
 
 @pytest.mark.parametrize("convert", [to_block_order, to_raster_order])
 @pytest.mark.parametrize("size", [1, 2])
-def test_boundary_reorder_requires_full_layout(convert, size):
-    shard = build_vsa_layout(PACK, head_num=2, ring_size=size, ring_rank=0, input_order="block")
+def test_boundary_reorder_requires_full_layout(convert, size, metadata_group):
+    shard = build_vsa_layout(PACK, head_num=2, ring_cp_group=metadata_group(size, 0), input_order="block")
     with pytest.raises(ValueError, match="full VSALayout"):
         convert(torch.empty(shard.tokens, 32), vsa_layout=shard)
 
 
-@pytest.mark.parametrize("kwargs", [{"ring_size": 2}, {"ring_rank": 0}])
-def test_ring_parameters_must_be_paired(kwargs):
-    with pytest.raises(ValueError, match="provided together"):
-        build_vsa_layout(PACK, head_num=2, input_order="block", **kwargs)
-
-
 @pytest.mark.parametrize("size", [1, 2])
-def test_ring_requires_explicit_block_order(size):
+def test_ring_requires_explicit_block_order(size, metadata_group):
     with pytest.raises(ValueError, match='input_order must be "block"'):
-        build_vsa_layout(PACK, head_num=2, ring_size=size, ring_rank=0)
+        build_vsa_layout(PACK, head_num=2, ring_cp_group=metadata_group(size, 0))
 
 
 def test_omitted_ring_parameters_preserve_full_layout():
     raster = build_vsa_layout(PACK, head_num=2)
-    block = build_vsa_layout(PACK, head_num=2, input_order="block", ring_size=None, ring_rank=None)
+    block = build_vsa_layout(PACK, head_num=2, input_order="block", ring_cp_group=None)
     assert isinstance(raster, VSALayout) and raster.input_order == "raster"
     assert isinstance(block, VSALayout) and block.input_order == "block"
     assert raster.ring is block.ring is None
@@ -188,28 +183,80 @@ def test_omitted_ring_parameters_preserve_full_layout():
     assert raster.input_rows.tolist() == list(range(raster.tokens))
 
 
-@pytest.mark.parametrize("size", [1, 2])
-@pytest.mark.parametrize("sharded", [False, True])
-def test_attention_rejects_layout_group_mismatch(size, sharded):
-    kwargs = dict(ring_size=size, ring_rank=0) if sharded else {}
-    layout = build_vsa_layout(PACK, head_num=2, input_order="block", **kwargs)
-    x = torch.empty(layout.tokens, 2, 128)
-    with pytest.raises(ValueError, match="explicit ring_cp_group"):
-        vsa_attention(x, x, x, x, layout, ring_cp_group=None if sharded else object())
+def test_microbatch_layouts_borrow_one_group(metadata_group, monkeypatch):
+    group = metadata_group(4, 1)
+    def unexpected(*args, **kwargs):
+        pytest.fail("Layout construction must not create or destroy process groups")
+    monkeypatch.setattr(dist, "new_group", unexpected)
+    monkeypatch.setattr(dist, "destroy_process_group", unexpected)
+    first = build_vsa_layout(PACK, head_num=2, input_order="block", ring_cp_group=group)
+    second = build_vsa_layout([[Segment("video", (4, 8, 8), .5)]], head_num=2,
+                              input_order="block", ring_cp_group=group)
+    assert first.tokens != second.tokens
+    assert first.ring.group is second.ring.group is group
+    assert (first.ring.size, first.ring.rank) == (4, 1)
+    with pytest.raises(FrozenInstanceError):
+        first.ring.group = metadata_group(4, 1)
+    del first
+    assert second.ring.group is group
+    assert group.size() == 4 and group.rank() == 1
 
 
-@pytest.mark.parametrize("rank,size", [(1, 2), (0, 4)])
-def test_ring_metadata_must_match_process_group(monkeypatch, rank, size):
+def test_same_shape_groups_keep_distinct_runtimes(metadata_group, monkeypatch):
     import vsa_core as core
 
-    layout = build_vsa_layout(PACK, head_num=2, input_order="block", ring_size=2, ring_rank=0)
-    monkeypatch.setattr(core.dist, "get_world_size", lambda group: size)
-    monkeypatch.setattr(core.dist, "get_rank", lambda group: rank)
-    with pytest.raises(ValueError, match="rank/size differ"):
-        core._ring_runtime(layout, object(), torch.device("cpu"), False, None)
+    groups = [metadata_group(2, 0), metadata_group(2, 0)]
+    peers = {groups[0]: [0, 2], groups[1]: [1, 3]}
+    monkeypatch.setattr(dist, "get_process_group_ranks", lambda group: peers[group])
+    monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: object())
+    layouts = [build_vsa_layout(PACK, head_num=2, input_order="block", ring_cp_group=group,
+                                ring_cp_batch_p2p=False, ring_cp_bwd_bucket_size=None)
+               for group in groups]
+    runtimes = [core._ring_runtime(layout, torch.device("cpu")) for layout in layouts]
+    for layout, runtime, group in zip(layouts, runtimes, groups):
+        assert runtime.group is layout.ring.group is group
+        assert runtime.peers == tuple(peers[group])
+        assert core._ring_runtime(layout, torch.device("cpu")) is runtime
+    assert runtimes[0] is not runtimes[1]
 
 
-def test_coarse_metadata_preserves_sample_isolation_and_global_collectives():
+def test_full_layout_needs_no_distributed_state(monkeypatch):
+    def unexpected(*args, **kwargs):
+        pytest.fail("Full layouts must not read distributed state")
+    for name in ("get_world_size", "get_rank", "get_process_group_ranks", "new_group"):
+        monkeypatch.setattr(dist, name, unexpected)
+    assert build_vsa_layout(PACK, head_num=2).ring is None
+
+
+@pytest.mark.parametrize("batch,bucket", [(None, "auto"), (False, None), (True, 64)])
+def test_transport_options_are_bound_to_layout(batch, bucket, metadata_group):
+    layout = build_vsa_layout(PACK, head_num=2, input_order="block", ring_cp_group=metadata_group(),
+                              ring_cp_batch_p2p=batch, ring_cp_bwd_bucket_size=bucket)
+    assert layout.ring.batch_p2p is batch
+    assert layout.ring.bwd_bucket_size == bucket
+
+
+@pytest.mark.parametrize("options,match", [
+    ({"ring_cp_batch_p2p": 1}, "ring_cp_batch_p2p"),
+    ({"ring_cp_batch_p2p": "False"}, "ring_cp_batch_p2p"),
+    *[({"ring_cp_bwd_bucket_size": value}, "ring_cp_bwd_bucket_size")
+      for value in [0, -1, True, False, 1.5, "backend"]],
+])
+def test_invalid_transport_options_fail_at_construction(options, match, metadata_group):
+    with pytest.raises(ValueError, match=match):
+        build_vsa_layout(PACK, head_num=2, input_order="block", ring_cp_group=metadata_group(), **options)
+
+
+@pytest.mark.parametrize("options", [
+    {"ring_cp_batch_p2p": False}, {"ring_cp_batch_p2p": True},
+    {"ring_cp_bwd_bucket_size": None}, {"ring_cp_bwd_bucket_size": 64},
+])
+def test_transport_options_require_a_bound_group(options):
+    with pytest.raises(ValueError, match="require ring_cp_group"):
+        build_vsa_layout(PACK, head_num=2, **options)
+
+
+def test_coarse_metadata_preserves_sample_isolation_and_global_collectives(metadata_group):
     samples = [
         [Segment("video", (4, 4, 8), .5)],  # Global blocks 0, 1: coarse.
         [Segment("video", (1, 1, 128))],   # Global blocks 2, 3: fine only.
@@ -217,7 +264,7 @@ def test_coarse_metadata_preserves_sample_isolation_and_global_collectives():
     ]
     for rank in range(4):
         layout = build_vsa_layout(samples, head_num=2, input_order="block",
-                                  ring_size=4, ring_rank=rank)
+                                  ring_cp_group=metadata_group(4, rank))
         # All ranks must join pooled collectives, even ranks 2/3 with no coarse Q.
         assert not layout.dense_only
         assert layout.sample_lengths == (128, 128, 128)

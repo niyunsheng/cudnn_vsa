@@ -1,9 +1,11 @@
 """Parity of the vendored bsa_cute kernels against the installed cudnn-frontend BSA.
 
-Both packages compile the same CuTe DSL source at this revision. Output, LSE,
-dK and dV are produced once per tile and must match bitwise. dQ accumulates
-across KV blocks with TMA reduce-add in scheduling order, so it is compared
-with the suite's similarity threshold instead.
+Both packages compile the same CuTe DSL source at this revision. Output and
+LSE are produced once per query tile and must match bitwise. The backward
+accumulates dQ across KV blocks and dK/dV across bucketed query groups with
+reduce-add in scheduling order, so GPU job 8563118 showed dK differing
+bitwise between two compilations of the same source; the gradients are
+therefore compared with the suite's 0.99999 similarity threshold.
 """
 import importlib
 
@@ -44,9 +46,12 @@ def test_local_bsa_matches_installed_package(heads, q_blocks, kv_blocks, keys):
     sizes = torch.randint(1, 65, (kv_blocks,), device="cuda", dtype=torch.int32)
     reference = _run(installed, q, k, v, index, counts, sizes, grad)
     candidate = _run(local, q, k, v, index, counts, sizes, grad)
-    for name in ("out", "lse", "dk", "dv"):
+    for name in ("out", "lse"):
         assert torch.equal(candidate[name], reference[name]), name
     rows = counts.sum(1).squeeze(0) > 0
-    metrics = similarity(candidate["dq"].view(q_blocks, 64, heads, 128)[rows],
-                         reference["dq"].view(q_blocks, 64, heads, 128)[rows])
-    assert min(metrics["cosine"], metrics["tensor_similarity"]) >= 1 - 1e-5, metrics
+    for name in ("dq", "dk", "dv"):
+        a, b = candidate[name], reference[name]
+        if name == "dq":
+            a, b = (x.view(q_blocks, 64, heads, 128)[rows] for x in (a, b))
+        metrics = similarity(a, b)
+        assert min(metrics["cosine"], metrics["tensor_similarity"]) >= 1 - 1e-5, (name, metrics)

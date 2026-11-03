@@ -95,11 +95,41 @@ def test_routing_templates_are_ready_at_construction_and_remain_immutable(head_n
         torch.testing.assert_close(template, template[:, :1].expand_as(template), atol=0, rtol=0)
     saved = [x.clone() for x in metadata]
     q, k = [torch.randn(layout.coarse_blocks.numel(), head_num, 8) for _ in range(2)]
-    index = core.route(q, k, layout.groups, layout.routing_indices,
-        dense_query_full=layout.dense_query_full)
+    index = core.route(q, k, layout)
     assert index.data_ptr() != metadata[0].data_ptr()
     for actual, expected in zip(metadata, saved):
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("ring", [False, True])
+def test_shared_router_skips_exempt_dense_queries(ring, metadata_group, monkeypatch):
+    options = dict(input_order="block", ring_cp_group=metadata_group()) if ring else {}
+    layout = build_vsa_layout(SAMPLES, head_num=2, dense_query_full=True, **options)
+    q = torch.randn(layout.blocks if ring else layout.coarse_blocks.numel(), 2, 8)
+    k = torch.randn_like(q)
+    routed_rows = []
+    original = core._route_group
+    def record(query, *args, **kwargs):
+        routed_rows.append(query.shape[0])
+        return original(query, *args, **kwargs)
+    monkeypatch.setattr(core, "_route_group", record)
+    index = core.route(q, k, layout)
+    assert sum(routed_rows) == sum(g.blocks - g.dense_blocks_num for g in layout.groups
+                                   if g.kept < g.blocks)
+    for g in layout.groups:
+        dense = slice(g.start, g.start + g.dense_blocks_num)
+        assert torch.equal(index[:, :, dense], layout.routing_indices[:, :, dense])
+
+
+@pytest.mark.parametrize("ring", [False, True])
+def test_no_topk_reuses_routing_template(ring, metadata_group, monkeypatch):
+    options = dict(input_order="block", ring_cp_group=metadata_group()) if ring else {}
+    layout = build_vsa_layout([[Segment("video", (4, 4, 8), 0)]], head_num=2, **options)
+    def unexpected(*args, **kwargs):
+        pytest.fail("Fully retained regions must not run top-k")
+    monkeypatch.setattr(core, "_route_group", unexpected)
+    means = torch.randn(layout.blocks, 2, 8)
+    assert core.route(means, means, layout) is layout.routing_indices
 
 
 def test_noncontiguous_and_mismatched_inputs_fail_before_backend():
@@ -165,8 +195,7 @@ def test_exempt_routing_and_all_modality_coarse():
     means = [pool(t, layout) for t in slots]
     scores = means[0] @ means[1].transpose(-2, -1) / 8**0.5
     q_route, k_route, _, _, _ = vsa_kernels.routing_and_coarse_means(*slots, layout.block_sizes, layout.coarse_blocks)
-    indices = route(q_route, k_route, layout.groups, layout.routing_indices,
-        dense_query_full=layout.dense_query_full)
+    indices = route(q_route, k_route, layout)
     mask = routing_mask(indices, layout.routing_counts)[0]
     assert mask[:, :2].all() and mask[:, :, :2].all()
     assert (mask[:, 2:, 2:].sum(-1) == 1).all()
@@ -254,8 +283,7 @@ def test_zero_sparsity_does_not_override_other_regions(dense_query_full):
     assert layout.groups[0].video_spans == ((1, 9, 1), (9, 11, 2))
     assert not layout.dense_only  # Numeric zero retains VSA tiling and coarse.
     q, k = [torch.randn(layout.blocks, 2, 8) for _ in range(2)]
-    index = route(q, k, layout.groups, layout.routing_indices,
-        dense_query_full=dense_query_full)
+    index = route(q, k, layout)
     counts = layout.routing_counts
     mask = routing_mask(index, counts)[0]
     assert mask[:, :, 0].all() and mask[:, :, 9:11].all()
@@ -273,8 +301,7 @@ def test_segment_sparsity_controls_kv_columns_including_cross_video_attention(de
     ], head_num=2, dense_query_full=dense_query_full)
     torch.manual_seed(310)
     q, k = [torch.randn(layout.coarse_blocks.numel(), 2, 8) for _ in range(2)]
-    index = route(q, k, layout.groups, layout.routing_indices,
-        dense_query_full=dense_query_full)
+    index = route(q, k, layout)
     counts = layout.routing_counts
     mask = routing_mask(index, counts)[0]
     assert index.shape[-1] == (10 if dense_query_full else 6)
@@ -466,8 +493,7 @@ def test_packed_calls_and_metadata_exclude_whole_dense_samples(monkeypatch):
         torch.testing.assert_close(coarse, routing.to(torch.bfloat16), atol=0, rtol=0)
     for coarse in (q_coarse, k_coarse, v_coarse):
         assert coarse.dtype == torch.bfloat16 and coarse.requires_grad
-    index = core.route(q_route, k_route, layout.groups, layout.routing_indices,
-        dense_query_full=layout.dense_query_full)
+    index = core.route(q_route, k_route, layout)
     mask = routing_mask(index, layout.routing_counts)[0]
     assert index.shape[-1] == 4 < layout.blocks  # Kept KV capacity, including dense KV.
     for i, g in enumerate(layout.groups):
@@ -513,14 +539,12 @@ def test_fp32_routing_survives_autocast_and_templates_are_immutable():
     q_route, k_route, _, _, _ = vsa_kernels.routing_and_coarse_means(*slots, layout.block_sizes, layout.coarse_blocks)
     template = layout.routing_indices
     saved = template.clone()
-    expected = core.route(q_route, k_route, layout.groups, template,
-        dense_query_full=layout.dense_query_full)
+    expected = core.route(q_route, k_route, layout)
     original = torch.backends.cuda.matmul.allow_tf32
     try:
         torch.backends.cuda.matmul.allow_tf32 = True
         with torch.autocast("cpu", dtype=torch.bfloat16):
-            actual = core.route(q_route, k_route, layout.groups, template,
-                dense_query_full=layout.dense_query_full)
+            actual = core.route(q_route, k_route, layout)
         assert torch.backends.cuda.matmul.allow_tf32
     finally:
         torch.backends.cuda.matmul.allow_tf32 = original

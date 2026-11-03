@@ -83,8 +83,7 @@ class FastVideoReference:
         )
         q_route, k_route, _, _, _ = vsa_kernels.routing_and_coarse_means(
             q_slots, k_slots, v_slots, layout.block_sizes, layout.coarse_blocks)
-        indices = route(q_route, k_route, layout.groups, layout.routing_indices,
-            dense_query_full=layout.dense_query_full)
+        indices = route(q_route, k_route, layout)
         actual = routing_mask(indices, layout.routing_counts)
         tq, tk = self.tiled((q, k))
         means = [self.h3._pool_tiles(x, self.meta.variable_block_sizes, 64) for x in (tq, tk)]

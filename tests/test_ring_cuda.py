@@ -45,8 +45,9 @@ def test_compiled_peer_metadata_alignment(heads, blocks, keys):
     index = torch.rand(1, heads, blocks, 8 * blocks, device="cuda").argsort(-1)[..., :keys]
     index = index.sort(-1).values.to(torch.int32).contiguous()
     counts = torch.randint(0, keys + 1, (1, heads, blocks), device="cuda", dtype=torch.int32)
-    actual = partition_indices(index, counts, 8, blocks)
-    expected = _partition_indices_reference(index, counts, 8, blocks)
+    mapping = _ownership_map(8, blocks)
+    actual = partition_indices(index, counts, mapping, 8, blocks)
+    expected = _partition_indices_reference(index, counts, mapping, 8, blocks)
     for a, b in zip(actual, expected):
         torch.testing.assert_close(a, b)
         assert all(peer.data_ptr() % 16 == 0 and peer.is_contiguous() for peer in a)
@@ -61,8 +62,19 @@ def test_long_peer_metadata_with_mixed_counts(ring_size, peer_blocks):
                           device="cuda", dtype=torch.int32).view(1, 1, -1)
     index = torch.arange(keys, device="cuda", dtype=torch.int32)
     index = index.expand(1, 1, counts.numel(), keys).contiguous()
-    actual = partition_indices(index, counts, ring_size, peer_blocks)
-    expected = _partition_indices_reference(index, counts, ring_size, peer_blocks)
+    mapping = _ownership_map(ring_size, peer_blocks)
+    actual = partition_indices(index, counts, mapping, ring_size, peer_blocks)
+    expected = _partition_indices_reference(index, counts, mapping, ring_size, peer_blocks)
     for a, b in zip(actual, expected):
         torch.testing.assert_close(a, b)
         assert all(peer.data_ptr() % 16 == 0 and peer.is_contiguous() for peer in a)
+
+
+def _ownership_map(ring_size, peer_blocks):
+    # Arbitrary noncyclic ownership, with increasing global IDs on each peer.
+    owner = torch.arange(ring_size, device="cuda").repeat_interleave(peer_blocks)
+    owner = owner[torch.randperm(owner.numel(), device="cuda")]
+    mapping = torch.empty_like(owner)
+    for peer in range(ring_size):
+        mapping[owner == peer] = peer * peer_blocks + torch.arange(peer_blocks, device="cuda")
+    return mapping

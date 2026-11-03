@@ -1,6 +1,8 @@
 """Static sample geometry, token maps and BSA routing templates for VSA."""
 import math
+from bisect import bisect_left
 from dataclasses import dataclass, field
+from itertools import accumulate
 
 import torch
 import torch.distributed as dist
@@ -79,7 +81,8 @@ class _RingMetadata:
     bwd_bucket_size: str | int | None
     global_blocks: int
     global_tokens: int
-    local_groups: tuple[tuple[SampleBlocks, int, int], ...]
+    # Sample, local query begin/end, local dense-query end.
+    local_groups: tuple[tuple[SampleBlocks, int, int, int], ...]
     block_ids: torch.Tensor
     peer_block_sizes: torch.Tensor
     global_to_gather: torch.Tensor
@@ -120,6 +123,8 @@ class VSALayout:
     ring: _RingMetadata | None = None
     routing_indices: torch.Tensor = field(init=False, repr=False)
     routing_counts: torch.Tensor = field(init=False, repr=False)
+    # Sample, routing-row begin/end, offset into pooled Q/K means.
+    routing_groups: tuple = field(init=False, repr=False)
     coarse_rows: torch.Tensor = field(init=False, repr=False)
     dense_only: bool = field(init=False)
 
@@ -140,17 +145,14 @@ class VSALayout:
         index = torch.zeros((1, self.head_num, self.blocks, capacity), device=device, dtype=torch.int32)
         counts = torch.zeros((1, self.head_num, self.blocks), device=device, dtype=torch.int32)
         local_groups = (self.ring.local_groups if self.ring is not None else
-                        ((g, g.start, g.end) for g in self.groups))
-        for g, begin, end in local_groups:
+                        tuple((g, g.start, g.end, g.start + g.dense_blocks_num)
+                              for g in self.groups))
+        for g, begin, end, dense_end in local_groups:
             ids = torch.arange(g.start, g.end, device=device, dtype=torch.int32)
             if g.kept == g.blocks:
                 index[:, :, begin:end, :g.blocks] = ids
                 counts[:, :, begin:end] = g.blocks
                 continue
-            dense_end = g.start + g.dense_blocks_num
-            if self.ring is not None:
-                dense_end = min(end, max(begin, (
-                    dense_end - self.ring.rank + self.ring.size - 1) // self.ring.size))
             routed_start = dense_end if self.dense_query_full else begin
             if g.dense_blocks_num:
                 if self.dense_query_full:
@@ -164,6 +166,15 @@ class VSALayout:
                     index[:, :, routed_start:end, cursor:cursor+k] = ids[start-g.start:span_end-g.start]
                 cursor += k
         self.routing_indices, self.routing_counts = index, counts
+        routing_groups, pooled_offset = [], 0
+        for g, begin, end, dense_end in local_groups:
+            offset = 0 if self.ring is not None else pooled_offset - g.start
+            if not g.dense_only:
+                pooled_offset += g.blocks
+            begin = dense_end if self.dense_query_full else begin
+            if g.kept < g.blocks and begin < end:
+                routing_groups.append((g, begin, end, offset))
+        self.routing_groups = tuple(routing_groups)
         # Input token rows per local coarse block; -1 marks padding for the merge adjoint.
         self.coarse_rows = self.slot_row.view(self.blocks, BLOCK)[self.coarse_blocks]
         # A rank with no local coarse queries must still join pooled collectives
@@ -197,6 +208,51 @@ class VSALayout:
         return tuple(sum(r.stop-r.start for r in rows) for rows in self.sample_slices)
 
 
+def _plan_ring_blocks(sizes, groups, ring_size):
+    """Give each sample at most one contiguous block interval per rank.
+
+    Visit ranks in cumulative valid-token load order (block count/rank break
+    ties). Choose the nearest prefix-balanced token boundary that fits the
+    remaining ranks' capacities. The hard ceil(total_blocks/R) cap preserves
+    communication size. Reserve data for ranks that have not received a block.
+    All choices use static host integers and are identical on every rank.
+    """
+    total = len(sizes)
+    capacity = (total + ring_size - 1) // ring_size
+    prefix = [0, *accumulate(sizes)]
+    owned = [[] for _ in range(ring_size)]
+    tokens = [0] * ring_size
+    empty = ring_size
+    for g in groups:
+        order = sorted(range(ring_size), key=lambda r: (tokens[r], len(owned[r]), r))
+        cursor = g.start
+        remaining_capacity = sum(capacity - len(owned[r]) for r in order)
+        for rank in order:
+            if cursor == g.end:
+                break
+            remaining_capacity -= capacity - len(owned[rank])
+            lower = max(0, g.end - cursor - remaining_capacity)
+            first = not owned[rank]
+            upper = min(g.end - cursor, capacity - len(owned[rank]),
+                        total - cursor - (empty - int(first)))
+            # Give the next interval to the least-loaded eligible rank, even
+            # when its first block exceeds the ideal fractional token share.
+            if upper:
+                lower = max(lower, 1)
+            # Compare scaled integer token totals to avoid rounding-dependent cuts.
+            target = prefix[g.end] + ring_size * (prefix[cursor] - tokens[rank])
+            cut = bisect_left(prefix, (target + ring_size - 1) // ring_size,
+                              cursor + lower, cursor + upper + 1)
+            choices = {max(cursor + lower, min(cursor + upper, x)) for x in (cut-1, cut)}
+            end = min(choices, key=lambda x: (abs(ring_size * prefix[x] - target), -x))
+            if end > cursor:
+                owned[rank].extend(range(cursor, end))
+                tokens[rank] += prefix[end] - prefix[cursor]
+                empty -= int(first)
+                cursor = end
+    return owned
+
+
 def _finalize_layout(samples, global_rows, groups, sample_slices, *, head_num,
                      dense_query_full, device, input_order, ring_size, ring_rank,
                      ring_cp_group, ring_cp_batch_p2p, ring_cp_bwd_bucket_size) -> VSALayout:
@@ -210,22 +266,27 @@ def _finalize_layout(samples, global_rows, groups, sample_slices, *, head_num,
 
     ring = None
     block_rows = global_rows
-    local_groups = [(g, g.start, g.end) for g in groups]
+    local_groups = [(g, g.start, g.end, g.start + g.dense_blocks_num) for g in groups]
     if ring_size is not None:
         total = len(global_rows)
         capacity = (total + ring_size - 1) // ring_size
-        owned = list(range(ring_rank, total, ring_size))
+        sizes = [len(rows) for rows in global_rows]
+        peer_ids = _plan_ring_blocks(sizes, groups, ring_size)
+        owned = peer_ids[ring_rank]
         block_rows = [global_rows[bid] for bid in owned]
         block_rows += [[] for _ in range(capacity - len(owned))]
         local_groups = []
         for g in groups:
-            begin = max(0, (g.start - ring_rank + ring_size - 1) // ring_size)
-            end = max(0, (g.end - ring_rank + ring_size - 1) // ring_size)
+            begin, end = bisect_left(owned, g.start), bisect_left(owned, g.end)
             if begin < end:
-                local_groups.append((g, begin, end))
-        sizes = [len(rows) for rows in global_rows]
-        peer_sizes = [[sizes[rank + i * ring_size] if rank + i * ring_size < total else 0
-                       for i in range(capacity)] for rank in range(ring_size)]
+                dense_end = bisect_left(owned, g.start + g.dense_blocks_num, begin, end)
+                local_groups.append((g, begin, end, dense_end))
+        peer_sizes = [[sizes[bid] for bid in ids] + [0] * (capacity - len(ids))
+                      for ids in peer_ids]
+        global_to_gather = [0] * total
+        for rank, ids in enumerate(peer_ids):
+            for local, bid in enumerate(ids):
+                global_to_gather[bid] = rank * capacity + local
         ring = _RingMetadata(
             group=ring_cp_group, batch_p2p=ring_cp_batch_p2p,
             bwd_bucket_size=ring_cp_bwd_bucket_size,
@@ -235,8 +296,7 @@ def _finalize_layout(samples, global_rows, groups, sample_slices, *, head_num,
             # Each peer slice needs a 16-byte-aligned base for the CuTe frontend.
             peer_block_sizes=tensor([row + [0] * (-capacity % 4) for row in peer_sizes],
                                     torch.int32)[:, :capacity],
-            global_to_gather=tensor([(bid % ring_size) * capacity + bid // ring_size
-                                     for bid in range(total)]))
+            global_to_gather=tensor(global_to_gather))
     token_count = sum(map(len, block_rows))
     input_rows = (list(range(token_count)) if input_order == "raster" else
                   [row for rows in block_rows for row in rows])
@@ -253,7 +313,7 @@ def _finalize_layout(samples, global_rows, groups, sample_slices, *, head_num,
         if row >= 0:
             inverse[row] = slot
     coarse_q, coarse_kv, cu_q, cu_kv = [], [], [0], [0]
-    for g, begin, end in local_groups:
+    for g, begin, end, _ in local_groups:
         if not g.dense_only:
             coarse_q.extend(range(begin, end))
             coarse_kv.extend(range(g.start, g.end))
@@ -356,7 +416,10 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
     Rank/size come from that group; layout only borrows it and never creates or
     destroys groups. Different micro-batch layouts can share the same group.
     Ring shards require input_order="block" and contain only valid owned-block
-    rows without padding.
+    rows without padding. Each sample contributes at most one contiguous block
+    interval per rank. Ranks with less cumulative valid-token load get earlier
+    intervals; cuts target balanced token totals within ceil(global_blocks/R)
+    blocks per rank. Ownership is explicit in ring.global_to_gather.
     The global block count must be at least ring_size, so every rank owns data.
     Individual samples may have fewer blocks; no divisibility is required.
     Reorder/distribute whole blocks at the dataset/model boundary. All attention

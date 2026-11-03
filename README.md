@@ -195,16 +195,27 @@ without padding. Keep Q/K/V/gate, position coordinates and gradients in that
 same order; outputs preserve it. Reuse the layout across layers.
 
 Plan blocks in the order described in **Input order**, numbering them across
-the packed samples. Global block `b` belongs to group rank `b % R`, at local
-slot block `b // R`. For R=2, ranks own blocks `[0, 2, 4, ...]` and
-`[1, 3, 5, ...]`. Every block stays within one segment and sample; samples
-remain isolated during routing and attention. Neither a sample's token count
-nor its block count needs to be a multiple of R. The total block count across
-the pack must be at least R; the builder rejects smaller packs on every rank.
-Each rank must have valid input tokens, although their counts may differ.
-Individual samples may have fewer than R blocks. Internal communication
-buffers use `ceil(global_blocks / R)` blocks per rank, with zero padding for
-partial and dummy blocks.
+packed samples. For each sample, assign at most one **contiguous block interval**
+to each rank. Visit ranks by cumulative valid-token load from all earlier
+samples; ties use cumulative block count, then group rank. The least-loaded
+rank with remaining capacity receives the first interval. Choose each cut
+nearest to the cumulative per-rank token target, subject to the remaining
+ranks' capacity and reserving data for ranks that have not received a block.
+A rank can receive no blocks from an individual sample.
+
+Every rank has a hard capacity of `C = ceil(global_blocks / R)` blocks. The
+planner therefore keeps the same communication-buffer size as an even
+block-count split while adjusting cuts for partial blocks and earlier samples.
+Each block stays within one segment and sample; samples remain isolated during
+routing and attention. Neither a sample's token count nor its block count
+needs to be a multiple of R. The total block count must be at least R; smaller
+packs are rejected on every rank. Every rank receives valid input tokens.
+Internal buffers pad partial and dummy blocks to 64 slots.
+
+Ownership is explicit: `p = layout.ring.global_to_gather[b]` maps global block
+`b` to rank-major storage, so `owner = p // C` and `local_block = p % C`.
+`layout.ring.block_ids` lists this rank's global IDs, with `-1` for dummy blocks.
+All ranks derive the same maps from the sample geometry, without communication.
 
 For a Ring shard, `layout.input_rows` maps local compact rows to the original global
 sample/segment/FHW coordinates. It is a shard map, whereas the full block
@@ -212,9 +223,9 @@ sample/segment/FHW coordinates. It is a shard map, whereas the full block
 in raster order, use `to_block_order` with a **full block VSALayout** once at
 the input boundary, then distribute whole blocks according to their owners.
 The dataset/model layer owns that distribution and final output gathering.
-Generate or convert positions consistently. Equal contiguous token slices of
-the full stream do not implement cyclic block ownership. Any Ulysses all-to-all
-is also caller-owned and must preserve the required local block order.
+Generate or convert positions consistently. Split at the planned block
+boundaries, using these ownership maps rather than equal token slices. Any
+Ulysses all-to-all is also caller-owned and must preserve local block order.
 
 ### Worked example: two samples on three ranks
 
@@ -235,28 +246,29 @@ dataset/model boundary. The rank boxes contain **only valid input tokens**.
 flowchart LR
     A["Sample A: b0, b1, b2, b3, b4<br/>212 tokens"]
     B["Sample B: b5, b6<br/>22 tokens"]
-    R0["rank 0: b0 | b3 | b6<br/>59 tokens"]
-    R1["rank 1: b1 | b4<br/>96 tokens"]
-    R2["rank 2: b2 | b5<br/>79 tokens"]
-    A -->|b0, b3| R0
-    A -->|b1, b4| R1
-    A -->|b2| R2
-    B -->|b6| R0
-    B -->|b5| R2
+    R0["rank 0: b0 | b1<br/>84 tokens"]
+    R1["rank 1: b2 | b5<br/>79 tokens"]
+    R2["rank 2: b3 | b4 | b6<br/>71 tokens"]
+    A -->|b0, b1| R0
+    A -->|b2| R1
+    A -->|b3, b4| R2
+    B -->|b5| R1
+    B -->|b6| R2
 ```
 
 Each rank concatenates its blocks in increasing global-ID order, preserving
-valid-token order within each block. For example, rank 0 supplies 20 tokens
-from `b0`, then 32 from `b3`, then 7 from `b6`, with no gaps. B starts at `b5`
-on rank 2; ownership does not restart at rank 0 for each sample.
+valid-token order within each block. Rank 0 supplies 20 tokens from `b0`,
+then 64 from `b1`, with no gaps. After A, cumulative loads are `[84, 64, 64]`
+tokens and `[2, 1, 2]` blocks. B starts at `b5` on rank 1: it ties rank 2 in
+tokens but has fewer blocks. Rank 2 receives `b6`; rank 0 receives none of B.
 
 Attention internally allocates `ceil(7 / 3) = 3` blocks of 64 slots per rank:
 
 | Group rank | Global block IDs in local slot order | Valid sizes per slot block | Compact input rows | Internal slot rows |
 | --- | --- | --- | ---: | ---: |
-| 0 | `b0, b3, b6` | `20, 32, 7` | 59 | 192 |
-| 1 | `b1, b4, dummy` | `64, 32, 0` | 96 | 192 |
-| 2 | `b2, b5, dummy` | `64, 15, 0` | 79 | 192 |
+| 0 | `b0, b1, dummy` | `20, 64, 0` | 84 | 192 |
+| 1 | `b2, b5, dummy` | `64, 15, 0` | 79 | 192 |
+| 2 | `b3, b4, b6` | `32, 32, 7` | 71 | 192 |
 
 Unused slots are zero-filled and excluded from attention and pooling. The
 caller supplies 234 valid tokens in total, not 576 slot rows. Q/K/V/gate and
@@ -276,8 +288,9 @@ The routing code follows this sequence:
    dummy blocks have zero means. Pooled K/V is all-gathered in rank order,
    then `layout.ring.global_to_gather` restores global block order and removes
    dummy blocks. Routing uses local Q means and globally ordered K means.
-3. `ring_route` visits each sample's local Q block range and calls the shared
-   `_route_group`. For each video KV region and head, it forms FP32 scores
+3. `route` is shared by full and Ring layouts. The layout precomputes each
+   sample's local routing rows and offsets into pooled Q/K; `route` calls
+   `_route_group` for those rows. For each video KV region and head, it forms FP32 scores
    `Q_mean @ K_mean.T`, with TF32 and autocast disabled, then selects that
    region's `keep` largest scores independently for every Q block. Routing
    uses unscaled dot products; attention applies its softmax scale later.
@@ -287,12 +300,14 @@ The routing code follows this sequence:
 4. `topk(..., sorted=False)` chooses region-relative IDs; `selected.sort(-1)`
    sorts those IDs, and `+ start` converts them to global block IDs. Dense
    keys and fully retained regions come from the layout's template. With
-   `dense_query_full=True`, dense Q rows restore their full-sample template;
-   sparse video Q rows keep their regional budgets. Routing runs under
+   `dense_query_full=True`, dense Q rows keep their full-sample template and
+   skip top-k; sparse video Q rows keep their regional budgets. Layouts with
+   no dynamic selections reuse the template directly. Routing runs under
    `no_grad`: gradients flow through the selected fine attention and the
    coarse branch, not through discrete top-k decisions.
 5. `partition_indices` in [vsa_kernels.py](vsa_kernels.py) groups selected IDs
-   by `owner = b % R`, translates them to `local_block = b // R`, and records
+   using the same `global_to_gather` map as pooled K/V. With capacity C, mapped
+   position `p` gives `owner = p // C` and `local_block = p % C`. It records
    each peer's valid count. A peer may contribute zero selected keys. These
    per-peer lists drive fine attention as K/V shards arrive.
 
@@ -306,8 +321,8 @@ Selected video IDs        b2          b4
 Final global IDs:   [b0, b2, b4]   (b0 is the always-visible text block)
 ```
 
-For R=3, the peer lists are rank 0 `[0]` (global `b0`), rank 1 `[1]` (global
-`b4`) and rank 2 `[0]` (global `b2`). A Q block in sample A never considers B's
+For R=3, the peer lists are rank 0 `[0]` (global `b0`), rank 1 `[0]` (global
+`b2`) and rank 2 `[1]` (global `b4`). A Q block in sample A never considers B's
 `b5/b6`. With multiple video regions, each region gets its own top-k budget;
 there is no single top-k across all video regions in the pack.
 
@@ -350,9 +365,9 @@ flowchart LR
 | 2: after two hops | `Q0, KV1` | `Q1, KV2` | `Q2, KV0` |
 
 Each step evaluates only the selected KV blocks owned by that peer. For
-example, global `b5` maps to owner `5 % 3 = 2`, local block `5 // 3 = 1`.
-When rank 0 receives `KV2`, its B query block `b6` may attend to B's `b5`;
-its A query blocks cannot attend to `b5`. The **layout/router** enforce this
+example, global `b5` maps to rank-major position 4: owner `4 // 3 = 1`,
+local block `4 % 3 = 1`. When rank 2 receives `KV1`, its B query block `b6`
+may attend to B's `b5`; its A query blocks cannot attend to `b5`. The **layout/router** enforce this
 sample isolation through the block lists. The **transport** just moves
 buffers; it does not interpret FHW coordinates or infer THD sample boundaries.
 Partial outputs are weighted using their log-sum-exp normalizers so the final
@@ -387,13 +402,12 @@ integer to select a bucket size.
   dataset/model boundary gives every block a single owner; subsequent layers
   can pool and project local tokens directly. Compact input also keeps slot
   padding out of the surrounding projections and MLPs.
-- **Use a simple, reusable ownership map.** `owner = b % R` and
-  `local_block = b // R` let every rank translate global routing decisions
-  without exchanging token-location maps on each layer. Consecutive blocks
-  from a long sample spread across ranks. Continuing the cycle across samples
-  distributes the total block count with at most one block's difference
-  between ranks, including short samples and partial tiles. Token counts and
-  compute can still differ, as the example shows.
+- **Keep each sample's local blocks contiguous.** Assigning a single interval
+  per sample/rank preserves local block order and simplifies the dataset's
+  slicing. Carry cumulative valid-token loads across samples so later samples
+  favor less-loaded ranks. Adjust cuts within the fixed block capacity; partial
+  tiles can have very different valid lengths. Layout construction computes
+  one ownership map, reused by pooled gather, routing and every VSA layer.
 - **Keep global routing information small.** Local Q blocks need pooled K
   from candidate blocks across the full sample to preserve the per-region
   top-k budgets. Coarse attention also needs pooled K/V. Gathering one summary
@@ -411,10 +425,11 @@ The tradeoff is that fine attention circulates **whole padded K/V shards**,
 even when routing selects few blocks from a peer. Sparsity reduces attention
 work but does not proportionally reduce these transferred bytes. Pooled K/V
 is still gathered globally, and additional ranks add communication steps.
-Cyclic ownership is therefore a simple block-count distribution, not a
-guarantee of balanced compute or higher MFU for every workload.
-The cyclic rule is a layout policy: another whole-block partition would need
-corresponding ownership and index mappings in this implementation.
+The contiguous planner is a deterministic token-load heuristic under a hard
+block-capacity constraint. It does not guarantee equal token totals, equal
+attention work or higher MFU: sample lengths, sparsity and selected KV owners
+also affect compute and overlap. Benchmark the complete workload when changing
+its distribution policy.
 
 ## Attention semantics
 

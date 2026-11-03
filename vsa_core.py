@@ -58,7 +58,7 @@ def fp32_routing(device_type):
         torch.backends.cuda.matmul.allow_tf32 = previous
 
 
-def _route_group(q, k, group, index, template, *, key_offset=0, dense_rows=0):
+def _route_group(q, k, group, index, *, key_offset=0):
     """Fill one sample's query rows using its global per-region KV budgets."""
     query = q.transpose(0, 1)
     cursor = group.dense_blocks_num
@@ -70,42 +70,17 @@ def _route_group(q, k, group, index, template, *, key_offset=0, dense_rows=0):
             selected = scores.topk(keep, dim=-1, sorted=False).indices.to(torch.int32)
             index[..., cursor:cursor+keep] = selected.sort(-1).values + start
         cursor += keep
-    if dense_rows:
-        index[:, :, :dense_rows] = template[:, :, :dense_rows]
 
 
 @torch.no_grad()
-def route(q, k, groups, template, *, dense_query_full):
-    """Route Q/K compact means of samples that include coarse attention."""
-    if not any(g.kept < g.blocks for g in groups):
-        return template
-    index = template.clone()
-    offset = 0
-    for g in groups:
-        if g.dense_only:
-            continue
-        if g.kept < g.blocks:
-            _route_group(q[offset:offset+g.blocks], k, g,
-                         index[:, :, g.start:g.end], template[:, :, g.start:g.end],
-                         key_offset=offset-g.start,
-                         dense_rows=g.dense_blocks_num if dense_query_full else 0)
-        offset += g.blocks
-    return index
-
-
-@torch.no_grad()
-def ring_route(q, k, layout):
-    """Ring routing: local Q means and globally ordered K means, same math."""
+def route(q, k, layout):
+    """Shared router; layout prepares pooled-mean offsets and sample-local rows."""
+    if not layout.routing_groups:
+        return layout.routing_indices
     index = layout.routing_indices.clone()
-    for g, begin, end in layout.ring.local_groups:
-        if g.dense_only or g.kept == g.blocks:
-            continue
-        dense_end = min(end, max(begin, (
-            g.start + g.dense_blocks_num - layout.ring.rank
-            + layout.ring.size - 1) // layout.ring.size))
-        _route_group(q[begin:end], k, g, index[:, :, begin:end],
-                     layout.routing_indices[:, :, begin:end],
-                     dense_rows=dense_end-begin if layout.dense_query_full else 0)
+    for g, begin, end, offset in layout.routing_groups:
+        _route_group(q[begin+offset:end+offset], k, g,
+                     index[:, :, begin:end], key_offset=offset)
     return index
 
 
@@ -133,8 +108,7 @@ def attention_slots(q, k, v, layout, *, scale=None):
     if not layout.dense_only:
         q_route, k_route, q_coarse, k_coarse, v_coarse = vsa_kernels.routing_and_coarse_means(
             q, k, v, layout.block_sizes, layout.coarse_blocks)
-        indices = route(q_route, k_route, layout.groups, indices,
-            dense_query_full=layout.dense_query_full)
+        indices = route(q_route, k_route, layout)
     sizes = None if layout.all_blocks_full else layout.block_sizes
     fine = BlockSparseAttention.apply(q, k, v, indices, layout.routing_counts, sizes, scale)
     # Enqueue the long fine kernel first so GPU execution
@@ -321,9 +295,9 @@ def ring_attention_slots(q, k, v, layout, *, scale):
         km, vm = _GatherMeans.apply(km, vm, runtime)
         km = km.index_select(0, layout.ring.global_to_gather)
         vm = vm.index_select(0, layout.ring.global_to_gather)
-        indices = ring_route(qm.detach(), km.detach(), layout)
+        indices = route(qm.detach(), km.detach(), layout)
     peer_indices, peer_counts = vsa_kernels.partition_indices(
-        indices, layout.routing_counts, runtime.size, layout.blocks)
+        indices, layout.routing_counts, layout.ring.global_to_gather, runtime.size, layout.blocks)
     fine = _RingFine.apply(q, k, v, peer_indices, peer_counts, layout, runtime, scale)
     if layout.dense_only:
         return fine, None

@@ -40,8 +40,7 @@ def packed_geometry_and_flops(layout, xs, dim):
         )
         q_route, k_route, _, _, _ = vsa_kernels.routing_and_coarse_means(
             q_slots, k_slots, v_slots, layout.block_sizes, layout.coarse_blocks)
-        indices = route(q_route, k_route, layout.groups, indices,
-            dense_query_full=layout.dense_query_full)
+        indices = route(q_route, k_route, layout)
     # Count index lists directly: no pack-wide dense NxN mask or pair tensor.
     records = []
     for i, g in enumerate(layout.groups):

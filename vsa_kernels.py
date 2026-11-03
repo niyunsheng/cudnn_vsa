@@ -263,13 +263,14 @@ def _align_peers(tensor):
     return flat.view(tensor.shape)
 
 
-def _partition_indices_reference(index, counts, ring_size: int, peer_blocks: int):
+def _partition_indices_reference(index, counts, global_to_gather, ring_size: int, peer_blocks: int):
     """Fixed-capacity peer lists; zero counts are valid and never fabricated."""
     positions = torch.arange(index.shape[-1], device=index.device)
     valid = positions < counts[..., None]
     owners = torch.arange(ring_size, device=index.device)[:, None, None, None, None]
-    belongs = valid.unsqueeze(0) & ((index % ring_size).unsqueeze(0) == owners)
-    local = torch.where(belongs, (index // ring_size).unsqueeze(0), peer_blocks)
+    mapped = global_to_gather[index.long()]
+    belongs = valid.unsqueeze(0) & ((mapped // peer_blocks).unsqueeze(0) == owners)
+    local = torch.where(belongs, (mapped % peer_blocks).unsqueeze(0), peer_blocks)
     compact = local.sort(-1).values[..., :min(peer_blocks, index.shape[-1])]
     compact = torch.where(compact < peer_blocks, compact, 0).to(torch.int32)
     return (_align_peers(compact.contiguous()),
@@ -277,8 +278,8 @@ def _partition_indices_reference(index, counts, ring_size: int, peer_blocks: int
 
 
 @triton.jit
-def _partition_kernel(INDEX, COUNTS, OUT, OUT_COUNTS, KEYS: tl.constexpr,
-                      CAP: tl.constexpr, RING: tl.constexpr, STRIDE: tl.constexpr,
+def _partition_kernel(INDEX, COUNTS, GLOBAL_TO_GATHER, OUT, OUT_COUNTS, KEYS: tl.constexpr,
+                      CAP: tl.constexpr, PEER_BLOCKS: tl.constexpr, STRIDE: tl.constexpr,
                       COUNT_STRIDE: tl.constexpr, TILE: tl.constexpr):
     row, peer = tl.program_id(0), tl.program_id(1)
     lane = tl.arange(0, TILE)
@@ -288,8 +289,9 @@ def _partition_kernel(INDEX, COUNTS, OUT, OUT_COUNTS, KEYS: tl.constexpr,
     # Tail and active stores target disjoint addresses.
     if KEYS <= TILE:
         index = tl.load(INDEX + row * KEYS + lane, lane < count, other=0)
-        owner = index % RING
-        local = index // RING
+        mapped = tl.load(GLOBAL_TO_GATHER + index, lane < count, other=0).to(tl.int32)
+        owner = mapped // PEER_BLOCKS
+        local = mapped % PEER_BLOCKS
         selected = (lane < count) & (owner == peer)
         destination = tl.cumsum(selected.to(tl.int32)) - 1
         total = tl.sum(selected.to(tl.int32))
@@ -302,8 +304,9 @@ def _partition_kernel(INDEX, COUNTS, OUT, OUT_COUNTS, KEYS: tl.constexpr,
         for start in range(tl.cdiv(count, TILE)):
             position = start * TILE + lane
             index = tl.load(INDEX + row * KEYS + position, position < count, other=0)
-            owner = index % RING
-            local = index // RING
+            mapped = tl.load(GLOBAL_TO_GATHER + index, position < count, other=0).to(tl.int32)
+            owner = mapped // PEER_BLOCKS
+            local = mapped % PEER_BLOCKS
             selected = (position < count) & (owner == peer)
             destination = total + tl.cumsum(selected.to(tl.int32)) - 1
             tl.store(base + destination, local, selected)
@@ -314,9 +317,9 @@ def _partition_kernel(INDEX, COUNTS, OUT, OUT_COUNTS, KEYS: tl.constexpr,
     tl.store(OUT_COUNTS + peer * COUNT_STRIDE + row, total)
 
 
-def partition_indices(index, counts, ring_size, peer_blocks):
+def partition_indices(index, counts, global_to_gather, ring_size, peer_blocks):
     if not index.is_cuda:
-        return _partition_indices_reference(index, counts, ring_size, peer_blocks)
+        return _partition_indices_reference(index, counts, global_to_gather, ring_size, peer_blocks)
     cap = min(peer_blocks, index.shape[-1])
     steps = ring_size
     rows = counts.numel()
@@ -324,7 +327,7 @@ def partition_indices(index, counts, ring_size, peer_blocks):
     indices = torch.empty((steps, stride), device=index.device, dtype=torch.int32)
     numbers = torch.empty((steps, count_stride), device=index.device, dtype=torch.int32)
     _partition_kernel[(rows, steps)](
-        index, counts, indices, numbers, index.shape[-1], cap, ring_size, stride,
+        index, counts, global_to_gather, indices, numbers, index.shape[-1], cap, peer_blocks, stride,
         count_stride, min(2048, triton.next_power_of_2(index.shape[-1])),
         num_warps=4)
     return (indices[:, :rows * cap].view(steps, *index.shape[:-1], cap),

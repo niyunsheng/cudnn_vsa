@@ -1,14 +1,14 @@
 """THD ownership and global routing contracts, without distributed execution."""
 from dataclasses import FrozenInstanceError, replace
+import random
 
 import pytest
 import torch
 import torch.distributed as dist
 
 from vsa_core import route
-from vsa_layout import VSALayout, Segment, build_vsa_layout
+from vsa_layout import VSALayout, SampleBlocks, Segment, _plan_ring_blocks, build_vsa_layout
 from vsa_kernels import partition_indices
-from vsa_core import ring_route
 from vsa import to_block_order, to_raster_order, vsa_attention
 
 
@@ -29,7 +29,14 @@ def test_thd_partition(size, dense_query_full, metadata_group):
         local = build_vsa_layout(PACK, head_num=2, ring_cp_group=metadata_group(size, rank),
                                      dense_query_full=dense_query_full, input_order="block")
         ids = local.ring.block_ids[local.ring.block_ids >= 0]
-        assert ids.tolist() == list(range(rank, full.blocks, size))
+        assert ids.tolist() == sorted(ids.tolist())
+        mapping = local.ring.global_to_gather
+        assert mapping[ids].tolist() == list(range(rank * local.blocks,
+                                                  rank * local.blocks + len(ids)))
+        if rank == 0:
+            expected_mapping = mapping.clone()
+        else:
+            assert torch.equal(mapping, expected_mapping)
         assert local.input_order == "block"
         assert local.tokens > 0
         assert local.slot_row[local.slot_row >= 0].tolist() == list(range(local.tokens))
@@ -46,12 +53,53 @@ def test_thd_partition(size, dense_query_full, metadata_group):
         assert torch.equal(local.routing_counts[:, :, :len(ids)], full.routing_counts[:, :, ids])
         assert not local.routing_counts[:, :, len(ids):].any()
         for g in full.groups:
-            amount = int(((ids >= g.start) & (ids < g.end)).sum())
-            assert g.blocks // size <= amount <= (g.blocks + size - 1) // size
+            part = ids[(ids >= g.start) & (ids < g.end)].tolist()
+            assert not part or part == list(range(part[0], part[-1] + 1))
         owners.extend(ids.tolist())
         seen.extend(local.input_rows.tolist())
     assert sorted(owners) == list(range(full.blocks))
     assert sorted(seen) == list(range(full.tokens))
+
+
+@pytest.mark.parametrize("size", [1, 2, 3, 4, 8, 16, 72, 128])
+def test_contiguous_planner_coverage_capacity_and_sample_boundaries(size):
+    rng = random.Random(71 + size)
+    for _ in range(80):
+        total = rng.randint(size, size + 192)
+        sizes = [rng.randint(1, 64) for _ in range(total)]
+        cuts = sorted({0, total, *[rng.randrange(total + 1) for _ in range(30)]})
+        groups = [SampleBlocks(a, b, b-a, ()) for a, b in zip(cuts, cuts[1:])]
+        owned = _plan_ring_blocks(sizes, groups, size)
+        assert sorted(b for ids in owned for b in ids) == list(range(total))
+        assert all(0 < len(ids) <= (total + size - 1) // size for ids in owned)
+        for ids in owned:
+            assert ids == sorted(ids)
+            for g in groups:
+                part = [b for b in ids if g.start <= b < g.end]
+                assert not part or part == list(range(part[0], part[-1] + 1))
+        assert _plan_ring_blocks(sizes, groups, size) == owned
+
+
+def test_next_sample_uses_cumulative_load_not_only_previous_sample():
+    groups = [SampleBlocks(a, b, b-a, ()) for a, b in [(0, 5), (5, 10), (10, 14)]]
+    owned = _plan_ring_blocks([64] * 14, groups, 4)
+    # A gives [1, 1, 1, 2] blocks; B starts on rank 0 and gives [2, 2, 1, 0].
+    # C starts on rank 2: it ties rank 3 in cumulative load and has a lower ID,
+    # although rank 3 received the fewest blocks in B alone.
+    assert owned == [[0, 5, 6], [1, 7, 8], [2, 9, 10, 11], [3, 4, 12, 13]]
+
+
+def test_partial_blocks_balance_valid_tokens_and_restore_rank_major_means(metadata_group):
+    samples = [[Segment("video", (4, 6, 8), .5), Segment("text", 20)],
+               [Segment("video", (1, 3, 5)), Segment("text", 7)]]
+    layouts = [build_vsa_layout(samples, head_num=2, input_order="block",
+                                ring_cp_group=metadata_group(3, rank)) for rank in range(3)]
+    assert [x.ring.block_ids.tolist() for x in layouts] == [[0, 1, -1], [2, 5, -1], [3, 4, 6]]
+    assert [x.tokens for x in layouts] == [84, 79, 71]
+    # Synthetic means mark global IDs; the gather permutation discards dummy rows.
+    gathered = torch.cat([x.ring.block_ids for x in layouts])
+    for x in layouts:
+        assert gathered[x.ring.global_to_gather].tolist() == list(range(7))
 
 
 @pytest.mark.parametrize("rank", range(4))
@@ -92,27 +140,29 @@ def test_global_topk_and_peer_lists(dense_query_full, metadata_group):
     heads, size = 2, 8
     full = build_vsa_layout(PACK, head_num=heads, dense_query_full=dense_query_full)
     q, k = (torch.randn(full.blocks, heads, 128) for _ in range(2))
-    selected = route(q[full.coarse_blocks], k[full.coarse_blocks], full.groups,
-                     full.routing_indices, dense_query_full=dense_query_full)
+    selected = route(q[full.coarse_blocks], k[full.coarse_blocks], full)
     for rank in range(size):
         local = build_vsa_layout(PACK, head_num=heads, ring_cp_group=metadata_group(size, rank),
                                      dense_query_full=dense_query_full, input_order="block")
         ids = local.ring.block_ids[local.ring.block_ids >= 0]
         query = torch.zeros(local.blocks, heads, 128)
         query[:len(ids)] = q[ids]
-        actual = ring_route(query, k, local)
+        actual = route(query, k, local)
         assert torch.equal(actual[:, :, :len(ids)], selected[:, :, ids])
         indices, counts = partition_indices(
-            actual, local.routing_counts, size, local.blocks)
+            actual, local.routing_counts, local.ring.global_to_gather, size, local.blocks)
         assert all(x.data_ptr() % 16 == 0 and x.is_contiguous()
                    for table in (indices, counts) for x in table)
         assert torch.equal(counts.sum(0), local.routing_counts)
+        inverse = torch.full((size * local.blocks,), -1, dtype=torch.int64)
+        inverse[local.ring.global_to_gather] = torch.arange(full.blocks)
         for head in range(heads):
             for row in range(local.blocks):
                 gathered = []
                 for peer in range(size):
                     n = counts[peer, 0, head, row].item()
-                    gathered.extend((indices[peer, 0, head, row, :n] * size + peer).tolist())
+                    positions = indices[peer, 0, head, row, :n].long() + peer * local.blocks
+                    gathered.extend(inverse[positions].tolist())
                 n = local.routing_counts[0, head, row].item()
                 assert sorted(gathered) == sorted(actual[0, head, row, :n].tolist())
 

@@ -73,13 +73,16 @@ def test_window_matches_global_block_sparse_attention(monkeypatch, size, metadat
     for local in layouts:
         xs = [x[local.input_rows].clone().requires_grad_() for x in (q, k, v)]
         local_inputs.append(xs)
-        k_s, v_s = (vsa_kernels.to_slots(x, local.slot_row, local.row_slot) for x in xs[1:])
-        shards.append(torch.stack((k_s, v_s), dim=1).detach())
+        shards.append([vsa_kernels.to_slots(x, local.slot_row, local.row_slot).detach()
+                       for x in xs[1:]])
     gathered, partials = [], []
 
-    def all_gather(window, kv, *, group):
-        gathered.append((kv.dtype, kv.shape))
-        window.copy_(torch.cat(shards))
+    def all_gather(window, x, *, group):
+        # K and V are gathered separately; identify the operand by its values.
+        which = next(i for i, shard in enumerate(shards[0]) if torch.equal(shard, x)
+                     or any(torch.equal(peer[i], x) for peer in shards))
+        gathered.append((x.dtype, x.shape, which))
+        window.copy_(torch.cat([peer[which] for peer in shards]))
 
     def reduce_scatter(local, partial, *, group):
         assert partial.dtype == torch.float32 and partial.is_contiguous()
@@ -103,7 +106,9 @@ def test_window_matches_global_block_sparse_attention(monkeypatch, size, metadat
         dy_local = vsa_kernels.to_slots(dy[local.input_rows], local.slot_row, local.row_slot)
         dq = torch.autograd.grad(out, xs[0], dy_local)[0]
         torch.testing.assert_close(dq, expected_grads[0][local.input_rows])
-    assert gathered == [(q.dtype, (capacity * 64, 2, HEADS, DIM))] * (2 * size if size > 1 else 0)
+    expected_gathers = [(q.dtype, (capacity * 64, HEADS, DIM), which)
+                        for _ in range(2 * size if size > 1 else 0) for which in (0, 1)]
+    assert gathered == expected_gathers
     if size == 1:
         return
     # Summing every rank's FP32 window partial reproduces dK/dV in gather order.

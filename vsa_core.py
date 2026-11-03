@@ -314,51 +314,53 @@ class _WindowFine(torch.autograd.Function):
     The window stacks every peer's slot-padded K/V shard in group-rank order,
     so global block b occupies window block (b % R) * capacity + b // R, the
     position recorded in layout.ring.global_to_gather. Forward all-gathers the
-    local [S, 2, H, D] shard once and runs a single BSA call with the global
-    routing lists, so no partial-output merge is needed. Backward re-gathers
-    the window, runs one BSA backward and reduce-scatters the FP32 dK/dV
-    partial sums to their owners. This is the host-side shape of a fused Ring
-    kernel: one KV tensor and one index table per launch; only the transport
-    (two collectives here) remains outside the kernel and is not overlapped.
+    local slot-padded K and V shards once and runs a single BSA call with the
+    global routing lists, so no partial-output merge is needed. Backward
+    re-gathers the windows, runs one BSA backward and reduce-scatters the FP32
+    dK/dV partial sums to their owners. This is the host-side shape of a fused
+    Ring kernel: one K/V window and one index table per launch; only the
+    transport (collectives here) remains outside the kernel, not overlapped.
+
+    K and V are gathered separately because the installed kernels require
+    compact (gap-free) K/V layouts; an interleaved [R*S, 2, H, D] window would
+    need one collective but strided views the backward conversion rejects.
     """
 
     @staticmethod
-    def _gather(kv, runtime):
-        window = kv.new_empty((runtime.size * kv.shape[0], *kv.shape[1:]))
+    def _gather(x, runtime):
+        window = x.new_empty((runtime.size * x.shape[0], *x.shape[1:]))
         if runtime.size == 1:
-            window.copy_(kv)
+            window.copy_(x)
         else:
-            dist.all_gather_into_tensor(window, kv, group=runtime.group)
+            dist.all_gather_into_tensor(window, x, group=runtime.group)
         return window
 
     @staticmethod
     def forward(ctx, q, k, v, indices, counts, layout, runtime, scale):
-        # One collective carries K and V; the kernels read the two strided views.
-        kv = torch.stack((k, v), dim=1)
-        window = _WindowFine._gather(kv, runtime)
+        k_window, v_window = (_WindowFine._gather(x.contiguous(), runtime) for x in (k, v))
         # Routing lists hold global block ids; rows past each count are ignored.
         window_indices = (indices % runtime.size) * layout.blocks + indices // runtime.size
         sizes = layout.ring.window_block_sizes
-        result = bsa_forward(q, window[:, 0], window[:, 1], window_indices, counts, sizes,
+        result = bsa_forward(q, k_window, v_window, window_indices, counts, sizes,
                              scale, allow_empty=True)
         out = result["o_tensor"].squeeze(0).transpose(0, 1).contiguous()
-        ctx.save_for_backward(q, kv, out, result["lse_tensor"], window_indices, counts)
+        ctx.save_for_backward(q, k, v, out, result["lse_tensor"], window_indices, counts)
         ctx.runtime, ctx.sizes, ctx.scale = runtime, sizes, scale
         return out
 
     @staticmethod
     def backward(ctx, grad):
-        q, kv, out, lse, window_indices, counts = ctx.saved_tensors
+        q, k, v, out, lse, window_indices, counts = ctx.saved_tensors
         runtime = ctx.runtime
-        window = _WindowFine._gather(kv, runtime)
-        dq, dk, dv = bsa_backward(grad, q, window[:, 0], window[:, 1], out, lse, window_indices,
+        k_window, v_window = (_WindowFine._gather(x.contiguous(), runtime) for x in (k, v))
+        dq, dk, dv = bsa_backward(grad, q, k_window, v_window, out, lse, window_indices,
                                   counts, ctx.sizes, ctx.scale, bucket_size=runtime.bwd_bucket_size)
         # Kernel partials are BF16; the cross-rank sum stays FP32 like the ring path.
         partial = torch.stack((dk, dv), dim=1).float()
         if runtime.size == 1:
             local = partial
         else:
-            local = partial.new_empty((kv.shape[0], *partial.shape[1:]))
+            local = partial.new_empty((k.shape[0], *partial.shape[1:]))
             dist.reduce_scatter_tensor(local, partial, group=runtime.group)
         return (dq.contiguous(), local[:, 0].to(q.dtype).contiguous(),
                 local[:, 1].to(q.dtype).contiguous(), None, None, None, None, None)

@@ -282,15 +282,16 @@ measure the actual overlap. See [`build_vsa_layout`](vsa_layout.py) for P2P call
 ### Experimental window transport
 
 `ring_cp_transport="ring"` (default) is the step-by-step P2P ring above.
-`ring_cp_transport="window"` instead all-gathers every peer's slot-padded K/V
-shard into one KV window per direction, in group-rank order, and issues a
-single block-sparse call whose routing lists are the global block ids mapped
-through `layout.ring.global_to_gather`; no partial-output merge is needed.
-Backward re-gathers the window, runs one block-sparse backward and
+`ring_cp_transport="window"` instead all-gathers every peer's slot-padded K
+and V shards into one window each per direction, in group-rank order, and
+issues a single block-sparse call whose routing lists are the global block ids
+mapped through `layout.ring.global_to_gather`; no partial-output merge is
+needed. Backward re-gathers the windows, runs one block-sparse backward and
 reduce-scatters FP32 dK/dV partial sums to their owners. Both transports
 compute the same attention with the same precision policy (BF16 kernel
 partials, FP32 cross-rank accumulation). The window holds `ring_size` shards
-per direction, and its two collectives are not overlapped with the kernel.
+per direction, and its collectives (two all-gathers forward, two all-gathers
+and one reduce-scatter backward) are not overlapped with the kernel.
 It is the host-side shape of a fused Ring kernel: one KV tensor and one index
 table per launch.
 

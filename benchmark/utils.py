@@ -221,6 +221,7 @@ def summarize(samples, flops, peak_tflops, *, world_size=1):
 def environment():
     import cudnn
     import triton
+    import vsa_core
 
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     try:
@@ -233,9 +234,10 @@ def environment():
             "triton": triton.__version__, "cudnn_frontend": importlib.metadata.version("nvidia-cudnn-frontend"),
             "cutlass": importlib.metadata.version("nvidia-cutlass-dsl"),
             "flash_attn_4": importlib.metadata.version("flash-attn-4"),
-            "cudnn_backend": cudnn.backend_version(), "gpu": props.name,
+            "cudnn_backend": cudnn.backend_version(), "bsa_impl": vsa_core.BSA_IMPL, "gpu": props.name,
             "compute_capability": [props.major, props.minor], "gpu_memory_bytes": props.total_memory,
             "python": sys.version, "nvidia_smi": smi,
             "source_sha256": {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
-                              for folder in (".", "benchmark")
-                              for p in sorted((ROOT / folder).iterdir()) if p.suffix == ".py"}}
+                              for p in [*(p for folder in (".", "benchmark")
+                                          for p in sorted((ROOT / folder).iterdir()) if p.suffix == ".py"),
+                                        *sorted((ROOT / "bsa_cute").rglob("*.py"))]}}

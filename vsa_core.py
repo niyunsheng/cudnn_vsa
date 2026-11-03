@@ -1,15 +1,36 @@
 """Shared routing/backends and single-device or ring attention execution."""
 from contextlib import contextmanager
 from dataclasses import dataclass
+import os
 
 import torch
 import torch.distributed as dist
 import triton
-from cudnn import BSA
 from flash_attn.cute.interface import flash_attn_varlen_func
 
 import vsa_kernels
 from vsa_layout import BLOCK
+
+
+def _select_bsa():
+    """Select the block-sparse attention kernels with VSA_BSA_IMPL.
+
+    "cudnn" (default) imports the installed nvidia-cudnn-frontend package.
+    "local" imports bsa_cute, the vendored copy of the same CuTe DSL source
+    (see bsa_cute/PROVENANCE.md), which is the editable base for fused Ring
+    kernels. Both expose the same block_sparse_attention_* entry points.
+    """
+    impl = os.environ.get("VSA_BSA_IMPL", "cudnn")
+    if impl == "cudnn":
+        from cudnn import BSA
+    elif impl == "local":
+        from bsa_cute import BSA
+    else:
+        raise ValueError(f'VSA_BSA_IMPL must be "cudnn" or "local", got {impl!r}')
+    return BSA, impl
+
+
+BSA, BSA_IMPL = _select_bsa()
 
 
 def bsa_forward(q, k, v, indices, counts, sizes, scale, *, allow_empty=False):
@@ -129,6 +150,7 @@ class _RingRuntime:
     batch_p2p: bool
     bwd_bucket_size: int | None
     peers: tuple
+    transport: str = "ring"
 
 
 def _ring_runtime(layout, device):
@@ -150,8 +172,8 @@ def _ring_runtime(layout, device):
     if key not in ring._runtime:
         ranks = dist.get_process_group_ranks(group)
         ring._runtime[key] = _RingRuntime(
-            group, ring.rank, ring.size, torch.cuda.Stream(device=device),
-            batch_p2p, bwd_bucket_size, tuple(ranks))
+            group, ring.rank, ring.size, torch.cuda.Stream(device=device), batch_p2p,
+            bwd_bucket_size, tuple(ranks), ring.transport)
     return ring._runtime[key]
 
 
@@ -286,6 +308,62 @@ class _RingFine(torch.autograd.Function):
                 None, None, None, None, None)
 
 
+class _WindowFine(torch.autograd.Function):
+    """One block-sparse launch per direction over an all-gathered KV window.
+
+    The window stacks every peer's slot-padded K/V shard in group-rank order,
+    so global block b occupies window block (b % R) * capacity + b // R, the
+    position recorded in layout.ring.global_to_gather. Forward all-gathers the
+    local [S, 2, H, D] shard once and runs a single BSA call with the global
+    routing lists, so no partial-output merge is needed. Backward re-gathers
+    the window, runs one BSA backward and reduce-scatters the FP32 dK/dV
+    partial sums to their owners. This is the host-side shape of a fused Ring
+    kernel: one KV tensor and one index table per launch; only the transport
+    (two collectives here) remains outside the kernel and is not overlapped.
+    """
+
+    @staticmethod
+    def _gather(kv, runtime):
+        window = kv.new_empty((runtime.size * kv.shape[0], *kv.shape[1:]))
+        if runtime.size == 1:
+            window.copy_(kv)
+        else:
+            dist.all_gather_into_tensor(window, kv, group=runtime.group)
+        return window
+
+    @staticmethod
+    def forward(ctx, q, k, v, indices, counts, layout, runtime, scale):
+        # One collective carries K and V; the kernels read the two strided views.
+        kv = torch.stack((k, v), dim=1)
+        window = _WindowFine._gather(kv, runtime)
+        # Routing lists hold global block ids; rows past each count are ignored.
+        window_indices = (indices % runtime.size) * layout.blocks + indices // runtime.size
+        sizes = layout.ring.window_block_sizes
+        result = bsa_forward(q, window[:, 0], window[:, 1], window_indices, counts, sizes,
+                             scale, allow_empty=True)
+        out = result["o_tensor"].squeeze(0).transpose(0, 1).contiguous()
+        ctx.save_for_backward(q, kv, out, result["lse_tensor"], window_indices, counts)
+        ctx.runtime, ctx.sizes, ctx.scale = runtime, sizes, scale
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        q, kv, out, lse, window_indices, counts = ctx.saved_tensors
+        runtime = ctx.runtime
+        window = _WindowFine._gather(kv, runtime)
+        dq, dk, dv = bsa_backward(grad, q, window[:, 0], window[:, 1], out, lse, window_indices,
+                                  counts, ctx.sizes, ctx.scale, bucket_size=runtime.bwd_bucket_size)
+        # Kernel partials are BF16; the cross-rank sum stays FP32 like the ring path.
+        partial = torch.stack((dk, dv), dim=1).float()
+        if runtime.size == 1:
+            local = partial
+        else:
+            local = partial.new_empty((kv.shape[0], *partial.shape[1:]))
+            dist.reduce_scatter_tensor(local, partial, group=runtime.group)
+        return (dq.contiguous(), local[:, 0].to(q.dtype).contiguous(),
+                local[:, 1].to(q.dtype).contiguous(), None, None, None, None, None)
+
+
 def ring_attention_slots(q, k, v, layout, *, scale):
     """Return local fine slots and compact coarse output; row handling is caller-owned."""
     runtime = _ring_runtime(layout, q.device)
@@ -296,9 +374,12 @@ def ring_attention_slots(q, k, v, layout, *, scale):
         km = km.index_select(0, layout.ring.global_to_gather)
         vm = vm.index_select(0, layout.ring.global_to_gather)
         indices = route(qm.detach(), km.detach(), layout)
-    peer_indices, peer_counts = vsa_kernels.partition_indices(
-        indices, layout.routing_counts, layout.ring.global_to_gather, runtime.size, layout.blocks)
-    fine = _RingFine.apply(q, k, v, peer_indices, peer_counts, layout, runtime, scale)
+    if runtime.transport == "window":
+        fine = _WindowFine.apply(q, k, v, indices, layout.routing_counts, layout, runtime, scale)
+    else:
+        peer_indices, peer_counts = vsa_kernels.partition_indices(
+            indices, layout.routing_counts, layout.ring.global_to_gather, runtime.size, layout.blocks)
+        fine = _RingFine.apply(q, k, v, peer_indices, peer_counts, layout, runtime, scale)
     if layout.dense_only:
         return fine, None
     if layout.coarse_blocks.numel() == 0:

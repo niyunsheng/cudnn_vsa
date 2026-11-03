@@ -279,6 +279,32 @@ VSA enqueues P2P before fine attention to overlap communication and computation;
 measure the actual overlap. See [`build_vsa_layout`](vsa_layout.py) for P2P call mode
 (`ring_cp_batch_p2p`) and backward compute bucket size (`ring_cp_bwd_bucket_size`).
 
+### Experimental window transport
+
+`ring_cp_transport="ring"` (default) is the step-by-step P2P ring above.
+`ring_cp_transport="window"` instead all-gathers every peer's slot-padded K/V
+shard into one KV window per direction, in group-rank order, and issues a
+single block-sparse call whose routing lists are the global block ids mapped
+through `layout.ring.global_to_gather`; no partial-output merge is needed.
+Backward re-gathers the window, runs one block-sparse backward and
+reduce-scatters FP32 dK/dV partial sums to their owners. Both transports
+compute the same attention with the same precision policy (BF16 kernel
+partials, FP32 cross-rank accumulation). The window holds `ring_size` shards
+per direction, and its two collectives are not overlapped with the kernel.
+It is the host-side shape of a fused Ring kernel: one KV tensor and one index
+table per launch.
+
+### Local kernel copy
+
+`bsa_cute/` is a vendored copy of cudnn-frontend v1.28.0's
+`cudnn.block_sparse_attention` CuTe DSL package (provenance, mechanical import
+rewrite and licenses in `bsa_cute/PROVENANCE.md`). `VSA_BSA_IMPL=local`
+selects it instead of the installed package (`VSA_BSA_IMPL=cudnn`, the
+default); `benchmark.perf_vsa` records the choice as `bsa_impl`.
+`tests/test_bsa_cute_cuda.py` checks both packages agree before the local
+copy is modified. Fused Ring kernel work edits `bsa_cute/` and keeps the
+installed package as the control.
+
 ### Why this design
 
 - **Whole blocks, compact inputs**: preserve pooling/routing units without

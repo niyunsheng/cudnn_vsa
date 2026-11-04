@@ -209,12 +209,19 @@ def test_size_one_ring_is_still_compact_block_order(metadata_group):
         replace(ring, input_order="raster")
 
 
-@pytest.mark.parametrize("convert", [to_block_order, to_raster_order])
 @pytest.mark.parametrize("size", [1, 2])
-def test_boundary_reorder_requires_full_layout(convert, size, metadata_group):
+def test_inverse_boundary_reorder_requires_full_layout(size, metadata_group):
     shard = build_vsa_layout(PACK, head_num=2, ring_cp_group=metadata_group(size, 0), input_order="block")
     with pytest.raises(ValueError, match="full VSALayout"):
-        convert(torch.empty(shard.tokens, 32), vsa_layout=shard)
+        to_raster_order(torch.empty(shard.tokens, 32), vsa_layout=shard)
+
+
+def test_ring_boundary_requires_global_raster_rows(metadata_group):
+    shard = build_vsa_layout(PACK, head_num=2, ring_cp_group=metadata_group(2, 0), input_order="block")
+    with pytest.raises(ValueError, match="shape"):
+        to_block_order(torch.empty(shard.tokens, 32), vsa_layout=shard)
+    with pytest.raises(ValueError, match="CUDA"):
+        to_block_order(torch.empty(shard.ring.global_tokens, 32), vsa_layout=shard)
 
 
 @pytest.mark.parametrize("size", [1, 2])

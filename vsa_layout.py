@@ -424,7 +424,8 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
     Individual samples may have fewer blocks; no divisibility is required.
     Reorder/distribute whole blocks at the dataset/model boundary. All attention
     calls use vsa_attention(q, k, v, gate, layout), with no Ring arguments.
-    Boundary reorder helpers still require a full block VSALayout.
+    to_block_order can reorder and select a Ring shard from a full raster tensor
+    in one gather. to_raster_order requires a full block VSALayout.
     ring_cp_batch_p2p=None chooses batched P2P for device-bound groups and
     individual P2P for lazy groups. ring_cp_bwd_bucket_size="auto" selects the
     measured SM100/H2/local-128-block/single-sample setting; None uses the backend

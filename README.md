@@ -85,10 +85,13 @@ This repository provides the fused reorder kernel separately from
 preserving its shape and dtype and adding **no padding**. Inputs that are
 already in block order go directly to attention. Keep that order across layers.
 
-`to_block_order(x, vsa_layout=layout)` takes and returns a single contiguous
-CUDA `[T, ...]` tensor. The inverse `to_raster_order(x, vsa_layout=layout)` has
-the same interface. Both require a full layout with `input_order="block"`:
-the layout describes the block order even when `x` enters in raster order.
+`to_block_order(x, vsa_layout=layout)` accepts one contiguous CUDA
+`[T_global, ...]` raster tensor. A full layout returns all rows in block order;
+a Ring layout selects and reorders only this rank's rows in one kernel,
+returning `[layout.tokens, ...]`. Both preserve dtype and trailing dimensions.
+The inverse `to_raster_order(x, vsa_layout=layout)` requires a **full** layout.
+Both helpers require `input_order="block"`: the layout describes the target
+block order even when `x` enters in raster order.
 Call the forward helper at the stack's input boundary and the inverse helper
 at its output boundary if raster output is needed. Subsequent token-wise
 projections produce Q/K/V/gate in block order directly. Positional coordinates
@@ -174,7 +177,8 @@ Ring construction requires `input_order="block"`; full layouts default to
 `"raster"`.
 Full layouts work on CPU without distributed initialization; Ring layouts
 require the caller's existing group. Nonmember group handles are rejected.
-Full layouts remain necessary for the boundary reorder helpers.
+`to_block_order` accepts both full and Ring block layouts. `to_raster_order`
+requires a full layout; it does not implicitly gather distributed outputs.
 
 Full inputs and Ring shards share slot maps, routing-template construction and
 coarse Q/KV metadata. `tokens`, `blocks` and row/slot maps describe the input
@@ -185,7 +189,7 @@ are local and KV boundaries cover the corresponding global samples; full
 layouts share the same Q/KV boundary and block-ID tensors. This metadata
 unification preserves the separate single-device and Ring execution paths.
 The group and transport options are bound at construction and cannot be
-reassigned on Ring metadata. Boundary reorder helpers reject Ring shards.
+reassigned on Ring metadata.
 
 ### Compact input and block ownership
 
@@ -217,15 +221,34 @@ Ownership is explicit: `p = layout.ring.global_to_gather[b]` maps global block
 `layout.ring.block_ids` lists this rank's global IDs, with `-1` for dummy blocks.
 All ranks derive the same maps from the sample geometry, without communication.
 
-For a Ring shard, `layout.input_rows` maps local compact rows to the original global
-sample/segment/FHW coordinates. It is a shard map, whereas the full block
-`VSALayout.input_rows` is a permutation of all tokens. If the model starts
-in raster order, use `to_block_order` with a **full block VSALayout** once at
-the input boundary, then distribute whole blocks according to their owners.
-The dataset/model layer owns that distribution and final output gathering.
-Generate or convert positions consistently. Split at the planned block
-boundaries, using these ownership maps rather than equal token slices. Any
-Ulysses all-to-all is also caller-owned and must preserve local block order.
+For a Ring shard, `layout.input_rows` maps local compact rows to the original
+global sample/segment/FHW stream. `to_block_order` uses this map to fuse **shard
+selection and reordering**: it reads only owned rows and does not materialize
+an intermediate full block-ordered tensor. If every rank has the full raster
+pack, prepare inputs once before the stack:
+
+```python
+from vsa import to_block_order
+
+layout = build_vsa_layout(
+    samples, head_num=H, input_order="block", device="cuda",
+    ring_cp_group=group,
+)
+# tokens_global: [layout.ring.global_tokens, C], in sample/segment/FHW order.
+tokens_local = to_block_order(tokens_global, vsa_layout=layout)
+positions_local = to_block_order(positions_global, vsa_layout=layout)
+# Use the same helper for aligned target/mask tensors when needed.
+assert tokens_local.shape == (layout.tokens, tokens_global.shape[1])
+# Token-wise projections and all VSA layers now consume the local block order.
+```
+
+The helper adds no padding and performs no communication. Its backward scatters
+into the original global shape, with zero gradients at unowned rows; it does
+not reduce gradients across ranks. Data loading and final output gathering
+remain caller-owned. Already local block-ordered tensors bypass this helper.
+A global block-ordered tensor is not a raster input: distribute whole blocks
+using their ownership maps without applying the FHW conversion again.
+Any Ulysses all-to-all is also caller-owned and must preserve local block order.
 
 ### Worked example: two samples on three ranks
 
@@ -388,11 +411,41 @@ required collectives; saved receive buffers support retained-graph backward.
 Set transport options on `build_vsa_layout`, alongside `ring_cp_group`.
 `ring_cp_batch_p2p=None` uses individual P2P for lazy NCCL groups and batched
 P2P for device-bound groups. A boolean selects either mode explicitly.
-Caller-created high-priority NCCL groups can improve overlap.
 `ring_cp_bwd_bucket_size="auto"` uses 64 query blocks per backward bucket for
 SM100, H=2, one sample and 128 physical local blocks; other shapes use the
 backend default. Pass `None` for the backend default everywhere, or a positive
 integer to select a bucket size.
+
+### Forward communication overlap
+
+Create the Ring group with high-priority NCCL streams during parallel
+initialization, then reuse it across layouts and layers:
+
+```python
+import torch.distributed as dist
+
+# Call on all WORLD ranks in the same group-creation order, before building layouts.
+options = dist.ProcessGroupNCCL.Options()
+options.is_high_priority_stream = True
+group = dist.new_group(ranks=ring_ranks, backend="nccl", pg_options=options)
+# Member ranks pass this group to build_vsa_layout(..., ring_cp_group=group).
+```
+
+Enqueuing P2P before BSA does not guarantee that its GPU kernel starts first.
+BSA and NCCL can compete for SM resources, including shared memory. With
+ordinary-priority streams, a pending NCCL kernel can wait until BSA's last
+thread blocks. High priority lets pending NCCL work acquire freed resources
+earlier; it does not preempt already running thread blocks. CUDA Graph replay
+must honor captured node priorities (`cudaGraphInstantiateFlagUseNodePriority`);
+check this in the PyTorch build used for training.
+
+Priority belongs to the process group's internal NCCL stream. Changing only
+the stream around `isend`/`irecv` is insufficient. VSA borrows the supplied
+group and does not replace it or modify global scheduling settings. The
+benchmark's `--high-priority-group` creates the group with the option above.
+Compare full forward/backward latency as well as trace overlap: communication
+still consumes SM and memory bandwidth, and pooled-mean collectives have their
+own data dependencies.
 
 ### Why this design
 
@@ -542,7 +595,7 @@ have no padding; VSA manages its internal 64-token attention slots.
 
 ```bash
 torchrun --standalone --nproc-per-node=4 --module benchmark.perf_vsa --ring \
-  --ring-size 4 --heads 1 --cases thd720p44s --batch-p2p \
+  --ring-size 4 --heads 1 --cases thd720p44s --batch-p2p --high-priority-group \
   --bwd-bucket-size backend --warmup 10 --repeats 50 --profile \
   --peak-tflops 2500 --output benchmark/results/ring4_720p44s/perf.json
 ```

@@ -13,7 +13,7 @@ from .utils import (backward, barrier, capture_graph, check_tensors, environment
                     forward_backward, measure_eager, measure_graph,
                     packed_geometry_and_flops, profile_step, summarize)
 from tests.reference import reference_pack
-from vsa import vsa_attention
+from vsa import to_block_order, vsa_attention
 from vsa_layout import build_vsa_layout
 
 
@@ -121,8 +121,11 @@ def run_case(name, heads, args, group):
     if name == "fine_only_peer":
         with torch.no_grad():
             global_xs[3][full.sample_slices[1][0]] = float("nan")
-    xs = tuple(x.detach()[local.input_rows].contiguous().requires_grad_() for x in global_xs)
-    dy = global_dy[local.input_rows].contiguous()
+    # Exercise the public one-time boundary conversion outside attention timing.
+    convert = (functools.partial(to_block_order, vsa_layout=local)
+               if local.input_order == "block" else lambda x: x)
+    xs = tuple(convert(x.detach()).requires_grad_() for x in global_xs)
+    dy = convert(global_dy)
     fn = functools.partial(vsa_attention, vsa_layout=local)
     ref = (functools.partial(vsa_attention, vsa_layout=full) if full.tokens > 4096
            else reference_pack(samples, full.sample_slices, dense_query_full=args.dense_query_full))

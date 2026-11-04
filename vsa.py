@@ -7,11 +7,13 @@ from vsa_layout import VSALayout
 
 
 def _reorder_tokens(x, layout, inverse):
-    if (not isinstance(layout, VSALayout) or layout.ring is not None
-            or layout.input_order != "block"):
-        raise ValueError('Token reordering requires a full VSALayout with input_order="block"')
-    if not isinstance(x, torch.Tensor) or x.ndim < 1 or x.shape[0] != layout.tokens:
-        raise ValueError("Expected one tensor with shape [layout.tokens, ...]")
+    if not isinstance(layout, VSALayout) or layout.input_order != "block":
+        raise ValueError('Token reordering requires a VSALayout with input_order="block"')
+    if inverse and layout.ring is not None:
+        raise ValueError("to_raster_order requires a full VSALayout; gather Ring outputs explicitly")
+    tokens = layout.tokens if layout.ring is None else layout.ring.global_tokens
+    if not isinstance(x, torch.Tensor) or x.ndim < 1 or x.shape[0] != tokens:
+        raise ValueError(f"Expected one tensor with shape [{tokens}, ...]")
     if any(size == 0 for size in x.shape[1:]) or not x.is_contiguous():
         raise ValueError("Token-reorder input must be contiguous with nonempty row dimensions")
     if x.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64,
@@ -23,12 +25,15 @@ def _reorder_tokens(x, layout, inverse):
 
 
 def to_block_order(x, *, vsa_layout):
-    """Reorder one raster tensor into compact blocks, without padding.
+    """Reorder and optionally shard one global raster tensor, without padding.
 
-    Accept and return one contiguous CUDA [T, ...] tensor, preserving its shape
-    and dtype. Use a full block layout and call once at the stack's input
-    boundary. Gradients apply the inverse permutation.
-    Already block-ordered inputs do not need this conversion.
+    Input is contiguous CUDA [T_global, ...]. A full block layout returns all
+    tokens; a Ring layout returns only its owned rows, [layout.tokens, ...].
+    One gather fuses selection with reordering, preserving dtype and trailing
+    dimensions. Call once before the VSA stack, separately for tokens/positions
+    or other aligned fields. The helper performs no communication.
+    Backward scatters gradients to the original rows, zeroing unowned rows.
+    Already local block-ordered inputs do not need this conversion.
     """
     return _reorder_tokens(x, vsa_layout, inverse=False)
 
@@ -71,7 +76,8 @@ def vsa_attention(q, k, v, gate, vsa_layout, *, scale=None):
 
     layout.ring selects Ring execution using the group and transport options
     bound by build_vsa_layout, including size-one groups. The caller owns the
-    group's lifetime, whole-block sharding and any external Ulysses transforms.
+    group's lifetime and any external Ulysses transforms. to_block_order can
+    prepare the local compact shard from a full raster tensor before the stack.
     Ordinary and Ring attention use the same call signature.
     """
     layout = vsa_layout

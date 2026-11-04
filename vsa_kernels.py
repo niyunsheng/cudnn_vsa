@@ -11,25 +11,31 @@ from vsa_layout import BLOCK
 @triton.jit(do_not_specialize=["TOKENS"])
 def _reorder_tokens_kernel(X, OUT, ROWS, TOKENS,
                            WIDTH: tl.constexpr, INVERSE: tl.constexpr, TILE: tl.constexpr):
-    offsets = tl.program_id(0) * TILE + tl.arange(0, TILE)
-    valid = offsets < TOKENS * WIDTH
+    # Full input or local hidden-state tensors can exceed 2**31 elements.
+    offsets = tl.program_id(0).to(tl.int64) * TILE + tl.arange(0, TILE)
+    valid = offsets < TOKENS.to(tl.int64) * WIDTH
     row, col = offsets // WIDTH, offsets % WIDTH
     original = tl.load(ROWS + row, valid, other=0)
     mapped = original * WIDTH + col
     if INVERSE:
         values = tl.load(X + offsets, valid, other=0)
-        # ROWS is a full permutation: every destination is written once.
+        # ROWS is unique; unowned destinations were zero-filled by the caller.
         tl.store(OUT + mapped, values, valid)
     else:
         values = tl.load(X + mapped, valid, other=0)
         tl.store(OUT + offsets, values, valid)
 
 
-def _reorder_tokens(x, input_rows, inverse):
+def _reorder_tokens(x, input_rows, inverse, output_tokens):
     x = x.contiguous()
-    out = torch.empty_like(x)
+    tokens = output_tokens if inverse else input_rows.numel()
+    shape = (tokens, *x.shape[1:])
+    # A Ring gather's adjoint returns a full-sized gradient with zero unowned
+    # rows. Full permutations retain the original one-launch scatter path.
+    out = (x.new_zeros(shape) if inverse and tokens != input_rows.numel()
+           else x.new_empty(shape))
     width = math.prod(x.shape[1:])
-    count = x.numel()
+    count = input_rows.numel() * width
     if count:
         _reorder_tokens_kernel[(triton.cdiv(count, 1024),)](
             x, out, input_rows, input_rows.numel(), width, inverse, 1024)
@@ -38,20 +44,23 @@ def _reorder_tokens(x, input_rows, inverse):
 
 class _TokenReorder(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, input_rows, inverse):
+    def forward(ctx, x, input_rows, inverse, output_tokens):
         ctx.save_for_backward(input_rows)
         ctx.inverse = inverse
-        return _reorder_tokens(x, input_rows, inverse)
+        ctx.input_tokens = x.shape[0]
+        return _reorder_tokens(x, input_rows, inverse, output_tokens)
 
     @staticmethod
     def backward(ctx, grad):
         input_rows, = ctx.saved_tensors
-        return reorder_tokens(grad, input_rows, inverse=not ctx.inverse), None, None
+        return (reorder_tokens(grad, input_rows, inverse=not ctx.inverse,
+                               output_tokens=ctx.input_tokens), None, None, None)
 
 
-def reorder_tokens(x, input_rows, *, inverse=False):
-    """Permute one token tensor in one launch, with the inverse adjoint."""
-    return _TokenReorder.apply(x, input_rows, inverse)
+def reorder_tokens(x, input_rows, *, inverse=False, output_tokens=None):
+    """Gather unique token rows or scatter their adjoint, preserving row shape."""
+    output_tokens = x.shape[0] if output_tokens is None else output_tokens
+    return _TokenReorder.apply(x, input_rows, inverse, output_tokens)
 
 
 @triton.jit(do_not_specialize=["N"])

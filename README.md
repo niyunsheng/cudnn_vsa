@@ -600,9 +600,10 @@ reduced across ranks before summarizing. Ring defaults to H=2 and omits traces;
 add `--profile` to save a trace per rank.
 Use the same explicit `--seed` in both modes when comparing performance:
 the defaults are 2026 for ordinary VSA and 937 for Ring. Matched seeds,
-geometry and head counts generate identical global Q/K/V/gate and gradients.
+geometry and head counts generate identical global Q/K/V/gate tensors and
+upstream output gradients (dY).
 
-### Standalone Ring4 profile at the 720p44s shape
+### Single-head 720p44s: ordinary VSA and Ring4
 
 The `thd720p44s` case matches the attention geometry inside the 128-GPU
 DiT U32/R4 configuration, after the Ulysses exchange. It runs only VSA:
@@ -626,36 +627,54 @@ not the approximately 7.5k rows before the Ulysses exchange. Input tensors
 have no padding; VSA manages its internal 64-token attention slots.
 
 ```bash
+# Full sequence on one GPU, with the same global inputs and block order.
+python -m benchmark.perf_vsa --heads 1 --cases thd720p44s --seed 937 \
+  --input-order block --warmup 10 --repeats 50 --profile \
+  --peak-tflops 2500 --output benchmark/results/single_720p44s/perf.json
+
+# The same global work distributed across four GPUs.
 torchrun --standalone --nproc-per-node=4 --module benchmark.perf_vsa --ring \
   --ring-size 4 --heads 1 --cases thd720p44s --seed 937 --batch-p2p --high-priority-group \
   --bwd-bucket-size backend --warmup 10 --repeats 50 --profile \
   --peak-tflops 2500 --output benchmark/results/ring4_720p44s/perf.json
 ```
 
-CUDA Graph is enabled by default. This command validates outputs and all
+CUDA Graph is enabled by default. Both commands validate outputs and all
 input gradients against single-device VSA, retained backward, and graph
-replay with original/changed inputs before timing. It writes
+replay with original/changed inputs before timing. The Ring command writes
 `perf-group0.json` and `perf-group0-thd720p44s-h1-rank{0,1,2,3}.trace.json`.
 Each trace captures one additional full forward/backward replay after the
 timed samples. JSON reports phase latency, TFLOP/s/GPU and MFU together.
 Inputs are seeded random tensors; matching geometry does not reproduce a
 particular model layer's routing decisions.
 
-Measured on four GB200 GPUs with the software environment listed below,
-using the high-priority group and backend-default backward buckets above:
+Measured in one four-GB200 allocation with the software environment listed
+below. Ordinary VSA runs the full sequence on one GPU without a process
+group; Ring4 uses all four GPUs with the high-priority group and
+backend-default backward buckets above. Both use **961,696 global tokens,
+H=1, D=128, compact block input and seed 937**. Global input hashes and useful
+FLOP counts match.
 
-| Phase | Latency ms | TFLOP/s/GPU | MFU |
-|---|---:|---:|---:|
-| Forward | 16.035 | 661.77 | 26.47% |
-| Backward | 51.617 | 411.15 | 16.45% |
-| Forward + backward | 66.789 | 476.63 | 19.07% |
+| Phase | Ordinary ms | Ordinary TFLOP/s | Ordinary MFU | Ring4 ms | Ring4 TFLOP/s/GPU | Ring4 MFU | Parallel efficiency |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Forward | 66.591 | 637.39 | 25.50% | 15.853 | 669.37 | 26.77% | 105.02% |
+| Backward | 184.570 | 459.93 | 18.40% | 50.867 | 417.21 | 16.69% | 90.71% |
+| Forward + backward | 251.091 | 507.12 | 20.28% | 66.385 | 479.53 | 19.18% | 94.56% |
 
-These results use **961,696 global tokens, H=1, D=128 and Ring=4**. Each of
-two runs uses 10 warmups and 50 timed CUDA Graph replays. Each replay takes
-the maximum latency across ranks; the table reports the median of the two
-run medians. Phase medians are independent. MFU divides global valid
-attention GEMM FLOPs by latency and four times the 2500 TFLOP/s BF16 peak.
-Input sharding/reordering, graph capture and profiling are outside timing.
+Each run uses 10 warmups and 50 timed CUDA Graph replays, in ordinary / Ring4 /
+Ring4 / ordinary order. Ring timing takes the maximum rank latency for each
+replay; the table reports the median of each mode's two run medians. Phase
+medians are independent. MFU divides global valid attention GEMM FLOPs by
+latency and the GPU count times the 2500 TFLOP/s BF16 peak. Input
+sharding/reordering, graph capture and profiling are outside timing.
+
+With fixed global work, speedup is `T1 / T4` and parallel efficiency is
+`T1 / (4 * T4)`, equivalently `MFU4 / MFU1`. Here the full pass achieves
+**3.782x speedup and 94.56% efficiency**. This comparison includes
+communication, changes in kernel shape, extra accumulation and load imbalance;
+it does not isolate communication cost. Forward's slightly superlinear result
+does not imply zero communication overhead, and backward remains below ideal
+scaling.
 
 The example uses four GPUs on one host. To measure a Ring spanning hosts,
 use one process per host and the normal torchrun rendezvous arguments,

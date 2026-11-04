@@ -128,6 +128,9 @@ def test_unified_cli_defaults_and_layouts():
     assert (single.warmup, single.repeats, single.profile) == (5, 80, True)
     assert (ring.heads, ring.input_order, ring.warmup, ring.repeats, ring.profile) == ([2], "block", 3, 30, False)
     assert ring.cases == ["ragged", "single64k", "thd64k"]
+    assert (single.seed, ring.seed) == (2026, 937)
+    assert parse_args(["--seed", "937"]).seed == ring.seed
+    assert parse_args(["--ring", "--seed", "0"]).seed == 0
     assert parse_args(["--ring", "--heads", "1", "8"]).heads == [1, 8]
     assert parse_args(["--input-order", "block", "--no-profile"]).input_order == "block"
     assert parse_args(["--ring", "--forward-only-high-priority"]).forward_only_high_priority

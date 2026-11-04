@@ -38,6 +38,8 @@ def parse_args(argv=None):
     parser.add_argument("--cases", nargs="+", choices=("default", *CASES))
     parser.add_argument("--heads", nargs="+", type=int)
     parser.add_argument("--input-order", choices=("raster", "block"))
+    parser.add_argument("--seed", type=int,
+                        help="Input seed; default 937 for Ring, 2026 for ordinary VSA")
     parser.add_argument("--dense-query-full", action="store_true")
     parser.add_argument("--eps", type=float, default=1e-5)
     parser.add_argument("--warmup", type=int)
@@ -68,6 +70,7 @@ def parse_args(argv=None):
     args.cases = args.cases or (["ragged", "single64k", "thd64k"]
                                if args.ring else ["default"])
     args.heads = args.heads or ([2] if args.ring else list(HEAD_COUNTS))
+    args.seed = (937 if args.ring else 2026) if args.seed is None else args.seed
     if min(args.heads) < 1:
         parser.error("Head counts must be positive")
     args.input_order = args.input_order or ("block" if args.ring else "raster")
@@ -132,7 +135,7 @@ def run_case(name, heads, args, group, bwd_group=None):
                                 ring_cp_bwd_bucket_size=args.bwd_bucket_size)
     else:
         local = full if args.input_order == "raster" else build_vsa_layout(samples, **kwargs, input_order="block")
-    global_xs, global_dy = make_inputs(heads, samples=samples, seed=937 if args.ring else 2026)
+    global_xs, global_dy = make_inputs(heads, samples=samples, seed=args.seed)
     if name == "fine_only_peer":
         with torch.no_grad():
             global_xs[3][full.sample_slices[1][0]] = float("nan")

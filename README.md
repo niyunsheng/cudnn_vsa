@@ -598,6 +598,9 @@ or directory. The `vsa-perf/v4` JSON uses `<case>-h<heads>` keys; each case reco
 checks, global useful FLOPs and per-GPU throughput/MFU. Ring timing samples are
 reduced across ranks before summarizing. Ring defaults to H=2 and omits traces;
 add `--profile` to save a trace per rank.
+Use the same explicit `--seed` in both modes when comparing performance:
+the defaults are 2026 for ordinary VSA and 937 for Ring. Matched seeds,
+geometry and head counts generate identical global Q/K/V/gate and gradients.
 
 ### Standalone Ring4 profile at the 720p44s shape
 
@@ -624,7 +627,7 @@ have no padding; VSA manages its internal 64-token attention slots.
 
 ```bash
 torchrun --standalone --nproc-per-node=4 --module benchmark.perf_vsa --ring \
-  --ring-size 4 --heads 1 --cases thd720p44s --batch-p2p --high-priority-group \
+  --ring-size 4 --heads 1 --cases thd720p44s --seed 937 --batch-p2p --high-priority-group \
   --bwd-bucket-size backend --warmup 10 --repeats 50 --profile \
   --peak-tflops 2500 --output benchmark/results/ring4_720p44s/perf.json
 ```

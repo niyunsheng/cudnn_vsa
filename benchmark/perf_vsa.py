@@ -52,12 +52,17 @@ def parse_args(argv=None):
     transport.add_argument("--batch-p2p", action="store_true", default=None)
     transport.add_argument("--unbatched-p2p", dest="batch_p2p", action="store_false")
     parser.add_argument("--eager-group", action="store_true", help="Bind device_id when creating WORLD")
-    parser.add_argument("--high-priority-group", action="store_true")
+    priority = parser.add_mutually_exclusive_group()
+    priority.add_argument("--high-priority-group", action="store_true",
+                          help="High-priority NCCL for both forward and backward")
+    priority.add_argument("--forward-only-high-priority", action="store_true",
+                          help="High-priority forward group and ordinary-priority backward group")
     parser.add_argument("--bwd-bucket-size", type=_bucket_argument, default="auto",
                         help="auto (default), backend, or a positive number of query blocks")
     parser.add_argument("--ring-size", type=int, help="Interleaved subgroup size; must divide world size")
     args = parser.parse_args(argv)
     if not args.ring and (args.ring_size is not None or args.eager_group or args.high_priority_group
+                         or args.forward_only_high_priority
                          or args.batch_p2p is not None or args.bwd_bucket_size != "auto"):
         parser.error("Ring transport options require --ring")
     args.cases = args.cases or (["ragged", "single64k", "thd64k"]
@@ -81,16 +86,18 @@ def parse_args(argv=None):
 
 
 def init_ring(args):
-    """Create caller-owned WORLD or interleaved groups on every worker."""
-    init_options = ({"device_id": torch.device("cuda", int(os.environ["LOCAL_RANK"]))}
-                    if args.eager_group else {})
-    pg_options = None
-    if args.high_priority_group:
-        pg_options = dist.ProcessGroupNCCL.Options()
-        pg_options.is_high_priority_stream = True
-        init_options["pg_options"] = pg_options
-    dist.init_process_group("nccl", timeout=timedelta(minutes=15), **init_options)
+    """Create caller-owned forward/backward groups once on every worker."""
+    device_options = ({"device_id": torch.device("cuda", int(os.environ["LOCAL_RANK"]))}
+                      if args.eager_group else {})
+    def options(high):
+        value = dist.ProcessGroupNCCL.Options()
+        value.is_high_priority_stream = high
+        return value
+    high = args.high_priority_group or args.forward_only_high_priority
+    dist.init_process_group("nccl", timeout=timedelta(minutes=15),
+                            pg_options=options(high), **device_options)
     group = dist.group.WORLD
+    bwd_group = group
     world_rank, world_size = dist.get_rank(), dist.get_world_size()
     if args.ring_size is not None:
         if args.ring_size < 1 or world_size % args.ring_size:
@@ -98,20 +105,28 @@ def init_ring(args):
         group_count = world_size // args.ring_size
         for index in range(group_count):
             ranks = list(range(index, world_size, group_count))
-            candidate = dist.new_group(ranks=ranks, pg_options=pg_options)
+            candidate = dist.new_group(ranks=ranks, backend="nccl",
+                                       pg_options=options(high), **device_options)
+            backward = (dist.new_group(ranks=ranks, backend="nccl",
+                                      pg_options=options(False), **device_options)
+                        if args.forward_only_high_priority else candidate)
             if world_rank in ranks:
-                group = candidate
+                group, bwd_group = candidate, backward
                 args.output = args.output.with_stem(f"{args.output.stem}-group{index}")
-    return group
+    elif args.forward_only_high_priority:
+        bwd_group = dist.new_group(ranks=list(range(world_size)), backend="nccl",
+                                   pg_options=options(False), **device_options)
+    return group, bwd_group
 
 
-def run_case(name, heads, args, group):
+def run_case(name, heads, args, group, bwd_group=None):
     rank, size = (dist.get_rank(group), dist.get_world_size(group)) if group is not None else (0, 1)
     samples = case_geometry(name)
     kwargs = dict(head_num=heads, device="cuda", dense_query_full=args.dense_query_full)
     full = build_vsa_layout(samples, **kwargs)
     if group is not None:
         local = build_vsa_layout(samples, **kwargs, ring_cp_group=group,
+                                ring_cp_bwd_group=bwd_group,
                                 input_order=args.input_order,
                                 ring_cp_batch_p2p=args.batch_p2p,
                                 ring_cp_bwd_bucket_size=args.bwd_bucket_size)
@@ -176,7 +191,7 @@ def main():
     torch.set_num_threads(8)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    group = init_ring(args) if args.ring else None
+    group, bwd_group = init_ring(args) if args.ring else (None, None)
     writer = group is None or dist.get_rank(group) == 0
     try:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -187,13 +202,15 @@ def main():
         if group is not None:
             result["batch_p2p_effective"] = (group.bound_device_id is not None
                                              if args.batch_p2p is None else args.batch_p2p)
+            result["bwd_batch_p2p_effective"] = (bwd_group.bound_device_id is not None
+                                                 if args.batch_p2p is None else args.batch_p2p)
             result["nccl_environment"] = {key: os.environ.get(key) for key in (
                 "NCCL_MNNVL_ENABLE", "NCCL_CUMEM_ENABLE", "NCCL_P2P_DISABLE",
                 "NCCL_MIN_P2P_NCHANNELS", "NCCL_MAX_P2P_NCHANNELS",
                 "NCCL_NCHANNELS_PER_NET_PEER", "NCCL_NVLS_ENABLE", "NCCL_IB_DISABLE")}
         for name in args.cases:
             for heads in args.heads:
-                result["cases"][f"{name}-h{heads}"] = run_case(name, heads, args, group)
+                result["cases"][f"{name}-h{heads}"] = run_case(name, heads, args, group, bwd_group)
                 if writer:
                     args.output.write_text(json.dumps(result, indent=2) + "\n")
                 torch.cuda.synchronize()

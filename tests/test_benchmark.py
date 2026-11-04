@@ -130,11 +130,15 @@ def test_unified_cli_defaults_and_layouts():
     assert ring.cases == ["ragged", "single64k", "thd64k"]
     assert parse_args(["--ring", "--heads", "1", "8"]).heads == [1, 8]
     assert parse_args(["--input-order", "block", "--no-profile"]).input_order == "block"
+    assert parse_args(["--ring", "--forward-only-high-priority"]).forward_only_high_priority
+    assert not ring.forward_only_high_priority and not ring.high_priority_group
     args = parse_args(["--ring", "--heads", "2", "4", "--bwd-bucket-size", "backend", "--output", "run.json"])
     assert args.bwd_bucket_size is None and args.heads == [2, 4] and args.output.name == "run.json"
 
 
 @pytest.mark.parametrize("argv", [
+    ["--forward-only-high-priority"],
+    ["--ring", "--forward-only-high-priority", "--high-priority-group"],
     ["--ring", "--input-order", "raster"], ["--ring-size", "2"], ["--batch-p2p"],
     ["--ring", "--ring-size", "0"], ["--ring", "--bwd-bucket-size", "0"],
     ["--heads", "0"], ["--heads", "-1"],

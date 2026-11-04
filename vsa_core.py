@@ -123,10 +123,12 @@ def attention_slots(q, k, v, layout, *, scale=None):
 @dataclass
 class _RingRuntime:
     group: object
+    bwd_group: object
     rank: int
     size: int
     stream: object
     batch_p2p: bool
+    bwd_batch_p2p: bool
     bwd_bucket_size: int | None
     peers: tuple
 
@@ -134,10 +136,12 @@ class _RingRuntime:
 def _ring_runtime(layout, device):
     ring = layout.ring
     group, batch_p2p, bwd_bucket_size = ring.group, ring.batch_p2p, ring.bwd_bucket_size
+    bwd_batch_p2p = batch_p2p
     if batch_p2p is None:
         # Eager NCCL groups serialize individual P2P operations on their
         # parent communicator. Lazy groups can use independent pair comms.
         batch_p2p = group.bound_device_id is not None
+        bwd_batch_p2p = ring.bwd_group.bound_device_id is not None
     if bwd_bucket_size == "auto":
         # A bounded tuning entry, not a claim about unmeasured geometries.
         # Splitting dense-KV work helps H2/B128 single-sample backward on
@@ -146,11 +150,12 @@ def _ring_runtime(layout, device):
             64 if layout.head_num == 2 and layout.blocks == 128
             and len(layout.groups) == 1
             and torch.cuda.get_device_capability(device) == (10, 0) else None)
-    key = (device, batch_p2p, bwd_bucket_size)
+    key = (device, batch_p2p, bwd_batch_p2p, bwd_bucket_size)
     if key not in ring._runtime:
         ranks = dist.get_process_group_ranks(group)
         ring._runtime[key] = _RingRuntime(
-            group, ring.rank, ring.size, torch.cuda.Stream(device=device), batch_p2p,
+            group, ring.bwd_group, ring.rank, ring.size, torch.cuda.Stream(device=device),
+            batch_p2p, bwd_batch_p2p,
             bwd_bucket_size, tuple(ranks))
     return ring._runtime[key]
 
@@ -164,17 +169,19 @@ def _ring_exchange(runtime, pairs, *, reverse=False):
     compute = torch.cuda.current_stream()
     runtime.stream.wait_stream(compute)
     direction = -1 if reverse else 1
+    group = runtime.bwd_group if reverse else runtime.group
+    batch_p2p = runtime.bwd_batch_p2p if reverse else runtime.batch_p2p
     next_peer = runtime.peers[(runtime.rank + direction) % runtime.size]
     previous_peer = runtime.peers[(runtime.rank - direction) % runtime.size]
     with torch.cuda.stream(runtime.stream):
         requests = []
         for send, receive in pairs:
-            send_op = dist.P2POp(dist.isend, send, next_peer, runtime.group)
-            receive_op = dist.P2POp(dist.irecv, receive, previous_peer, runtime.group)
+            send_op = dist.P2POp(dist.isend, send, next_peer, group)
+            receive_op = dist.P2POp(dist.irecv, receive, previous_peer, group)
             parity = runtime.rank % 2
             ordered = (send_op, receive_op) if parity == 0 else (receive_op, send_op)
             requests.extend(ordered)
-        if runtime.batch_p2p:
+        if batch_p2p:
             requests = dist.batch_isend_irecv(requests)
         else:
             # Lazy groups use pair communicators. Alternating the posting
@@ -211,7 +218,7 @@ class _GatherMeans(torch.autograd.Function):
         # Unused outputs receive materialized zero gradients on every rank.
         grad = torch.stack((dk.float(), dv.float()), dim=1)
         local = grad.new_empty((grad.shape[0] // runtime.size, *grad.shape[1:]))
-        dist.reduce_scatter_tensor(local, grad, group=runtime.group)
+        dist.reduce_scatter_tensor(local, grad, group=runtime.bwd_group)
         return local[:, 0], local[:, 1], None
 
 

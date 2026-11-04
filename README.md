@@ -161,12 +161,16 @@ out = vsa_attention(q, k, v, gate, layout)
 
 Pass the existing process group when constructing the layout. Rank and size
 come from that group; they are not separate builder arguments. Forward and
-backward use the bound group without additional Ring arguments.
+backward use the bound groups without additional Ring arguments. By default,
+both use `ring_cp_group`. Optionally pass `ring_cp_bwd_group` to use another
+caller-owned group for backward P2P and pooled-gradient reduce-scatter. Its
+members and group-rank order must match the forward group; mismatches are
+rejected when constructing the layout.
 All group ranks use identical global sample/segment metadata and the same
 heads. Layout rank and size refer to that group, including interleaved groups.
 The caller creates the group once during parallel initialization and owns its
 lifetime. Different micro-batches can build different layouts referencing the
-same group. Constructing or releasing a layout never creates or destroys a
+same group or pair of groups. Constructing or releasing a layout never creates or destroys a
 process group. Reuse a layout when geometry, policy, heads and device match.
 
 `build_vsa_layout` is the only public layout builder. `ring_cp_group=None`
@@ -183,12 +187,12 @@ requires a full layout; it does not implicitly gather distributed outputs.
 Full inputs and Ring shards share slot maps, routing-template construction and
 coarse Q/KV metadata. `tokens`, `blocks` and row/slot maps describe the input
 held locally; `groups`, `sample_slices` and `sample_lengths` describe global
-samples. `layout.ring` holds `group`, group-local `size`/`rank`, global counts, block
+samples. `layout.ring` holds `group`, `bwd_group`, group-local `size`/`rank`, global counts, block
 ownership, peer lengths and the all-gather permutation. Coarse Q boundaries
 are local and KV boundaries cover the corresponding global samples; full
 layouts share the same Q/KV boundary and block-ID tensors. This metadata
 unification preserves the separate single-device and Ring execution paths.
-The group and transport options are bound at construction and cannot be
+The groups and transport options are bound at construction and cannot be
 reassigned on Ring metadata.
 
 ### Compact input and block ownership
@@ -410,7 +414,8 @@ required collectives; saved receive buffers support retained-graph backward.
 
 Set transport options on `build_vsa_layout`, alongside `ring_cp_group`.
 `ring_cp_batch_p2p=None` uses individual P2P for lazy NCCL groups and batched
-P2P for device-bound groups. A boolean selects either mode explicitly.
+P2P for device-bound groups, resolved independently for forward and backward.
+A boolean selects that mode for both groups explicitly.
 `ring_cp_bwd_bucket_size="auto"` uses 64 query blocks per backward bucket for
 SM100, H=2, one sample and 128 physical local blocks; other shapes use the
 backend default. Pass `None` for the backend default everywhere, or a positive
@@ -418,8 +423,9 @@ integer to select a bucket size.
 
 ### Forward communication overlap
 
-Create the Ring group with high-priority NCCL streams during parallel
-initialization, then reuse it across layouts and layers:
+To use high-priority forward communication and ordinary-priority backward
+communication, create two NCCL groups once during parallel initialization.
+Reuse the pair across layouts and layers:
 
 ```python
 import torch.distributed as dist
@@ -427,9 +433,23 @@ import torch.distributed as dist
 # Call on all WORLD ranks in the same group-creation order, before building layouts.
 options = dist.ProcessGroupNCCL.Options()
 options.is_high_priority_stream = True
-group = dist.new_group(ranks=ring_ranks, backend="nccl", pg_options=options)
-# Member ranks pass this group to build_vsa_layout(..., ring_cp_group=group).
+forward_group = dist.new_group(ranks=ring_ranks, backend="nccl", pg_options=options)
+backward_options = dist.ProcessGroupNCCL.Options()
+backward_options.is_high_priority_stream = False
+backward_group = dist.new_group(ranks=ring_ranks, backend="nccl", pg_options=backward_options)
+# Member ranks construct their layouts with the same pair for every micro-batch.
+layout = build_vsa_layout(
+    samples, head_num=H, input_order="block", device="cuda",
+    ring_cp_group=forward_group, ring_cp_bwd_group=backward_group,
+)
+out = vsa_attention(q, k, v, gate, layout)
 ```
+
+Forward pooled all-gather and fine KV P2P use `forward_group`; backward fine
+P2P and pooled-gradient reduce-scatter use `backward_group`. Leaving
+`ring_cp_bwd_group=None` reuses the forward group, preserving the original
+single-group behavior. VSA borrows both handles; the caller owns creation and
+destruction and keeps them alive through backward and CUDA Graph replay.
 
 Enqueuing P2P before BSA does not guarantee that its GPU kernel starts first.
 BSA and NCCL can compete for SM resources, including shared memory. With
@@ -441,8 +461,12 @@ check this in the PyTorch build used for training.
 
 Priority belongs to the process group's internal NCCL stream. Changing only
 the stream around `isend`/`irecv` is insufficient. VSA borrows the supplied
-group and does not replace it or modify global scheduling settings. The
-benchmark's `--high-priority-group` creates the group with the option above.
+groups and does not replace them or modify global scheduling settings. The
+benchmark's `--forward-only-high-priority` creates the pair above.
+`--high-priority-group` instead uses one high-priority group in both directions;
+omitting both flags uses one ordinary-priority group. Both priority flags are
+mutually exclusive. A high-priority group also affects backward when reused
+there, even if backward P2P was already overlapped.
 Compare full forward/backward latency as well as trace overlap: communication
 still consumes SM and memory bandwidth, and pooled-mean collectives have their
 own data dependencies.
@@ -595,7 +619,7 @@ have no padding; VSA manages its internal 64-token attention slots.
 
 ```bash
 torchrun --standalone --nproc-per-node=4 --module benchmark.perf_vsa --ring \
-  --ring-size 4 --heads 1 --cases thd720p44s --batch-p2p --high-priority-group \
+  --ring-size 4 --heads 1 --cases thd720p44s --batch-p2p --forward-only-high-priority \
   --bwd-bucket-size backend --warmup 10 --repeats 50 --profile \
   --peak-tflops 2500 --output benchmark/results/ring4_720p44s/perf.json
 ```

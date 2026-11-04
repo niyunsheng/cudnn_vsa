@@ -239,8 +239,11 @@ layout = build_vsa_layout(
     ring_cp_group=group,
 )
 # tokens_global: [layout.ring.global_tokens, C], in sample/segment/FHW order.
+# position_ids_global: [T_global] or [T_global, axes], aligned with those tokens.
 tokens_local = to_block_order(tokens_global, vsa_layout=layout)
-positions_local = to_block_order(positions_global, vsa_layout=layout)
+position_ids_local = to_block_order(position_ids_global, vsa_layout=layout)
+# Build local RoPE cos/sin from position_ids_local; reuse across layers with
+# the same RoPE configuration. Preserve each sample's original position values.
 # Use the same helper for aligned target/mask tensors when needed.
 assert tokens_local.shape == (layout.tokens, tokens_global.shape[1])
 # Token-wise projections and all VSA layers now consume the local block order.

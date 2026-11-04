@@ -234,7 +234,7 @@ def test_ring_boundary_large_offsets(size, metadata_group):
     # Cover both flattened output offsets and source offsets beyond int32.
     if torch.cuda.mem_get_info()[0] < 8 * 2**30:
         pytest.skip("Large-offset regression requires 8 GiB free CUDA memory")
-    samples = ((Segment("text", 128),),)
+    samples = ((Segment("video", (1, 1, 128)),),)
     layout = build_vsa_layout(samples, head_num=1, input_order="block", device="cuda",
                               ring_cp_group=metadata_group(size, size - 1))
     x = torch.arange(128, device="cuda", dtype=torch.uint8)[:, None]

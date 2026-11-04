@@ -467,6 +467,9 @@ benchmark's `--forward-only-high-priority` creates the pair above.
 omitting both flags uses one ordinary-priority group. Both priority flags are
 mutually exclusive. A high-priority group also affects backward when reused
 there, even if backward P2P was already overlapped.
+The pooled collectives use synchronous APIs. Some PyTorch versions run them
+on the current CUDA stream, so their kernel priorities can differ from the
+group's asynchronous P2P stream. Inspect the captured nodes in the target build.
 Compare full forward/backward latency as well as trace overlap: communication
 still consumes SM and memory bandwidth, and pooled-mean collectives have their
 own data dependencies.

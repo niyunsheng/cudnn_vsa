@@ -66,10 +66,9 @@ def test_contiguous_planner_coverage_capacity_and_sample_boundaries(size):
     rng = random.Random(71 + size)
     for _ in range(80):
         total = rng.randint(size, size + 192)
-        sizes = [rng.randint(1, 64) for _ in range(total)]
         cuts = sorted({0, total, *[rng.randrange(total + 1) for _ in range(30)]})
         groups = [SampleBlocks(a, b, b-a, ()) for a, b in zip(cuts, cuts[1:])]
-        owned = _plan_ring_blocks(sizes, groups, size)
+        owned = _plan_ring_blocks(groups, size)
         assert sorted(b for ids in owned for b in ids) == list(range(total))
         assert all(0 < len(ids) <= (total + size - 1) // size for ids in owned)
         for ids in owned:
@@ -77,25 +76,32 @@ def test_contiguous_planner_coverage_capacity_and_sample_boundaries(size):
             for g in groups:
                 part = [b for b in ids if g.start <= b < g.end]
                 assert not part or part == list(range(part[0], part[-1] + 1))
-        assert _plan_ring_blocks(sizes, groups, size) == owned
+        for g in groups:
+            counts = [sum(g.start <= b < g.end for b in ids) for ids in owned]
+            cumulative = [sum(b < g.end for b in ids) for ids in owned]
+            assert max(counts) - min(counts) <= 1
+            assert max(cumulative) - min(cumulative) <= 1
+        assert _plan_ring_blocks(groups, size) == owned
 
 
-def test_next_sample_uses_cumulative_load_not_only_previous_sample():
+def test_next_sample_rotates_past_extra_blocks_and_keeps_start_without_remainder():
     groups = [SampleBlocks(a, b, b-a, ()) for a, b in [(0, 5), (5, 10), (10, 14)]]
-    owned = _plan_ring_blocks([64] * 14, groups, 4)
-    # A gives [1, 1, 1, 2] blocks; B starts on rank 0 and gives [2, 2, 1, 0].
-    # C starts on rank 2: it ties rank 3 in cumulative load and has a lower ID,
-    # although rank 3 received the fewest blocks in B alone.
-    assert owned == [[0, 5, 6], [1, 7, 8], [2, 9, 10, 11], [3, 4, 12, 13]]
+    # A's extra block goes to rank 0, B's to rank 1. C starts on rank 2
+    # and divides evenly, so a fourth sample still starts on rank 2.
+    assert _plan_ring_blocks(groups, 4) == [
+        [0, 1, 9, 12], [2, 5, 6, 13], [3, 7, 10], [4, 8, 11]]
+    groups.append(SampleBlocks(14, 15, 1, ()))
+    assert _plan_ring_blocks(groups, 4) == [
+        [0, 1, 9, 12], [2, 5, 6, 13], [3, 7, 10, 14], [4, 8, 11]]
 
 
-def test_partial_blocks_balance_valid_tokens_and_restore_rank_major_means(metadata_group):
+def test_partial_blocks_balance_block_counts_and_restore_rank_major_means(metadata_group):
     samples = [[Segment("video", (4, 6, 8), .5), Segment("text", 20)],
                [Segment("video", (1, 3, 5)), Segment("text", 7)]]
     layouts = [build_vsa_layout(samples, head_num=2, input_order="block",
                                 ring_cp_group=metadata_group(3, rank)) for rank in range(3)]
-    assert [x.ring.block_ids.tolist() for x in layouts] == [[0, 1, -1], [2, 5, -1], [3, 4, 6]]
-    assert [x.tokens for x in layouts] == [84, 79, 71]
+    assert [x.ring.block_ids.tolist() for x in layouts] == [[0, 1, 6], [2, 3, -1], [4, 5, -1]]
+    assert [x.tokens for x in layouts] == [91, 96, 47]
     # Synthetic means mark global IDs; the gather permutation discards dummy rows.
     gathered = torch.cat([x.ring.block_ids for x in layouts])
     for x in layouts:

@@ -2,7 +2,6 @@
 import math
 from bisect import bisect_left
 from dataclasses import dataclass, field
-from itertools import accumulate
 
 import torch
 import torch.distributed as dist
@@ -209,48 +208,24 @@ class VSALayout:
         return tuple(sum(r.stop-r.start for r in rows) for rows in self.sample_slices)
 
 
-def _plan_ring_blocks(sizes, groups, ring_size):
+def _plan_ring_blocks(groups, ring_size):
     """Give each sample at most one contiguous block interval per rank.
 
-    Visit ranks in cumulative valid-token load order (block count/rank break
-    ties). Choose the nearest prefix-balanced token boundary that fits the
-    remaining ranks' capacities. The hard ceil(total_blocks/R) cap preserves
-    communication size. Reserve data for ranks that have not received a block.
-    All choices use static host integers and are identical on every rank.
+    Split block counts evenly, rotating extra blocks across samples. The next
+    sample starts after the last extra-block recipient; no load search is
+    needed. Cumulative counts differ by at most one after every sample.
     """
-    total = len(sizes)
-    capacity = (total + ring_size - 1) // ring_size
-    prefix = [0, *accumulate(sizes)]
     owned = [[] for _ in range(ring_size)]
-    tokens = [0] * ring_size
-    empty = ring_size
+    first = 0
     for g in groups:
-        order = sorted(range(ring_size), key=lambda r: (tokens[r], len(owned[r]), r))
+        count, remainder = divmod(g.end - g.start, ring_size)
         cursor = g.start
-        remaining_capacity = sum(capacity - len(owned[r]) for r in order)
-        for rank in order:
-            if cursor == g.end:
-                break
-            remaining_capacity -= capacity - len(owned[rank])
-            lower = max(0, g.end - cursor - remaining_capacity)
-            first = not owned[rank]
-            upper = min(g.end - cursor, capacity - len(owned[rank]),
-                        total - cursor - (empty - int(first)))
-            # Give the next interval to the least-loaded eligible rank, even
-            # when its first block exceeds the ideal fractional token share.
-            if upper:
-                lower = max(lower, 1)
-            # Compare scaled integer token totals to avoid rounding-dependent cuts.
-            target = prefix[g.end] + ring_size * (prefix[cursor] - tokens[rank])
-            cut = bisect_left(prefix, (target + ring_size - 1) // ring_size,
-                              cursor + lower, cursor + upper + 1)
-            choices = {max(cursor + lower, min(cursor + upper, x)) for x in (cut-1, cut)}
-            end = min(choices, key=lambda x: (abs(ring_size * prefix[x] - target), -x))
-            if end > cursor:
-                owned[rank].extend(range(cursor, end))
-                tokens[rank] += prefix[end] - prefix[cursor]
-                empty -= int(first)
-                cursor = end
+        for step in range(ring_size):
+            rank = (first + step) % ring_size
+            end = cursor + count + (step < remainder)
+            owned[rank].extend(range(cursor, end))
+            cursor = end
+        first = (first + remainder) % ring_size
     return owned
 
 
@@ -273,7 +248,7 @@ def _finalize_layout(samples, global_rows, groups, sample_slices, *, head_num,
         total = len(global_rows)
         capacity = (total + ring_size - 1) // ring_size
         sizes = [len(rows) for rows in global_rows]
-        peer_ids = _plan_ring_blocks(sizes, groups, ring_size)
+        peer_ids = _plan_ring_blocks(groups, ring_size)
         owned = peer_ids[ring_rank]
         block_rows = [global_rows[bid] for bid in owned]
         block_rows += [[] for _ in range(capacity - len(owned))]
@@ -424,9 +399,11 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
     chooses each group's NCCL stream priority once during parallel initialization.
     Ring shards require input_order="block" and contain only valid owned-block
     rows without padding. Each sample contributes at most one contiguous block
-    interval per rank. Ranks with less cumulative valid-token load get earlier
-    intervals; cuts target balanced token totals within ceil(global_blocks/R)
-    blocks per rank. Ownership is explicit in ring.global_to_gather.
+    interval per rank, with block counts differing by at most one. Extra blocks
+    rotate across samples; the next sample starts after the last extra-block
+    recipient (or keeps the start if evenly divisible). Cumulative block counts
+    also differ by at most one. Valid token lengths do not affect ownership.
+    Ownership is explicit in ring.global_to_gather.
     The global block count must be at least ring_size, so every rank owns data.
     Individual samples may have fewer blocks; no divisibility is required.
     Reorder/distribute whole blocks at the dataset/model boundary. All attention

@@ -236,16 +236,18 @@ same order; outputs preserve it. Reuse the layout across layers.
 
 Plan blocks in the order described in **Input order**, numbering them across
 packed samples. For each sample, assign at most one **contiguous block interval**
-to each rank. Visit ranks by cumulative valid-token load from all earlier
-samples; ties use cumulative block count, then group rank. The least-loaded
-rank with remaining capacity receives the first interval. Choose each cut
-nearest to the cumulative per-rank token target, subject to the remaining
-ranks' capacity and reserving data for ranks that have not received a block.
-A rank can receive no blocks from an individual sample.
+to each rank. Start the first sample at rank 0. For a sample with N blocks,
+compute `base, extra = divmod(N, R)` and visit ranks cyclically from the
+current start. The first `extra` ranks receive `base + 1` consecutive blocks;
+the others receive `base`. Then advance the start by `extra` modulo R: the
+next sample starts at the first rank that received fewer blocks. If N is
+divisible by R, keep the start unchanged. A rank can receive no blocks from
+an individual sample.
 
-Every rank has a hard capacity of `C = ceil(global_blocks / R)` blocks. The
-planner therefore keeps the same communication-buffer size as an even
-block-count split while adjusting cuts for partial blocks and earlier samples.
+This rotation keeps both per-sample and cumulative block counts within one
+block of each other, without searching for the globally least-loaded rank.
+Every rank uses `C = ceil(global_blocks / R)` internal blocks. Valid token
+lengths do not affect ownership; partial blocks can produce unequal token loads.
 Each block stays within one segment and sample; samples remain isolated during
 routing and attention. Neither a sample's token count nor its block count
 needs to be a multiple of R. The total block count must be at least R; smaller
@@ -308,30 +310,27 @@ dataset/model boundary. The rank boxes contain **only valid input tokens**.
 flowchart LR
     A["Sample A: b0, b1, b2, b3, b4<br/>212 tokens"]
     B["Sample B: b5, b6<br/>22 tokens"]
-    R0["rank 0: b0 | b1<br/>84 tokens"]
-    R1["rank 1: b2 | b5<br/>79 tokens"]
-    R2["rank 2: b3 | b4 | b6<br/>71 tokens"]
+    R0["rank 0: b0 | b1 | b6<br/>91 tokens"]
+    R1["rank 1: b2 | b3<br/>96 tokens"]
+    R2["rank 2: b4 | b5<br/>47 tokens"]
     A -->|b0, b1| R0
-    A -->|b2| R1
-    A -->|b3, b4| R2
-    B -->|b5| R1
-    B -->|b6| R2
+    A -->|b2, b3| R1
+    A -->|b4| R2
+    B -->|b5| R2
+    B -->|b6| R0
 ```
 
 Each rank concatenates its blocks in increasing global-ID order, preserving
 valid-token order within each block. Rank 0 supplies 20 tokens from `b0`,
-then 64 from `b1`, with no gaps. After A, cumulative loads are `[84, 64, 64]`
-tokens and `[2, 1, 2]` blocks. B starts at `b5` on rank 1: it ties rank 2 in
-tokens but has fewer blocks. Rank 2 receives `b6`; rank 0 receives none of B.
-
-Rank 1 receives fewer blocks from A because the cuts target valid-token load.
-A's block sizes are `[20, 64, 64, 32, 32]`: cuts of `[2, 1, 2]` blocks give
-`[84, 64, 64]` tokens. Assigning `[2, 2, 1]` blocks would give `[84, 96, 32]`
-tokens. There is no rule that the final rank must receive the shortest block
-interval.
+then 64 from `b1` and 7 from `b6`, with no gaps. A starts at rank 0 and gives
+`[2, 2, 1]` blocks to ranks 0/1/2. B therefore starts at rank 2: it gives `b5`
+to rank 2 and `b6` to rank 0. The cumulative counts become `[3, 2, 2]`, and a
+third sample would start at rank 1. No token-load calculation or rank sorting
+is needed. A's partial blocks deliberately make the token totals unequal in
+this example; ownership balances block counts.
 
 Concatenating rank outputs in rank order gives blocks
-`[b0, b1, b2, b5, b3, b4, b6]`. To reconstruct global order, use the ownership
+`[b0, b1, b6, b2, b3, b4, b5]`. To reconstruct global order, use the ownership
 and row maps; `input_rows` gives each local row's destination in global raster
 order. A rank-order concatenation alone is insufficient for the full layout's
 inverse reorder helper.
@@ -340,9 +339,9 @@ Attention internally allocates `ceil(7 / 3) = 3` blocks of 64 slots per rank:
 
 | Group rank | Global block IDs in local slot order | Valid sizes per slot block | Compact input rows | Internal slot rows |
 | --- | --- | --- | ---: | ---: |
-| 0 | `b0, b1, dummy` | `20, 64, 0` | 84 | 192 |
-| 1 | `b2, b5, dummy` | `64, 15, 0` | 79 | 192 |
-| 2 | `b3, b4, b6` | `32, 32, 7` | 71 | 192 |
+| 0 | `b0, b1, b6` | `20, 64, 7` | 91 | 192 |
+| 1 | `b2, b3, dummy` | `64, 32, 0` | 96 | 192 |
+| 2 | `b4, b5, dummy` | `32, 15, 0` | 47 | 192 |
 
 Unused slots are zero-filled and excluded from attention and pooling. The
 caller supplies 234 valid tokens in total, not 576 slot rows. Q/K/V/gate and
@@ -396,7 +395,7 @@ Final global IDs:   [b0, b2, b4]   (b0 is the always-visible text block)
 ```
 
 For R=3, the peer lists are rank 0 `[0]` (global `b0`), rank 1 `[0]` (global
-`b2`) and rank 2 `[1]` (global `b4`). A Q block in sample A never considers B's
+`b2`) and rank 2 `[0]` (global `b4`). A Q block in sample A never considers B's
 `b5/b6`. With multiple video regions, each region gets its own top-k budget;
 there is no single top-k across all video regions in the pack.
 
@@ -439,8 +438,8 @@ flowchart LR
 | 2: after two hops | `Q0, KV1` | `Q1, KV2` | `Q2, KV0` |
 
 Each step evaluates only the selected KV blocks owned by that peer. For
-example, global `b5` maps to rank-major position 4: owner `4 // 3 = 1`,
-local block `4 % 3 = 1`. When rank 2 receives `KV1`, its B query block `b6`
+example, global `b5` maps to rank-major position 7: owner `7 // 3 = 2`,
+local block `7 % 3 = 1`. When rank 0 receives `KV2`, its B query block `b6`
 may attend to B's `b5`; its A query blocks cannot attend to `b5`. The **layout/router** enforce this
 sample isolation through the block lists. The **transport** just moves
 buffers; it does not interpret FHW coordinates or infer THD sample boundaries.
@@ -531,10 +530,10 @@ own data dependencies.
   padding out of the surrounding projections and MLPs.
 - **Keep each sample's local blocks contiguous.** Assigning a single interval
   per sample/rank preserves local block order and simplifies the dataset's
-  slicing. Carry cumulative valid-token loads across samples so later samples
-  favor less-loaded ranks. Adjust cuts within the fixed block capacity; partial
-  tiles can have very different valid lengths. Layout construction computes
-  one ownership map, reused by pooled gather, routing and every VSA layer.
+  slicing. Divide by block count and rotate the extra-block recipients across
+  samples. This balances cumulative block counts with a single carried start
+  rank, independent of partial-block lengths. Layout construction computes one
+  ownership map, reused by pooled gather, routing and every VSA layer.
 - **Keep global routing information small.** Local Q blocks need pooled K
   from candidate blocks across the full sample to preserve the per-region
   top-k budgets. Coarse attention also needs pooled K/V. Gathering one summary
@@ -552,11 +551,10 @@ The tradeoff is that fine attention circulates **whole padded K/V shards**,
 even when routing selects few blocks from a peer. Sparsity reduces attention
 work but does not proportionally reduce these transferred bytes. Pooled K/V
 is still gathered globally, and additional ranks add communication steps.
-The contiguous planner is a deterministic token-load heuristic under a hard
-block-capacity constraint. It does not guarantee equal token totals, equal
-attention work or higher MFU: sample lengths, sparsity and selected KV owners
-also affect compute and overlap. Benchmark the complete workload when changing
-its distribution policy.
+Balancing block counts does not guarantee equal valid token totals or attention
+work: partial blocks, sample lengths, sparsity and selected KV owners also
+affect compute and overlap. Benchmark the complete workload when changing its
+distribution policy.
 
 ## Attention semantics
 
@@ -664,14 +662,15 @@ work are outside this benchmark.
 | Text | 2048 tokens per sample |
 | Global packed tokens | 961696: video/text 956048, image/text 5648 |
 | Ring size / heads / head dimension | `4 / 1 / 128` |
-| Compact input tokens at Ring ranks 0/1/2/3 | `243664 / 242944 / 242944 / 232144` |
+| Compact input tokens at Ring ranks 0/1/2/3 | `243904 / 242880 / 242832 / 232080` |
 | Input order / precision | Compact block order / BF16 |
 
 One head is correct here: the model's 32 heads have already been divided by
 U32. Each Ring rank receives 232k–244k valid tokens for that head, averaging
-240,424. The contiguous planner's block-capacity constraint limits token
-balancing. These are token counts after the Ulysses exchange; input tensors
-have no padding, and VSA manages its internal 64-token attention slots.
+240,424. The ranks own `4051 / 4050 / 4050 / 4050` blocks; partial blocks
+account for the unequal valid token counts. These are token counts after the
+Ulysses exchange; input tensors have no padding, and VSA manages its internal
+64-token attention slots.
 
 ```bash
 # Full sequence on one GPU, with the same global inputs and block order.
@@ -704,20 +703,20 @@ FLOP counts match.
 
 | Phase | Ordinary ms | Ordinary TFLOP/s | Ordinary MFU | Ring4 ms | Ring4 TFLOP/s/GPU | Ring4 MFU | Parallel efficiency |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Forward | 66.591 | 637.39 | 25.50% | 15.853 | 669.37 | 26.77% | 105.02% |
-| Backward | 184.570 | 459.93 | 18.40% | 50.867 | 417.21 | 16.69% | 90.71% |
-| Forward + backward | 251.091 | 507.12 | 20.28% | 66.385 | 479.53 | 19.18% | 94.56% |
+| Forward | 66.134 | 641.80 | 25.67% | 16.086 | 659.66 | 26.39% | 102.78% |
+| Backward | 183.688 | 462.14 | 18.49% | 51.312 | 413.60 | 16.54% | 89.50% |
+| Forward + backward | 249.447 | 510.47 | 20.42% | 66.927 | 475.65 | 19.03% | 93.18% |
 
-Each run uses 10 warmups and 50 timed CUDA Graph replays, in ordinary / Ring4 /
-Ring4 / ordinary order. Ring timing takes the maximum rank latency for each
-replay; the table reports the median of each mode's two run medians. Phase
+Each mode has two runs of 10 warmups and 50 timed CUDA Graph replays. Ring
+timing takes the maximum rank latency for each replay; the table reports the
+median of each mode's two run medians. Phase
 medians are independent. MFU divides global valid attention GEMM FLOPs by
 latency and the GPU count times the 2500 TFLOP/s BF16 peak. Input
 sharding/reordering, graph capture and profiling are outside timing.
 
 With fixed global work, speedup is `T1 / T4` and parallel efficiency is
 `T1 / (4 * T4)`, equivalently `MFU4 / MFU1`. Here the full pass achieves
-**3.782x speedup and 94.56% efficiency**. This comparison includes
+**3.727x speedup and 93.18% efficiency**. This comparison includes
 communication, changes in kernel shape, extra accumulation and load imbalance;
 it does not isolate communication cost. Forward's slightly superlinear result
 does not imply zero communication overhead, and backward remains below ideal

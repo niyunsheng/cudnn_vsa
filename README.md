@@ -60,7 +60,7 @@ Add this directory to `PYTHONPATH`, or copy `vsa.py`, `vsa_core.py`,
 | `input_order` | Input tokens | Slot conversion |
 | --- | --- | --- |
 | `"raster"` (default) | Original sample/segment order, video in FHW order | Reorder into blocks and add padding |
-| `"block"` | Compact canonical blocks, no padding | Add padding only; skip copies for full blocks |
+| `"block"` | Valid tokens in the block order below, no padding | Add padding only; skip conversion when every local slot is valid |
 
 ### Raster input
 
@@ -70,25 +70,52 @@ restores the output to the same raster order. No preprocessing is required.
 
 ### Block input
 
-Pass `input_order="block"` to `build_vsa_layout` when the caller already
-supplies block-ordered tokens. Samples stay in declared order. Within each
-sample, dense segments come first in chunks of at most 64 tokens, followed by
-numeric-sparsity video segments in 4×4×4 tiles. Segment order is preserved
-within each category; blocks never cross segment or sample boundaries.
-`layout.input_rows[i]` gives the original raster row for supplied row `i`
-(an identity map for raster inputs). Apply the same ordering to Q/K/V, gate,
-positional coordinates and dO. Outputs and gradients preserve that order.
+`input_order="block"` describes the tokens that `vsa_attention` expects;
+setting the flag does not reorder a tensor. The global block order is:
+
+1. Keep samples in their declared order.
+2. Within each sample, put `sparsity=None` segments first, then numeric-sparsity
+   video segments. Preserve declared segment order within each category.
+   A dense image/video belongs to the first category; numeric `sparsity=0`
+   still belongs to the second.
+3. Split each None-sparsity segment into consecutive chunks of at most 64
+   tokens. For numeric-sparsity video, visit 4×4×4 tile origins in F/H/W order
+   (W changes fastest), then valid tokens within each tile in the same order.
+   Clip edge tiles to the actual dimensions; concatenate their valid tokens
+   without gaps. Blocks never cross segment or sample boundaries.
+
+A Ring input keeps only this rank's owned blocks, in increasing global block-ID
+order. Within each block, token order is unchanged. `layout.input_rows[i]`
+maps supplied row `i` to the original **global raster** row; a full raster
+layout has an identity map. Q/K/V, gate, position IDs and dO must all follow
+the supplied order. Outputs and input gradients preserve it.
+
+For example, declare `video=(1, 2, 5), sparsity=0.9`, followed by three text
+tokens. Number the original raster rows `0..12`: video rows are `0..9`, and
+text rows are `10..12`. The compact block stream is:
+
+| Block | Original raster rows, in supplied order | Valid tokens |
+| --- | --- | ---: |
+| b0: text | `10, 11, 12` | 3 |
+| b1: first video tile | `0, 1, 2, 3, 5, 6, 7, 8` | 8 |
+| b2: edge video tile | `4, 9` | 2 |
+
+For a full layout, the input has 13 rows and attention allocates 3×64 slots.
+With `sparsity=None` on that video, both segments are dense: video stays before
+text, giving blocks of 10 and 3 tokens in the original raster order.
 
 For raster data, call `to_block_order` once before the entire VSA stack.
 This repository provides the fused reorder kernel separately from
-`vsa_attention`: it permutes one token tensor in one kernel launch,
-preserving its shape and dtype and adding **no padding**. Inputs that are
+`vsa_attention`: it gathers rows from one token tensor in one kernel launch,
+preserving dtype and trailing dimensions and adding **no padding**. Inputs
 already in block order go directly to attention. Keep that order across layers.
 
 `to_block_order(x, vsa_layout=layout)` accepts one contiguous CUDA
 `[T_global, ...]` raster tensor. A full layout returns all rows in block order;
-a Ring layout selects and reorders only this rank's rows in one kernel,
-returning `[layout.tokens, ...]`. Both preserve dtype and trailing dimensions.
+a Ring layout selects and reorders only this rank's rows, returning
+`[layout.tokens, ...]`. Full layouts preserve the first dimension; Ring layouts
+use the local valid-token count. In both cases the result equals
+`x[layout.input_rows]` by value.
 The inverse `to_raster_order(x, vsa_layout=layout)` requires a **full** layout.
 Both helpers require `input_order="block"`: the layout describes the target
 block order even when `x` enters in raster order.
@@ -108,13 +135,13 @@ layout = build_vsa_layout(
     [[Segment("video", (5, 9, 11), sparsity=0.9), Segment("text", 67)]],
     head_num=H, input_order="block", device="cuda",
 )
-tokens = torch.randn(layout.tokens, C, device="cuda", dtype=torch.bfloat16,
-                     requires_grad=True)
+tokens_raster = torch.randn(layout.tokens, C, device="cuda", dtype=torch.bfloat16,
+                            requires_grad=True)
 projection = torch.nn.Linear(C, 4 * H * D, device="cuda", dtype=torch.bfloat16)
 
 # One reorder at the input boundary, before the layers' projections.
-tokens_block = to_block_order(tokens, vsa_layout=layout)
-assert tokens_block.shape == tokens.shape  # 562 valid tokens, no input padding.
+tokens_block = to_block_order(tokens_raster, vsa_layout=layout)
+assert tokens_block.shape == tokens_raster.shape  # Full layout: 562 valid tokens.
 
 # One example VSA layer; intermediate layers retain block order.
 projected = projection(tokens_block).view(layout.tokens, 4, H, D)
@@ -126,14 +153,19 @@ out_raster = to_raster_order(out, vsa_layout=layout)
 out_raster.backward(torch.randn_like(out_raster))
 ```
 
-The reorder's backward applies the inverse permutation to gradients. The
-inverse helper restores original sample/segment/FHW order after the stack.
+For this full layout, backward applies the inverse permutation, and
+`to_raster_order` restores the original sample/segment/FHW order after the
+stack. For a Ring layout, backward scatters to the global raster shape with
+zeros at unowned rows; it performs no cross-rank reduction. Restoring a full
+Ring output requires caller-owned communication; `to_raster_order` accepts
+only full layouts.
 
 Internally, blocks occupy 64 slots: `slot_row` maps slots to input rows, using
 `-1` for padding, and `row_slot` is the inverse map for valid rows. Block inputs
 use fused Q/K/V padding and fused dQ/dK/dV restoration; padding is zero and
-excluded from means and attention. `slots_are_input` skips conversion for
-full block inputs. Full raster blocks still require the FHW permutation.
+excluded from means and attention. `slots_are_input` skips conversion only
+for block inputs with `tokens == blocks * 64`, with no partial or dummy blocks.
+Raster inputs use the raster-to-slot path even when all blocks are full.
 
 ## Code structure
 
@@ -238,7 +270,7 @@ layout = build_vsa_layout(
     samples, head_num=H, input_order="block", device="cuda",
     ring_cp_group=group,
 )
-# tokens_global: [layout.ring.global_tokens, C], in sample/segment/FHW order.
+# tokens_global: [layout.ring.global_tokens, hidden_size], in sample/segment/FHW order.
 # position_ids_global: [T_global] or [T_global, axes], aligned with those tokens.
 tokens_local = to_block_order(tokens_global, vsa_layout=layout)
 position_ids_local = to_block_order(position_ids_global, vsa_layout=layout)
@@ -291,6 +323,18 @@ valid-token order within each block. Rank 0 supplies 20 tokens from `b0`,
 then 64 from `b1`, with no gaps. After A, cumulative loads are `[84, 64, 64]`
 tokens and `[2, 1, 2]` blocks. B starts at `b5` on rank 1: it ties rank 2 in
 tokens but has fewer blocks. Rank 2 receives `b6`; rank 0 receives none of B.
+
+Rank 1 receives fewer blocks from A because the cuts target valid-token load.
+A's block sizes are `[20, 64, 64, 32, 32]`: cuts of `[2, 1, 2]` blocks give
+`[84, 64, 64]` tokens. Assigning `[2, 2, 1]` blocks would give `[84, 96, 32]`
+tokens. There is no rule that the final rank must receive the shortest block
+interval.
+
+Concatenating rank outputs in rank order gives blocks
+`[b0, b1, b2, b5, b3, b4, b6]`. To reconstruct global order, use the ownership
+and row maps; `input_rows` gives each local row's destination in global raster
+order. A rank-order concatenation alone is insufficient for the full layout's
+inverse reorder helper.
 
 Attention internally allocates `ceil(7 / 3) = 3` blocks of 64 slots per rank:
 
@@ -412,8 +456,9 @@ of the fine top-k lists. `vsa_attention` restores compact valid rows and merges
 
 Backward traverses the ring in reverse, using the final fine output and
 log-sum-exp, and accumulates dQ/dK/dV in FP32. The pooled-mean gather has a
-reduce-scatter adjoint. Empty or fine-only peers still participate in the
-required collectives; saved receive buffers support retained-graph backward.
+reduce-scatter adjoint. Ranks without local coarse queries still participate
+in the required collectives; saved receive buffers support retained-graph
+backward.
 
 Set transport options on `build_vsa_layout`, alongside `ring_cp_group`.
 `ring_cp_batch_p2p=None` uses individual P2P for lazy NCCL groups and batched
@@ -533,7 +578,8 @@ adds a query-side exception: dense queries see **all** KV blocks.
 video KV sparsity to every query. Dense queries come from `sparsity=None` regions.
 
 Example fine masks for one sample/head at sparsity 0.5. Both axes follow the
-internal block order: **dense first, video second**. `■` visible; `□` masked.
+internal block order: **None-sparsity segments first, numeric-sparsity video
+segments second**. `■` visible; `□` masked.
 Top-k selections are illustrative.
 
 **`dense_query_full=False` (default)**
@@ -618,13 +664,14 @@ work are outside this benchmark.
 | Text | 2048 tokens per sample |
 | Global packed tokens | 961696: video/text 956048, image/text 5648 |
 | Ring size / heads / head dimension | `4 / 1 / 128` |
-| Compact input tokens at Ring ranks 0/1/2/3 | `240436 / 240420 / 240420 / 240420` |
+| Compact input tokens at Ring ranks 0/1/2/3 | `243664 / 242944 / 242944 / 232144` |
 | Input order / precision | Compact block order / BF16 |
 
 One head is correct here: the model's 32 heads have already been divided by
-U32. Each Ring rank therefore receives about 240k tokens for that head,
-not the approximately 7.5k rows before the Ulysses exchange. Input tensors
-have no padding; VSA manages its internal 64-token attention slots.
+U32. Each Ring rank receives 232k–244k valid tokens for that head, averaging
+240,424. The contiguous planner's block-capacity constraint limits token
+balancing. These are token counts after the Ulysses exchange; input tensors
+have no padding, and VSA manages its internal 64-token attention slots.
 
 ```bash
 # Full sequence on one GPU, with the same global inputs and block order.

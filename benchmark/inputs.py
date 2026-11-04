@@ -29,13 +29,6 @@ CASES = {
         (Segment("video", (12, 48, 64), .9), Segment("text", 2048)),
         (Segment("video", (8, 40, 64), .9), Segment("text", 2048)),
         (Segment("video", (1, 32, 64)), Segment("text", 2048))),
-    # 720p, 30 s at 24 fps: 721 frames -> 181 temporal latents;
-    # spatial VAE compression 8 and 2x2 patches give 45x80 token rows.
-    "single720p30s": (
-        (Segment("video", (181, 45, 80), .9), Segment("text", 2048)),),
-    "thd720p30s": (
-        (Segment("video", (181, 45, 80), .9), Segment("text", 2048)),
-        (Segment("video", (1, 45, 80)), Segment("text", 2048))),
     # Match the DiT 720p44s U32/R4 attention shape after the Ulysses exchange:
     # one video, one independent image and two text segments, 961696 tokens.
     "thd720p44s": (

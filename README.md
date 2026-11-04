@@ -426,9 +426,8 @@ integer to select a bucket size.
 
 ### Forward communication overlap
 
-To use high-priority forward communication and ordinary-priority backward
-communication, create two NCCL groups once during parallel initialization.
-Reuse the pair across layouts and layers:
+To give Ring P2P communication a high-priority NCCL stream, create the group
+once during parallel initialization. Reuse it across layouts and layers:
 
 ```python
 import torch.distributed as dist
@@ -436,23 +435,22 @@ import torch.distributed as dist
 # Call on all WORLD ranks in the same group-creation order, before building layouts.
 options = dist.ProcessGroupNCCL.Options()
 options.is_high_priority_stream = True
-forward_group = dist.new_group(ranks=ring_ranks, backend="nccl", pg_options=options)
-backward_options = dist.ProcessGroupNCCL.Options()
-backward_options.is_high_priority_stream = False
-backward_group = dist.new_group(ranks=ring_ranks, backend="nccl", pg_options=backward_options)
-# Member ranks construct their layouts with the same pair for every micro-batch.
+group = dist.new_group(ranks=ring_ranks, backend="nccl", pg_options=options)
+# Member ranks reuse this group for every micro-batch's layout.
 layout = build_vsa_layout(
     samples, head_num=H, input_order="block", device="cuda",
-    ring_cp_group=forward_group, ring_cp_bwd_group=backward_group,
+    ring_cp_group=group,
 )
 out = vsa_attention(q, k, v, gate, layout)
 ```
 
-Forward pooled all-gather and fine KV P2P use `forward_group`; backward fine
-P2P and pooled-gradient reduce-scatter use `backward_group`. Leaving
-`ring_cp_bwd_group=None` reuses the forward group, preserving the original
-single-group behavior. VSA borrows both handles; the caller owns creation and
-destruction and keeps them alive through backward and CUDA Graph replay.
+Forward and backward use the same group by default. To choose a different
+backward NCCL stream priority, create a second group with the same members
+and rank order, then pass it as `ring_cp_bwd_group`. Forward pooled all-gather
+and fine KV P2P use `ring_cp_group`; backward fine P2P and pooled-gradient
+reduce-scatter use `ring_cp_bwd_group`. VSA borrows the handles; the caller
+owns creation and destruction and keeps them alive through backward and
+CUDA Graph replay.
 
 Enqueuing P2P before BSA does not guarantee that its GPU kernel starts first.
 BSA and NCCL can compete for SM resources, including shared memory. With
@@ -465,11 +463,12 @@ check this in the PyTorch build used for training.
 Priority belongs to the process group's internal NCCL stream. Changing only
 the stream around `isend`/`irecv` is insufficient. VSA borrows the supplied
 groups and does not replace them or modify global scheduling settings. The
-benchmark's `--forward-only-high-priority` creates the pair above.
-`--high-priority-group` instead uses one high-priority group in both directions;
-omitting both flags uses one ordinary-priority group. Both priority flags are
-mutually exclusive. A high-priority group also affects backward when reused
-there, even if backward P2P was already overlapped.
+benchmark's `--high-priority-group` uses the configuration above.
+`--forward-only-high-priority` creates a high-priority forward group and an
+ordinary-priority backward group; omitting both flags uses one
+ordinary-priority group. The flags are mutually exclusive. A high-priority
+group also affects backward when reused there, even if backward P2P was
+already overlapped.
 The pooled collectives use synchronous APIs. Some PyTorch versions run them
 on the current CUDA stream, so their kernel priorities can differ from the
 group's asynchronous P2P stream. Inspect the captured nodes in the target build.
@@ -625,7 +624,7 @@ have no padding; VSA manages its internal 64-token attention slots.
 
 ```bash
 torchrun --standalone --nproc-per-node=4 --module benchmark.perf_vsa --ring \
-  --ring-size 4 --heads 1 --cases thd720p44s --batch-p2p --forward-only-high-priority \
+  --ring-size 4 --heads 1 --cases thd720p44s --batch-p2p --high-priority-group \
   --bwd-bucket-size backend --warmup 10 --repeats 50 --profile \
   --peak-tflops 2500 --output benchmark/results/ring4_720p44s/perf.json
 ```
@@ -703,7 +702,7 @@ torchrun --standalone --nproc-per-node=4 --module benchmark.perf_vsa --ring \
 # Single/packed 64k workloads, plus timing after numerical checks.
 torchrun --standalone --nproc-per-node=8 --module benchmark.perf_vsa --ring \
   --high-priority-group --cases single64k thd64k --warmup 30 --repeats 500
-# Strict reproduction of the known fine-only-sample precision limit.
+# Strict reproduction of the known fine-only-sample numerical failure.
 torchrun --standalone --nproc-per-node=8 --module benchmark.perf_vsa --ring \
   --ring-size 2 --cases fine_only_peer --check-only
 ```
@@ -717,14 +716,12 @@ nodes, replace `--standalone` with the usual torchrun rendezvous arguments.
 Each JSON result records numerical/graph checks and source hashes. Distributed
 timing takes the maximum latency across ranks for each replay; per-GPU MFU
 divides global valid attention GEMM FLOPs by that time and R times the dense
-BF16 GPU peak. Optional `single720p30s` and `thd720p30s` cases use a
-`181x45x80` video grid with 2048 text tokens; the packed case adds one dense
-image with its own text.
+BF16 GPU peak. Use `thd720p44s` for the long-sequence profile described above.
 
-The strict `fine_only_peer` case has a known BF16 precision limitation: dK
-for a six-token fine-only sample can fall below the unchanged 0.99999 native
-reference similarity threshold. The command above reports failure when it
-reproduces the limit. This case remains part of the validation surface.
+The strict BF16 `fine_only_peer` case has an unresolved numerical failure:
+dQ and dK for a six-token fine-only sample can fall below the 0.99999 native
+reference similarity threshold. The command above reports this failure;
+the case and threshold remain unchanged.
 
 [MIT License](LICENSE).
 

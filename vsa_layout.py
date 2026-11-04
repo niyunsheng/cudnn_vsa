@@ -79,7 +79,6 @@ class _RingMetadata:
     rank: int
     batch_p2p: bool | None
     bwd_bucket_size: str | int | None
-    global_blocks: int
     global_tokens: int
     # Sample, local query begin/end, local dense-query end.
     local_groups: tuple[tuple[SampleBlocks, int, int, int], ...]
@@ -243,7 +242,6 @@ def _finalize_layout(samples, global_rows, groups, sample_slices, *, head_num,
 
     ring = None
     block_rows = global_rows
-    local_groups = [(g, g.start, g.end, g.start + g.dense_blocks_num) for g in groups]
     if ring_size is not None:
         total = len(global_rows)
         capacity = (total + ring_size - 1) // ring_size
@@ -267,13 +265,15 @@ def _finalize_layout(samples, global_rows, groups, sample_slices, *, head_num,
         ring = _RingMetadata(
             group=ring_cp_group, bwd_group=ring_cp_bwd_group, batch_p2p=ring_cp_batch_p2p,
             bwd_bucket_size=ring_cp_bwd_bucket_size,
-            size=ring_size, rank=ring_rank, global_blocks=total, global_tokens=sum(sizes),
+            size=ring_size, rank=ring_rank, global_tokens=sum(sizes),
             local_groups=tuple(local_groups),
             block_ids=tensor(owned + [-1] * (capacity - len(owned))),
             # Each peer slice needs a 16-byte-aligned base for the CuTe frontend.
             peer_block_sizes=tensor([row + [0] * (-capacity % 4) for row in peer_sizes],
                                     torch.int32)[:, :capacity],
             global_to_gather=tensor(global_to_gather))
+    else:
+        local_groups = [(g, g.start, g.end, g.start + g.dense_blocks_num) for g in groups]
     token_count = sum(map(len, block_rows))
     input_rows = (list(range(token_count)) if input_order == "raster" else
                   [row for rows in block_rows for row in rows])

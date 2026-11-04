@@ -191,41 +191,28 @@ layout = build_vsa_layout(
 out = vsa_attention(q, k, v, gate, layout)
 ```
 
-Pass the existing process group when constructing the layout. Rank and size
-come from that group; they are not separate builder arguments. Forward and
-backward use the bound groups without additional Ring arguments. By default,
-both use `ring_cp_group`. Optionally pass `ring_cp_bwd_group` to use another
-caller-owned group for backward P2P and pooled-gradient reduce-scatter. Its
-members and group-rank order must match the forward group; mismatches are
-rejected when constructing the layout.
-All group ranks use identical global sample/segment metadata and the same
-heads. Layout rank and size refer to that group, including interleaved groups.
-The caller creates the group once during parallel initialization and owns its
-lifetime. Different micro-batches can build different layouts referencing the
-same group or pair of groups. Constructing or releasing a layout never creates or destroys a
-process group. Reuse a layout when geometry, policy, heads and device match.
+`build_vsa_layout` returns `VSALayout` in both modes. `ring_cp_group=None`
+builds a full layout (`layout.ring is None`) without distributed initialization,
+including on CPU. A member process group builds a local Ring shard, including
+size-one groups, and requires `input_order="block"`. Rank and size come from
+the supplied group; nonmember handles are rejected.
 
-`build_vsa_layout` is the only public layout builder. `ring_cp_group=None`
-builds a full input (`layout.ring is None`); a member `ProcessGroup` builds a
-local shard with its group reference and distribution metadata in `layout.ring`.
-Both return `VSALayout`. A size-one group still builds a Ring shard.
-Ring construction requires `input_order="block"`; full layouts default to
-`"raster"`.
-Full layouts work on CPU without distributed initialization; Ring layouts
-require the caller's existing group. Nonmember group handles are rejected.
-`to_block_order` accepts both full and Ring block layouts. `to_raster_order`
-requires a full layout; it does not implicitly gather distributed outputs.
+All group ranks supply identical global sample geometry and head counts.
+Create groups once during parallel initialization and share them across
+micro-batch layouts; layers reuse each layout. VSA borrows group handles and
+never creates or destroys them. Forward and backward share `ring_cp_group`
+by default. Optional `ring_cp_bwd_group` must have identical members and rank
+order. Groups and transport options are bound at construction; keep the groups
+alive through backward and CUDA Graph replay. See **Forward communication
+overlap** for stream-priority configuration.
 
-Full inputs and Ring shards share slot maps, routing-template construction and
-coarse Q/KV metadata. `tokens`, `blocks` and row/slot maps describe the input
-held locally; `groups`, `sample_slices` and `sample_lengths` describe global
-samples. `layout.ring` holds `group`, `bwd_group`, group-local `size`/`rank`, global counts, block
-ownership, peer lengths and the all-gather permutation. Coarse Q boundaries
-are local and KV boundaries cover the corresponding global samples; full
-layouts share the same Q/KV boundary and block-ID tensors. This metadata
-unification preserves the separate single-device and Ring execution paths.
-The groups and transport options are bound at construction and cannot be
-reassigned on Ring metadata.
+Full layouts and Ring shards share slot maps, routing templates and coarse
+metadata. `tokens`, `blocks` and row/slot maps describe local input;
+`groups`, `sample_slices` and `sample_lengths` describe global samples.
+`layout.ring` holds the bound groups, local rank/size, global token count,
+block ownership, peer lengths and all-gather permutation. Coarse Q boundaries
+are local; KV boundaries cover the corresponding global samples. Full layouts
+share their Q/KV boundary and block-ID tensors.
 
 ### Compact input and block ownership
 
@@ -412,13 +399,6 @@ communication autograd boundary; backward combines dK/dV into one FP32
 reduce-scatter SUM and returns FP32 gradients to pooling. Forward pooled K/V
 payload is 25% smaller than sending both in FP32; the forward and backward
 collective counts remain one each. End-to-end latency must still be measured.
-
-Pool local Q/K/V in FP32 and all-gather pooled K/V for global per-region top-k
-routing and coarse attention. Fine attention keeps Q local and circulates
-BF16 K/V shards. Selected global block IDs are partitioned by owner and
-translated into local slot IDs; partial outputs and log-sum-exp are merged
-in FP32. Fine-attention kernels use these IDs and valid block sizes; the
-layout and router enforce sample boundaries and KV budgets.
 
 For the example above, let `KV_r` be rank r's entire internal K/V shard,
 including its slot padding. Q stays on its original rank throughout fine
@@ -614,6 +594,30 @@ handled; a dense image inside a VSA sample still participates in coarse.
 
 ## Performance
 
+MFU counts valid attention GEMM FLOPs; backward is twice forward. Padding,
+routing and non-GEMM operations are excluded from the FLOP numerator. Per-GPU
+TFLOP/s divides global FLOPs by latency and GPU count; MFU divides that value
+by the dense BF16 peak (`--peak-tflops`). Phase medians are independent.
+One-time input sharding/reordering, graph capture and profiling are outside
+timing; attention's slot conversion and padding are included.
+
+Environment: GB200 (2500 TFLOP/s BF16), PyTorch 2.12.0a0/NV26.04, CUDA 13.2, cuDNN 9.22 / frontend 1.28.0, Triton 3.6, CuTe 4.6.2, FA4 4.0.0b35.
+
+`benchmark.perf_vsa` supports ordinary and distributed workloads (`--ring`).
+Both modes share input generation, numerical checks, graph capture and timing.
+`--cases` selects workloads, `--heads` selects head counts, `--check-only` runs
+reference and retained-backward checks, and `--output` accepts a JSON file or
+directory. The `vsa-perf/v4` JSON uses `<case>-h<heads>` keys; each case records
+checks, global useful FLOPs and per-GPU throughput/MFU. Ring timing samples are
+reduced across ranks before summarizing. Ring defaults to H=2 and omits traces;
+add `--profile` to save a trace per rank.
+Use the same explicit `--seed` in both modes when comparing performance:
+the defaults are 2026 for ordinary VSA and 937 for Ring. Matched seeds,
+geometry and head counts generate identical global Q/K/V/gate tensors and
+upstream output gradients (dY).
+
+### Single-device 720p5s: FA4 full and VSA
+
 The benchmark packs one 720p 5-second video and two independent 720p images,
 each with text: 121 video frames, 4× temporal and 16× spatial compression,
 2048 text tokens per sample, 124944 tokens total, H=2/4, D=128, video sparsity
@@ -626,26 +630,25 @@ python -m benchmark.perf_vsa --peak-tflops 2500
 python -m benchmark.compare --peak-tflops 2500 --warmup 30 --repeats 500 --rounds 2
 ```
 
-Both use CUDA Graph and validate replay against eager execution. Timing covers
-packing, pooling, routing, fine, coarse, restoration and merge.
+Both use CUDA Graph and validate replay against eager execution. VSA timing
+covers slot conversion, pooling, routing, fine, coarse, restoration and merge.
 `benchmark/results/perf_vsa/` contains `perf.json` and
 `perf-default-h{2,4}-rank0.trace.json`; traces are collected after timing.
 Use `--input-order block` to measure compact block inputs, `--eager` for eager
 execution, or `--no-profile` to omit traces. Input generation/reordering is
 outside timing. The comparison writes `benchmark/results/compare.json`.
 
-`benchmark.perf_vsa` also runs distributed workloads with `--ring` (commands
-below). Both modes share input generation, numerical checks, graph capture and
-timing. `--cases` selects workloads, `--heads` selects one or more head counts, `--check-only`
-runs reference and retained-backward checks, and `--output` accepts a JSON file
-or directory. The `vsa-perf/v4` JSON uses `<case>-h<heads>` keys; each case records
-checks, global useful FLOPs and per-GPU throughput/MFU. Ring timing samples are
-reduced across ranks before summarizing. Ring defaults to H=2 and omits traces;
-add `--profile` to save a trace per rank.
-Use the same explicit `--seed` in both modes when comparing performance:
-the defaults are 2026 for ordinary VSA and 937 for Ring. Matched seeds,
-geometry and head counts generate identical global Q/K/V/gate tensors and
-upstream output gradients (dY).
+| Method | H | Forward ms | Forward MFU | Backward ms | Backward MFU | F+B ms | F+B TFLOP/s | F+B MFU |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| FA4 full | 2 | 9.357 | 56.82% | 25.409 | 41.85% | 34.772 | 1146.72 | 45.87% |
+| cuDNN VSA (raster) | 2 | 2.366 | 24.81% | 6.746 | 17.40% | 9.114 | 482.91 | 19.32% |
+| FA4 full | 4 | 19.001 | 55.96% | 50.988 | 41.71% | 70.019 | 1138.94 | 45.56% |
+| cuDNN VSA (raster) | 4 | 4.665 | 25.15% | 13.352 | 17.57% | 18.017 | 488.36 | 19.53% |
+
+CUDA Graph, 30 warmups per measurement, two rounds of 500 timed replays per
+method. FA4 full and VSA alternate order on the same GPU. Each time column is
+an independent median over 1000 replays. These are standalone operator
+measurements; raster-to-slot reordering and padding are included in VSA time.
 
 ### Single-head 720p44s: ordinary VSA and Ring4
 
@@ -694,62 +697,38 @@ timed samples. JSON reports phase latency, TFLOP/s/GPU and MFU together.
 Inputs are seeded random tensors; matching geometry does not reproduce a
 particular model layer's routing decisions.
 
-Measured in one four-GB200 allocation with the software environment listed
-below. Ordinary VSA runs the full sequence on one GPU without a process
-group; Ring4 uses all four GPUs with the high-priority group and
+Measured in one four-GB200 allocation with the software environment above.
+Ordinary VSA runs the full sequence on one GPU without a process group;
+Ring4 uses all four GPUs with the high-priority group and
 backend-default backward buckets above. Both use **961,696 global tokens,
 H=1, D=128, compact block input and seed 937**. Global input hashes and useful
 FLOP counts match.
 
 | Phase | Ordinary ms | Ordinary TFLOP/s | Ordinary MFU | Ring4 ms | Ring4 TFLOP/s/GPU | Ring4 MFU | Parallel efficiency |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Forward | 66.134 | 641.80 | 25.67% | 16.086 | 659.66 | 26.39% | 102.78% |
-| Backward | 183.688 | 462.14 | 18.49% | 51.312 | 413.60 | 16.54% | 89.50% |
-| Forward + backward | 249.447 | 510.47 | 20.42% | 66.927 | 475.65 | 19.03% | 93.18% |
+| Forward | 58.193 | 729.38 | 29.18% | 15.556 | 682.14 | 27.29% | 93.52% |
+| Backward | 179.412 | 473.15 | 18.93% | 50.403 | 421.05 | 16.84% | 88.99% |
+| Forward + backward | 237.707 | 535.68 | 21.43% | 65.210 | 488.17 | 19.53% | 91.13% |
 
 Each mode has two runs of 10 warmups and 50 timed CUDA Graph replays. Ring
 timing takes the maximum rank latency for each replay; the table reports the
-median of each mode's two run medians. Phase
-medians are independent. MFU divides global valid attention GEMM FLOPs by
-latency and the GPU count times the 2500 TFLOP/s BF16 peak. Input
-sharding/reordering, graph capture and profiling are outside timing.
+median of each mode's two run medians.
 
 With fixed global work, speedup is `T1 / T4` and parallel efficiency is
 `T1 / (4 * T4)`, equivalently `MFU4 / MFU1`. Here the full pass achieves
-**3.727x speedup and 93.18% efficiency**. This comparison includes
+**3.645x speedup and 91.13% efficiency**. This comparison includes
 communication, changes in kernel shape, extra accumulation and load imbalance;
-it does not isolate communication cost. Forward's slightly superlinear result
-does not imply zero communication overhead, and backward remains below ideal
-scaling.
+it does not isolate communication cost. P2P overlap alone does not establish
+zero communication overhead.
 
 The example uses four GPUs on one host. To measure a Ring spanning hosts,
-use one process per host and the normal torchrun rendezvous arguments,
+use one process per GPU and the normal torchrun rendezvous arguments,
 keeping the same benchmark flags. Record the actual fabric placement:
 single-host NVLink overlap is not representative of a Ring crossing NVLink
 domains, and a four-GPU run does not reproduce 32 concurrent Ring groups.
 Standalone useful-FLOP MFU counts valid attention pairs only; the DiT model
 ledger also includes projections/MoE and counts physical fine-attention
 block slots, so their MFU values have different numerators.
-
-### FLOP accounting and single-device measurements
-
-MFU counts each method's valid attention GEMM FLOPs; backward is twice forward.
-Padding, routing and non-GEMM operations are excluded from the FLOP numerator.
-Set `--peak-tflops` to your GPU's dense BF16 peak.
-
-Environment: GB200 (2500 TFLOP/s BF16), PyTorch 2.12.0a0/NV26.04, CUDA 13.2, cuDNN 9.22 / frontend 1.28.0, Triton 3.6, CuTe 4.6.2, FA4 4.0.0b35.
-
-| Method | H | Forward ms | Forward MFU | Backward ms | Backward MFU | F+B ms | F+B MFU |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| FA4 full | 2 | 9.319 | 57.05% | 25.652 | 41.45% | 34.959 | 45.62% |
-| cuDNN VSA (raster) | 2 | 2.364 | 24.83% | 6.753 | 17.38% | 9.117 | 19.31% |
-| FA4 full | 4 | 18.790 | 56.59% | 51.389 | 41.38% | 70.210 | 45.43% |
-| cuDNN VSA (raster) | 4 | 4.726 | 24.82% | 13.444 | 17.45% | 18.164 | 19.38% |
-
-CUDA Graph, 30 warmups per measurement, two rounds of 500 timed replays per
-method. FA4 full and VSA alternate order on the same GPU. Each time column is
-an independent median over 1000 replays. These are standalone operator
-measurements; raster-to-slot reordering and padding are included in VSA time.
 
 ## Tests
 

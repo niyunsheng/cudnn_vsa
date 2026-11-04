@@ -638,6 +638,22 @@ timed samples. JSON reports phase latency, TFLOP/s/GPU and MFU together.
 Inputs are seeded random tensors; matching geometry does not reproduce a
 particular model layer's routing decisions.
 
+Measured on four GB200 GPUs with the software environment listed below,
+using the high-priority group and backend-default backward buckets above:
+
+| Phase | Latency ms | TFLOP/s/GPU | MFU |
+|---|---:|---:|---:|
+| Forward | 16.035 | 661.77 | 26.47% |
+| Backward | 51.617 | 411.15 | 16.45% |
+| Forward + backward | 66.789 | 476.63 | 19.07% |
+
+These results use **961,696 global tokens, H=1, D=128 and Ring=4**. Each of
+two runs uses 10 warmups and 50 timed CUDA Graph replays. Each replay takes
+the maximum latency across ranks; the table reports the median of the two
+run medians. Phase medians are independent. MFU divides global valid
+attention GEMM FLOPs by latency and four times the 2500 TFLOP/s BF16 peak.
+Input sharding/reordering, graph capture and profiling are outside timing.
+
 The example uses four GPUs on one host. To measure a Ring spanning hosts,
 use one process per host and the normal torchrun rendezvous arguments,
 keeping the same benchmark flags. Record the actual fabric placement:

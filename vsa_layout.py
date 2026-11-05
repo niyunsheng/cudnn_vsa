@@ -77,6 +77,7 @@ class _RingMetadata:
     bwd_group: dist.ProcessGroup = field(repr=False)
     size: int
     rank: int
+    partition: str
     batch_p2p: bool | None
     bwd_bucket_size: str | int | None
     global_tokens: int
@@ -207,14 +208,21 @@ class VSALayout:
         return tuple(sum(r.stop-r.start for r in rows) for rows in self.sample_slices)
 
 
-def _plan_ring_blocks(groups, ring_size):
-    """Give each sample at most one contiguous block interval per rank.
+def _plan_ring_blocks(groups, ring_size, partition="cyclic"):
+    """Assign global blocks with cyclic or per-sample contiguous ownership.
 
-    Split block counts evenly, rotating extra blocks across samples. The next
-    sample starts after the last extra-block recipient; no load search is
-    needed. Cumulative counts differ by at most one after every sample.
+    Both policies balance per-sample and cumulative block counts within one.
+    Cyclic ownership uses global block IDs, without restarting at sample edges.
+    Contiguous ownership rotates extra blocks across samples.
     """
+    if partition not in ("cyclic", "contiguous"):
+        raise ValueError('ring_partition must be "cyclic" or "contiguous"')
     owned = [[] for _ in range(ring_size)]
+    if partition == "cyclic":
+        for g in groups:
+            for block in range(g.start, g.end):
+                owned[block % ring_size].append(block)
+        return owned
     first = 0
     for g in groups:
         count, remainder = divmod(g.end - g.start, ring_size)
@@ -231,7 +239,7 @@ def _plan_ring_blocks(groups, ring_size):
 def _finalize_layout(samples, global_rows, groups, sample_slices, *, head_num,
                      dense_query_full, device, input_order, ring_size, ring_rank,
                      ring_cp_group, ring_cp_bwd_group, ring_cp_batch_p2p,
-                     ring_cp_bwd_bucket_size) -> VSALayout:
+                     ring_cp_bwd_bucket_size, ring_partition="cyclic") -> VSALayout:
     """Materialize padding, inverse maps and coarse metadata from planned blocks.
 
     Each block lists its valid original token rows. Block order, sample bounds
@@ -246,7 +254,7 @@ def _finalize_layout(samples, global_rows, groups, sample_slices, *, head_num,
         total = len(global_rows)
         capacity = (total + ring_size - 1) // ring_size
         sizes = [len(rows) for rows in global_rows]
-        peer_ids = _plan_ring_blocks(groups, ring_size)
+        peer_ids = _plan_ring_blocks(groups, ring_size, ring_partition)
         owned = peer_ids[ring_rank]
         block_rows = [global_rows[bid] for bid in owned]
         block_rows += [[] for _ in range(capacity - len(owned))]
@@ -265,7 +273,7 @@ def _finalize_layout(samples, global_rows, groups, sample_slices, *, head_num,
         ring = _RingMetadata(
             group=ring_cp_group, bwd_group=ring_cp_bwd_group, batch_p2p=ring_cp_batch_p2p,
             bwd_bucket_size=ring_cp_bwd_bucket_size,
-            size=ring_size, rank=ring_rank, global_tokens=sum(sizes),
+            size=ring_size, rank=ring_rank, partition=ring_partition, global_tokens=sum(sizes),
             local_groups=tuple(local_groups),
             block_ids=tensor(owned + [-1] * (capacity - len(owned))),
             # Each peer slice needs a 16-byte-aligned base for the CuTe frontend.
@@ -368,7 +376,7 @@ def _build_sample_blocks(segments, *, token_offset, block_offset):
 def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
                      input_order="raster", ring_cp_group=None, ring_cp_bwd_group=None,
                      ring_cp_batch_p2p=None,
-                     ring_cp_bwd_bucket_size="auto") -> VSALayout:
+                     ring_cp_bwd_bucket_size="auto", ring_partition="cyclic") -> VSALayout:
     """Build a full layout or an explicitly requested ring shard from Segments.
 
     input_order="raster" (the default) concatenates samples/segments
@@ -398,11 +406,12 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
     ring_cp_group. None reuses ring_cp_group for both directions. The caller
     chooses each group's NCCL stream priority once during parallel initialization.
     Ring shards require input_order="block" and contain only valid owned-block
-    rows without padding. Each sample contributes at most one contiguous block
-    interval per rank, with block counts differing by at most one. Extra blocks
-    rotate across samples; the next sample starts after the last extra-block
-    recipient (or keeps the start if evenly divisible). Cumulative block counts
-    also differ by at most one. Valid token lengths do not affect ownership.
+    rows without padding. ring_partition="cyclic" (default) assigns global
+    block b to rank b % ring_size. "contiguous" assigns at most one interval
+    per sample per rank, rotating extra blocks across samples. Both policies
+    balance per-sample and cumulative block counts within one. Valid token
+    lengths and dynamic routing do not affect ownership. The policy is stored
+    in layout.ring.partition; local blocks retain increasing global-ID order.
     Ownership is explicit in ring.global_to_gather.
     The global block count must be at least ring_size, so every rank owns data.
     Individual samples may have fewer blocks; no divisibility is required.
@@ -418,6 +427,8 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
     """
     if input_order not in ("raster", "block"):
         raise ValueError('input_order must be "raster" or "block"')
+    if ring_partition not in ("cyclic", "contiguous"):
+        raise ValueError('ring_partition must be "cyclic" or "contiguous"')
     if ring_cp_batch_p2p is not None and not isinstance(ring_cp_batch_p2p, bool):
         raise ValueError("ring_cp_batch_p2p must be a bool or None")
     if ring_cp_bwd_bucket_size not in (None, "auto") and (
@@ -450,7 +461,7 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
         if not isinstance(dense_query_full, bool):
             raise ValueError("dense_query_full must be a bool")
     elif (ring_cp_bwd_group is not None or ring_cp_batch_p2p is not None
-          or ring_cp_bwd_bucket_size != "auto"):
+          or ring_cp_bwd_bucket_size != "auto" or ring_partition != "cyclic"):
         raise ValueError("Ring transport options require ring_cp_group")
     samples, block_rows, groups, sample_slices = _plan_samples(samples)
     if is_ring:
@@ -463,7 +474,8 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
                             input_order=input_order, ring_size=ring_size, ring_rank=ring_rank,
                             ring_cp_group=ring_cp_group, ring_cp_bwd_group=ring_cp_bwd_group,
                             ring_cp_batch_p2p=ring_cp_batch_p2p,
-                            ring_cp_bwd_bucket_size=ring_cp_bwd_bucket_size)
+                            ring_cp_bwd_bucket_size=ring_cp_bwd_bucket_size,
+                            ring_partition=ring_partition)
 
 
 def _plan_samples(samples):

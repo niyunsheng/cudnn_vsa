@@ -22,12 +22,15 @@ PACK = (
 
 @pytest.mark.parametrize("size", [1, 2, 8])
 @pytest.mark.parametrize("dense_query_full", [False, True])
-def test_thd_partition(size, dense_query_full, metadata_group):
+@pytest.mark.parametrize("partition", ["cyclic", "contiguous"])
+def test_thd_partition(size, dense_query_full, partition, metadata_group):
     full = build_vsa_layout(PACK, head_num=2, dense_query_full=dense_query_full)
     owners, seen = [], []
     for rank in range(size):
         local = build_vsa_layout(PACK, head_num=2, ring_cp_group=metadata_group(size, rank),
-                                     dense_query_full=dense_query_full, input_order="block")
+                                     dense_query_full=dense_query_full, input_order="block",
+                                     ring_partition=partition)
+        assert local.ring.partition == partition
         ids = local.ring.block_ids[local.ring.block_ids >= 0]
         assert ids.tolist() == sorted(ids.tolist())
         mapping = local.ring.global_to_gather
@@ -54,7 +57,8 @@ def test_thd_partition(size, dense_query_full, metadata_group):
         assert not local.routing_counts[:, :, len(ids):].any()
         for g in full.groups:
             part = ids[(ids >= g.start) & (ids < g.end)].tolist()
-            assert not part or part == list(range(part[0], part[-1] + 1))
+            stride = size if partition == "cyclic" else 1
+            assert not part or part == list(range(part[0], part[-1] + 1, stride))
         owners.extend(ids.tolist())
         seen.extend(local.input_rows.tolist())
     assert sorted(owners) == list(range(full.blocks))
@@ -62,46 +66,54 @@ def test_thd_partition(size, dense_query_full, metadata_group):
 
 
 @pytest.mark.parametrize("size", [1, 2, 3, 4, 8, 16, 72, 128])
-def test_contiguous_planner_coverage_capacity_and_sample_boundaries(size):
+@pytest.mark.parametrize("partition", ["cyclic", "contiguous"])
+def test_planner_coverage_capacity_and_sample_boundaries(size, partition):
     rng = random.Random(71 + size)
     for _ in range(80):
         total = rng.randint(size, size + 192)
         cuts = sorted({0, total, *[rng.randrange(total + 1) for _ in range(30)]})
         groups = [SampleBlocks(a, b, b-a, ()) for a, b in zip(cuts, cuts[1:])]
-        owned = _plan_ring_blocks(groups, size)
+        owned = _plan_ring_blocks(groups, size, partition)
         assert sorted(b for ids in owned for b in ids) == list(range(total))
         assert all(0 < len(ids) <= (total + size - 1) // size for ids in owned)
         for ids in owned:
             assert ids == sorted(ids)
             for g in groups:
                 part = [b for b in ids if g.start <= b < g.end]
-                assert not part or part == list(range(part[0], part[-1] + 1))
+                stride = size if partition == "cyclic" else 1
+                assert not part or part == list(range(part[0], part[-1] + 1, stride))
         for g in groups:
             counts = [sum(g.start <= b < g.end for b in ids) for ids in owned]
             cumulative = [sum(b < g.end for b in ids) for ids in owned]
             assert max(counts) - min(counts) <= 1
             assert max(cumulative) - min(cumulative) <= 1
-        assert _plan_ring_blocks(groups, size) == owned
+        assert _plan_ring_blocks(groups, size, partition) == owned
 
 
 def test_next_sample_rotates_past_extra_blocks_and_keeps_start_without_remainder():
     groups = [SampleBlocks(a, b, b-a, ()) for a, b in [(0, 5), (5, 10), (10, 14)]]
     # A's extra block goes to rank 0, B's to rank 1. C starts on rank 2
     # and divides evenly, so a fourth sample still starts on rank 2.
-    assert _plan_ring_blocks(groups, 4) == [
+    assert _plan_ring_blocks(groups, 4, "contiguous") == [
         [0, 1, 9, 12], [2, 5, 6, 13], [3, 7, 10], [4, 8, 11]]
     groups.append(SampleBlocks(14, 15, 1, ()))
-    assert _plan_ring_blocks(groups, 4) == [
+    assert _plan_ring_blocks(groups, 4, "contiguous") == [
         [0, 1, 9, 12], [2, 5, 6, 13], [3, 7, 10, 14], [4, 8, 11]]
 
 
-def test_partial_blocks_balance_block_counts_and_restore_rank_major_means(metadata_group):
+@pytest.mark.parametrize("partition,blocks,tokens", [
+    ("contiguous", [[0, 1, 6], [2, 3, -1], [4, 5, -1]], [91, 96, 47]),
+    ("cyclic", [[0, 3, 6], [1, 4, -1], [2, 5, -1]], [59, 96, 79]),
+])
+def test_partial_blocks_balance_block_counts_and_restore_rank_major_means(
+        partition, blocks, tokens, metadata_group):
     samples = [[Segment("video", (4, 6, 8), .5), Segment("text", 20)],
                [Segment("video", (1, 3, 5)), Segment("text", 7)]]
     layouts = [build_vsa_layout(samples, head_num=2, input_order="block",
-                                ring_cp_group=metadata_group(3, rank)) for rank in range(3)]
-    assert [x.ring.block_ids.tolist() for x in layouts] == [[0, 1, 6], [2, 3, -1], [4, 5, -1]]
-    assert [x.tokens for x in layouts] == [91, 96, 47]
+                                ring_cp_group=metadata_group(3, rank),
+                                ring_partition=partition) for rank in range(3)]
+    assert [x.ring.block_ids.tolist() for x in layouts] == blocks
+    assert [x.tokens for x in layouts] == tokens
     # Synthetic means mark global IDs; the gather permutation discards dummy rows.
     gathered = torch.cat([x.ring.block_ids for x in layouts])
     for x in layouts:
@@ -141,7 +153,8 @@ def test_attention_rejects_empty_tokens_before_cuda_or_communication(ring, metad
 
 
 @pytest.mark.parametrize("dense_query_full", [False, True])
-def test_global_topk_and_peer_lists(dense_query_full, metadata_group):
+@pytest.mark.parametrize("partition", ["cyclic", "contiguous"])
+def test_global_topk_and_peer_lists(dense_query_full, partition, metadata_group):
     torch.manual_seed(38)
     heads, size = 2, 8
     full = build_vsa_layout(PACK, head_num=heads, dense_query_full=dense_query_full)
@@ -149,7 +162,8 @@ def test_global_topk_and_peer_lists(dense_query_full, metadata_group):
     selected = route(q[full.coarse_blocks], k[full.coarse_blocks], full)
     for rank in range(size):
         local = build_vsa_layout(PACK, head_num=heads, ring_cp_group=metadata_group(size, rank),
-                                     dense_query_full=dense_query_full, input_order="block")
+                                     dense_query_full=dense_query_full, input_order="block",
+                                     ring_partition=partition)
         ids = local.ring.block_ids[local.ring.block_ids >= 0]
         query = torch.zeros(local.blocks, heads, 128)
         query[:len(ids)] = q[ids]
@@ -244,6 +258,24 @@ def test_omitted_ring_parameters_preserve_full_layout():
     assert raster.ring is block.ring is None
     assert raster.tokens == block.tokens
     assert raster.input_rows.tolist() == list(range(raster.tokens))
+
+
+def test_default_partition_is_global_cyclic(metadata_group):
+    full = build_vsa_layout(PACK, head_num=2)
+    for rank in range(3):
+        layout = build_vsa_layout(PACK, head_num=2, input_order="block",
+                                  ring_cp_group=metadata_group(3, rank))
+        assert layout.ring.partition == "cyclic"
+        assert layout.ring.block_ids[layout.ring.block_ids >= 0].tolist() == list(
+            range(rank, full.blocks, 3))
+
+
+@pytest.mark.parametrize("partition", ["", "round_robin", None, 3, False])
+@pytest.mark.parametrize("ring", [False, True])
+def test_invalid_partition_rejected(partition, ring, metadata_group):
+    kwargs = dict(input_order="block", ring_cp_group=metadata_group(3, 0)) if ring else {}
+    with pytest.raises(ValueError, match="ring_partition"):
+        build_vsa_layout(PACK, head_num=2, ring_partition=partition, **kwargs)
 
 
 def test_microbatch_layouts_borrow_one_group(metadata_group, monkeypatch):
@@ -377,6 +409,7 @@ def test_invalid_transport_options_fail_at_construction(options, match, metadata
     {"ring_cp_bwd_group": object()},
     {"ring_cp_batch_p2p": False}, {"ring_cp_batch_p2p": True},
     {"ring_cp_bwd_bucket_size": None}, {"ring_cp_bwd_bucket_size": 64},
+    {"ring_partition": "contiguous"},
 ])
 def test_transport_options_require_a_bound_group(options):
     with pytest.raises(ValueError, match="require ring_cp_group"):

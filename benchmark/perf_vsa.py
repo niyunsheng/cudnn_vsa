@@ -62,10 +62,13 @@ def parse_args(argv=None):
     parser.add_argument("--bwd-bucket-size", type=_bucket_argument, default="auto",
                         help="auto (default), backend, or a positive number of query blocks")
     parser.add_argument("--ring-size", type=int, help="Interleaved subgroup size; must divide world size")
+    parser.add_argument("--ring-partition", choices=("cyclic", "contiguous"), default="cyclic",
+                        help="Ring block ownership; default cyclic")
     args = parser.parse_args(argv)
     if not args.ring and (args.ring_size is not None or args.eager_group or args.high_priority_group
                          or args.forward_only_high_priority
-                         or args.batch_p2p is not None or args.bwd_bucket_size != "auto"):
+                         or args.batch_p2p is not None or args.bwd_bucket_size != "auto"
+                         or args.ring_partition != "cyclic"):
         parser.error("Ring transport options require --ring")
     args.cases = args.cases or (["ragged", "single64k", "thd64k"]
                                if args.ring else ["default"])
@@ -132,7 +135,8 @@ def run_case(name, heads, args, group, bwd_group=None):
                                 ring_cp_bwd_group=bwd_group,
                                 input_order=args.input_order,
                                 ring_cp_batch_p2p=args.batch_p2p,
-                                ring_cp_bwd_bucket_size=args.bwd_bucket_size)
+                                ring_cp_bwd_bucket_size=args.bwd_bucket_size,
+                                ring_partition=args.ring_partition)
     else:
         local = full if args.input_order == "raster" else build_vsa_layout(samples, **kwargs, input_order="block")
     global_xs, global_dy = make_inputs(heads, samples=samples, seed=args.seed)
@@ -161,6 +165,7 @@ def run_case(name, heads, args, group, bwd_group=None):
     if name == "default":
         record["input"] = describe()
     if group is not None:
+        record["ring_partition"] = local.ring.partition
         record["bwd_bucket_size_effective"] = next(iter(local.ring._runtime.values())).bwd_bucket_size
     del global_xs, global_dy, expected, actual, repeated
     if rank == 0:

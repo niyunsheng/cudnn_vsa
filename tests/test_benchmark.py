@@ -129,6 +129,8 @@ def test_unified_cli_defaults_and_layouts():
     assert (ring.heads, ring.input_order, ring.warmup, ring.repeats, ring.profile) == ([2], "block", 3, 30, False)
     assert ring.cases == ["ragged", "single64k", "thd64k"]
     assert (single.seed, ring.seed) == (2026, 937)
+    assert ring.ring_partition == "cyclic"
+    assert parse_args(["--ring", "--ring-partition", "contiguous"]).ring_partition == "contiguous"
     assert parse_args(["--seed", "937"]).seed == ring.seed
     assert parse_args(["--ring", "--seed", "0"]).seed == 0
     assert parse_args(["--ring", "--heads", "1", "8"]).heads == [1, 8]
@@ -140,6 +142,7 @@ def test_unified_cli_defaults_and_layouts():
 
 
 @pytest.mark.parametrize("argv", [
+    ["--ring-partition", "contiguous"], ["--ring", "--ring-partition", "unknown"],
     ["--forward-only-high-priority"],
     ["--ring", "--forward-only-high-priority", "--high-priority-group"],
     ["--ring", "--input-order", "raster"], ["--ring-size", "2"], ["--batch-p2p"],

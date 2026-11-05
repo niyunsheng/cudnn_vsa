@@ -187,6 +187,7 @@ Ordinary VSA and Ring use the same forward API:
 layout = build_vsa_layout(
     samples, head_num=H, input_order="block", device=device,
     ring_cp_group=group,  # Existing caller-owned group; None selects ordinary VSA.
+    ring_partition="cyclic",  # Default; "contiguous" is also supported.
 )
 out = vsa_attention(q, k, v, gate, layout)
 ```
@@ -222,8 +223,21 @@ without padding. Keep Q/K/V/gate, position coordinates and gradients in that
 same order; outputs preserve it. Reuse the layout across layers.
 
 Plan blocks in the order described in **Input order**, numbering them across
-packed samples. For each sample, assign at most one **contiguous block interval**
-to each rank. Start the first sample at rank 0. For a sample with N blocks,
+packed samples. `ring_partition` selects their ownership independently of
+`input_order`, and is recorded as `layout.ring.partition`:
+
+| `ring_partition` | Global block ownership |
+| --- | --- |
+| `"cyclic"` (default) | Block `b` belongs to rank `b % R`; global numbering continues across samples |
+| `"contiguous"` | Each sample contributes at most one consecutive block interval to each rank |
+
+Cyclic ownership spreads neighboring Q/KV blocks across ranks, which can reduce
+per-peer sparse-work concentration. Neither policy guarantees balanced dynamic
+top-k work. Both share the same routing, attention and communication kernels.
+All group ranks must select the same policy. Rebuild the layout and reshard the
+input when changing it; do not reinterpret an existing local tensor.
+
+For contiguous ownership, start the first sample at rank 0. For N blocks,
 compute `base, extra = divmod(N, R)` and visit ranks cyclically from the
 current start. The first `extra` ranks receive `base + 1` consecutive blocks;
 the others receive `base`. Then advance the start by `extra` modulo R: the
@@ -280,7 +294,8 @@ Any Ulysses all-to-all is also caller-owned and must preserve local block order.
 
 ### Worked example: two samples on three ranks
 
-Pack these independent samples, with R=3:
+Pack these independent samples, with R=3. The diagram below uses
+`ring_partition="contiguous"`:
 
 - **A:** sparse video `(4, 6, 8)` with `sparsity=0.5`, then 20 text tokens.
   Block order places text first: `b0` has 20 tokens; the four video tiles
@@ -333,6 +348,17 @@ Attention internally allocates `ceil(7 / 3) = 3` blocks of 64 slots per rank:
 Unused slots are zero-filled and excluded from attention and pooling. The
 caller supplies 234 valid tokens in total, not 576 slot rows. Q/K/V/gate and
 positions use the same local order; the output and its gradients retain it.
+
+With the default `ring_partition="cyclic"`, the same global blocks instead give:
+
+| Group rank | Owned global blocks | Valid tokens |
+| --- | --- | ---: |
+| 0 | `b0, b3, b6` | 59 |
+| 1 | `b1, b4` | 96 |
+| 2 | `b2, b5` | 79 |
+
+The total remains 234 tokens and internal capacity remains three blocks per
+rank. The following routing example uses the contiguous ownership diagram.
 
 ### Routing and top-k
 
@@ -665,11 +691,12 @@ work are outside this benchmark.
 | Text | 2048 tokens per sample |
 | Global packed tokens | 961696: video/text 956048, image/text 5648 |
 | Ring size / heads / head dimension | `4 / 1 / 128` |
-| Compact input tokens at Ring ranks 0/1/2/3 | `243904 / 242880 / 242832 / 232080` |
+| Compact tokens, cyclic ranks 0/1/2/3 | `240436 / 240420 / 240420 / 240420` |
+| Compact tokens, contiguous ranks 0/1/2/3 | `243904 / 242880 / 242832 / 232080` |
 | Input order / precision | Compact block order / BF16 |
 
 One head is correct here: the model's 32 heads have already been divided by
-U32. Each Ring rank receives 232k–244k valid tokens for that head, averaging
+U32. Contiguous Ring ranks receive 232k–244k valid tokens for that head, averaging
 240,424. The ranks own `4051 / 4050 / 4050 / 4050` blocks; partial blocks
 account for the unequal valid token counts. These are token counts after the
 Ulysses exchange; input tensors have no padding, and VSA manages its internal
@@ -681,11 +708,14 @@ python -m benchmark.perf_vsa --heads 1 --cases thd720p44s --seed 937 \
   --input-order block --warmup 10 --repeats 50 --profile \
   --peak-tflops 2500 --output benchmark/results/single_720p44s/perf.json
 
-# The same global work distributed across four GPUs.
-torchrun --standalone --nproc-per-node=4 --module benchmark.perf_vsa --ring \
-  --ring-size 4 --heads 1 --cases thd720p44s --seed 937 --batch-p2p --high-priority-group \
-  --bwd-bucket-size backend --warmup 10 --repeats 50 --profile \
-  --peak-tflops 2500 --output benchmark/results/ring4_720p44s/perf.json
+# Compare both ownership policies on the same four GPUs and global inputs.
+for partition in cyclic contiguous; do
+  torchrun --standalone --nproc-per-node=4 --module benchmark.perf_vsa --ring \
+    --ring-size 4 --ring-partition "$partition" --heads 1 --cases thd720p44s \
+    --seed 937 --batch-p2p --high-priority-group --bwd-bucket-size backend \
+    --warmup 10 --repeats 50 --profile --peak-tflops 2500 \
+    --output "benchmark/results/ring4_720p44s/$partition/perf.json"
+done
 ```
 
 CUDA Graph is enabled by default. Both commands validate outputs and all
@@ -693,13 +723,13 @@ input gradients against single-device VSA, retained backward, and graph
 replay with original/changed inputs before timing. The Ring command writes
 `perf-group0.json` and `perf-group0-thd720p44s-h1-rank{0,1,2,3}.trace.json`.
 Each trace captures one additional full forward/backward replay after the
-timed samples. JSON reports phase latency, TFLOP/s/GPU and MFU together.
+timed samples. JSON records `ring_partition`, phase latency, TFLOP/s/GPU and MFU.
 Inputs are seeded random tensors; matching geometry does not reproduce a
 particular model layer's routing decisions.
 
 Measured in one four-GB200 allocation with the software environment above.
 Ordinary VSA runs the full sequence on one GPU without a process group;
-Ring4 uses all four GPUs with the high-priority group and
+Ring4 in the table uses **contiguous ownership**, all four GPUs, the high-priority group and
 backend-default backward buckets above. Both use **961,696 global tokens,
 H=1, D=128, compact block input and seed 937**. Global input hashes and useful
 FLOP counts match.

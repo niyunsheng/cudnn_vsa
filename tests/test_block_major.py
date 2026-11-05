@@ -200,7 +200,8 @@ def test_reorder_discrete_tensor(samples, dtype):
 @pytest.mark.parametrize("size", [1, 3, 8])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.float64])
 @pytest.mark.parametrize("row_shape", [(), (2, 7), (1025,)])
-def test_ring_boundary_gather_and_scatter_adjoint(size, dtype, row_shape, metadata_group):
+@pytest.mark.parametrize("partition", ["cyclic", "contiguous"])
+def test_ring_boundary_gather_and_scatter_adjoint(size, dtype, row_shape, partition, metadata_group):
     samples = CASES[1]
     total = sum(s.tokens for sample in samples for s in sample)
     x = torch.randn(total, *row_shape, device="cuda", dtype=dtype, requires_grad=True)
@@ -209,7 +210,7 @@ def test_ring_boundary_gather_and_scatter_adjoint(size, dtype, row_shape, metada
     covered = []
     for rank in range(size):
         layout = build_vsa_layout(samples, head_num=2, input_order="block", device="cuda",
-                                  ring_cp_group=metadata_group(size, rank))
+                                  ring_cp_group=metadata_group(size, rank), ring_partition=partition)
         rows = layout.input_rows
         actual = to_block_order(x, vsa_layout=layout)
         expected = x[rows]

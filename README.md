@@ -727,6 +727,21 @@ timed samples. JSON records `ring_partition`, phase latency, TFLOP/s/GPU and MFU
 Inputs are seeded random tensors; matching geometry does not reproduce a
 particular model layer's routing decisions.
 
+The two supported ownership policies were compared in a separate four-GB200
+allocation, in cyclic / contiguous / contiguous / cyclic order. Each run uses
+10 warmups and 50 timed graph replays; values are medians of two run medians,
+with maximum rank latency per replay. All reference and graph checks passed.
+
+| Ring4 ownership | Forward ms | Backward ms | F+B ms | F+B TFLOP/s/GPU | F+B MFU |
+|---|---:|---:|---:|---:|---:|
+| Contiguous | 16.090 | 51.370 | 66.661 | 477.54 | 19.10% |
+| Cyclic | 16.186 | 51.691 | 67.197 | 473.73 | 18.95% |
+
+The 0.8% total-time difference applies to these random inputs. Actual model
+routing can concentrate selected KV blocks by peer, so benchmark both policies
+in the model as well. This allocation did not repeat ordinary VSA; the matched
+ordinary/Ring comparison below is a separate measurement.
+
 Measured in one four-GB200 allocation with the software environment above.
 Ordinary VSA runs the full sequence on one GPU without a process group;
 Ring4 in the table uses **contiguous ownership**, all four GPUs, the high-priority group and

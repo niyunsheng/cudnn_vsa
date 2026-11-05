@@ -197,6 +197,94 @@ def test_reorder_discrete_tensor(samples, dtype):
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("size", [1, 3, 8])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize("row_shape", [(), (2, 7), (1025,)])
+@pytest.mark.parametrize("partition", ["cyclic", "contiguous"])
+def test_ring_boundary_gather_and_scatter_adjoint(size, dtype, row_shape, partition, metadata_group):
+    samples = CASES[1]
+    total = sum(s.tokens for sample in samples for s in sample)
+    x = torch.randn(total, *row_shape, device="cuda", dtype=dtype, requires_grad=True)
+    dy = torch.randn(*x.shape, 2, device="cuda", dtype=dtype)[..., 0]
+    combined = torch.zeros_like(x)
+    covered = []
+    for rank in range(size):
+        layout = build_vsa_layout(samples, head_num=2, input_order="block", device="cuda",
+                                  ring_cp_group=metadata_group(size, rank), ring_partition=partition)
+        rows = layout.input_rows
+        actual = to_block_order(x, vsa_layout=layout)
+        expected = x[rows]
+        assert actual.is_contiguous() and actual.shape == (layout.tokens, *row_shape)
+        assert actual.dtype == dtype
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        # Preserve a noncontiguous gradient to exercise the scatter's row strides.
+        grad = torch.stack((dy[rows], dy[rows]), dim=-1)[..., 0]
+        got, = torch.autograd.grad(actual, x, grad)
+        want, = torch.autograd.grad(expected, x, grad)
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+        combined += got
+        covered.extend(rows.cpu().tolist())
+    assert sorted(covered) == list(range(total))
+    torch.testing.assert_close(combined, dy, rtol=0, atol=0)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("size", [1, 2])
+def test_ring_boundary_large_offsets(size, metadata_group):
+    # Cover both flattened output offsets and source offsets beyond int32.
+    if torch.cuda.mem_get_info()[0] < 8 * 2**30:
+        pytest.skip("Large-offset regression requires 8 GiB free CUDA memory")
+    samples = ((Segment("video", (1, 1, 128)),),)
+    layout = build_vsa_layout(samples, head_num=1, input_order="block", device="cuda",
+                              ring_cp_group=metadata_group(size, size - 1))
+    x = torch.arange(128, device="cuda", dtype=torch.uint8)[:, None]
+    x = x.expand(128, 2**24 + 1).contiguous()
+    actual = to_block_order(x, vsa_layout=layout)
+    assert torch.equal(actual, x[layout.input_rows])
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_ring_boundary_positions_masks_and_graph(metadata_group, monkeypatch):
+    from benchmark.utils import capture_graph
+    import torch.distributed as dist
+
+    layout = build_vsa_layout(CASES[1], head_num=2, input_order="block", device="cuda",
+                              ring_cp_group=metadata_group(3, 1))
+    def unexpected(*args, **kwargs):
+        pytest.fail("Boundary conversion must not communicate or create groups")
+    for name in ("all_gather_into_tensor", "all_reduce", "reduce_scatter_tensor", "new_group"):
+        monkeypatch.setattr(dist, name, unexpected)
+    total = layout.ring.global_tokens
+    positions = torch.arange(total * 3, device="cuda").view(total, 3) + 2**60
+    mask = torch.arange(total, device="cuda") % 3 == 0
+    for field in (positions, mask):
+        torch.testing.assert_close(to_block_order(field, vsa_layout=layout),
+                                   field[layout.input_rows], rtol=0, atol=0)
+    x = torch.randn(total, 32, device="cuda", requires_grad=True)
+    fn = lambda value: to_block_order(value, vsa_layout=layout)
+    dy = torch.randn(layout.tokens, 32, device="cuda")
+    capture_graph(fn, [x], dy, 3, 1e-5)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_ring_boundary_second_derivative(metadata_group):
+    layout = build_vsa_layout(CASES[1], head_num=2, input_order="block", device="cuda",
+                              ring_cp_group=metadata_group(3, 2))
+    x = torch.randn(layout.ring.global_tokens, device="cuda", dtype=torch.float64,
+                    requires_grad=True)
+    y = to_block_order(x, vsa_layout=layout)
+    dx, = torch.autograd.grad(y.square().sum(), x, create_graph=True)
+    ddx, = torch.autograd.grad(dx.sum(), x)
+    expected = torch.zeros_like(x)
+    expected[layout.input_rows] = 2
+    torch.testing.assert_close(ddx, expected, rtol=0, atol=0)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("samples", CASES)
 @pytest.mark.parametrize("heads", [2, 4])
 def test_fused_padding_and_adjoint(samples, heads):

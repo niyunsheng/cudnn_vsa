@@ -167,9 +167,8 @@ rejected; even a size-one group requires block input.
 
 Create groups once, share them across micro-batch layouts, and reuse each
 layout across layers. All group members must supply the same global sample
-geometry, head count and partition policy. VSA borrows the groups; keep them
-alive through backward and CUDA Graph replay. Forward and backward share
-the same `ring_cp_group`.
+geometry, head count and partition policy. Forward and backward share the
+same `ring_cp_group`.
 
 ### Block ownership
 

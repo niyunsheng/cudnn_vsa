@@ -164,7 +164,6 @@ rank 和 size 从进程组获取。非成员句柄会被拒绝；即使组大小
 
 进程组只创建一次，在不同 micro-batch 的 layout 之间共享；每个 layout 在层间复用。
 组内所有成员必须使用相同的全局样本形状、head 数和分配策略。
-VSA 借用进程组，调用方应使其存活到反向和 CUDA Graph replay 完成。
 前反向共用同一个 `ring_cp_group`。
 
 ### Block 归属

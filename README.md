@@ -84,9 +84,10 @@ tokens_block = raster_to_block_wo_padding(tokens_global, vsa_layout=layout)
 position_ids_block = raster_to_block_wo_padding(position_ids_global, vsa_layout=layout)
 ```
 
-`input_order="block"` declares the layout; it does not reorder data. Skip the
-conversion for existing block input. Positions, targets and masks must use
-the same row mapping.
+The caller declares `input_order`; VSA does not detect the tensor's actual row
+order. If data already matches this layout's block order, the caller omits
+`raster_to_block_wo_padding`. Positions, targets and masks must use the same
+row mapping.
 
 ## Attention semantics
 

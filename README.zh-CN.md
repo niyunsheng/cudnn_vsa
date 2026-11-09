@@ -83,8 +83,9 @@ tokens_block = raster_to_block_wo_padding(tokens_global, vsa_layout=layout)
 position_ids_block = raster_to_block_wo_padding(position_ids_global, vsa_layout=layout)
 ```
 
-`input_order="block"` 仅声明布局，不会自动重排；输入已是 block 顺序时跳过转换。
-位置、target 和 mask 应使用相同的行映射。
+`input_order` 由调用方声明，VSA 不会检测张量的实际行顺序。
+数据已符合此 layout 的 block 顺序时，调用方无需调用
+`raster_to_block_wo_padding`。位置、target 和 mask 应使用相同的行映射。
 
 ## 注意力语义
 

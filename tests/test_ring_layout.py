@@ -322,7 +322,7 @@ def test_runtime_resolves_shared_transport(batch, bound, monkeypatch):
     import vsa_core as core
 
     group = SimpleNamespace(bound_device_id=torch.device("cuda:0") if bound else None)
-    ring = SimpleNamespace(group=group, batch_p2p=batch,
+    ring = SimpleNamespace(group=group, batch_p2p=batch, transport="ring",
                            bwd_bucket_size=None, size=2, rank=0, _runtime={})
     monkeypatch.setattr(dist, "get_process_group_ranks", lambda group: [1, 3])
     monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: object())
@@ -383,12 +383,47 @@ def test_full_layout_needs_no_distributed_state(monkeypatch):
     assert build_vsa_layout(PACK, head_num=2).ring is None
 
 
-@pytest.mark.parametrize("batch,bucket", [(None, "auto"), (False, None), (True, 64)])
-def test_transport_options_are_bound_to_layout(batch, bucket, metadata_group):
+@pytest.mark.parametrize("batch,bucket,transport", [
+    (None, "auto", "ring"), (False, None, "window"), (True, 64, "ring")])
+def test_transport_options_are_bound_to_layout(batch, bucket, transport, metadata_group):
     layout = build_vsa_layout(PACK, head_num=2, input_order="block", ring_cp_group=metadata_group(),
-                              ring_cp_batch_p2p=batch, ring_cp_bwd_bucket_size=bucket)
+                              ring_cp_batch_p2p=batch, ring_cp_bwd_bucket_size=bucket,
+                              ring_cp_transport=transport)
     assert layout.ring.batch_p2p is batch
     assert layout.ring.bwd_bucket_size == bucket
+    assert layout.ring.transport == transport
+    with pytest.raises(FrozenInstanceError):
+        layout.ring.transport = "window"
+
+
+def test_default_transport_is_the_step_ring(metadata_group):
+    assert build_vsa_layout(PACK, head_num=2, input_order="block",
+                            ring_cp_group=metadata_group()).ring.transport == "ring"
+
+
+@pytest.mark.parametrize("size", [1, 2, 3, 8])
+@pytest.mark.parametrize("partition", ["cyclic", "contiguous"])
+def test_window_block_sizes_follow_gather_order(size, partition, metadata_group):
+    """The all-gathered KV window is indexed exactly like the pooled-mean gather."""
+    full = build_vsa_layout(PACK, head_num=2)
+    for rank in range(size):
+        local = build_vsa_layout(PACK, head_num=2, input_order="block",
+                                 ring_partition=partition,
+                                 ring_cp_group=metadata_group(size, rank), ring_cp_transport="window")
+        ring, capacity = local.ring, local.blocks
+        assert capacity == -(-full.blocks // size)
+        assert ring.window_block_sizes.shape == (size * capacity,)
+        assert ring.window_block_sizes.dtype == torch.int32
+        slots = ring.global_to_gather
+        # Every real block keeps its valid length; the remaining slots are dummies.
+        assert torch.equal(ring.window_block_sizes[slots], full.block_sizes)
+        dummy = torch.ones(size * capacity, dtype=torch.bool)
+        dummy[slots] = False
+        assert int(dummy.sum()) == size * capacity - full.blocks
+        assert not ring.window_block_sizes[dummy].any()
+        # This rank's own shard occupies the window blocks of its gather slot.
+        own = ring.window_block_sizes[rank * capacity:(rank + 1) * capacity]
+        assert torch.equal(own, local.block_sizes)
 
 
 @pytest.mark.parametrize("options,match", [
@@ -396,6 +431,8 @@ def test_transport_options_are_bound_to_layout(batch, bucket, metadata_group):
     ({"ring_cp_batch_p2p": "False"}, "ring_cp_batch_p2p"),
     *[({"ring_cp_bwd_bucket_size": value}, "ring_cp_bwd_bucket_size")
       for value in [0, -1, True, False, 1.5, "backend"]],
+    ({"ring_cp_transport": "p2p"}, "ring_cp_transport"),
+    ({"ring_cp_transport": None}, "ring_cp_transport"),
 ])
 def test_invalid_transport_options_fail_at_construction(options, match, metadata_group):
     with pytest.raises(ValueError, match=match):
@@ -406,6 +443,7 @@ def test_invalid_transport_options_fail_at_construction(options, match, metadata
     {"ring_cp_batch_p2p": False}, {"ring_cp_batch_p2p": True},
     {"ring_cp_bwd_bucket_size": None}, {"ring_cp_bwd_bucket_size": 64},
     {"ring_partition": "contiguous"},
+    {"ring_cp_transport": "window"},
 ])
 def test_transport_options_require_a_bound_group(options):
     with pytest.raises(ValueError, match="require ring_cp_group"):

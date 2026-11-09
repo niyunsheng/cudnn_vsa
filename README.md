@@ -279,6 +279,52 @@ VSA enqueues P2P before fine attention to overlap communication and computation;
 measure the actual overlap. See [`build_vsa_layout`](vsa_layout.py) for P2P call mode
 (`ring_cp_batch_p2p`) and backward compute bucket size (`ring_cp_bwd_bucket_size`).
 
+### Experimental window transport
+
+`ring_cp_transport="ring"` (default) is the step-by-step P2P ring above.
+`ring_cp_transport="window"` instead all-gathers every peer's slot-padded K
+and V shards into one window each per direction, in group-rank order, and
+issues a single block-sparse call whose routing lists are the global block ids
+mapped through `layout.ring.global_to_gather`; no partial-output merge is
+needed. Backward re-gathers the windows, runs one block-sparse backward and
+reduce-scatters FP32 dK/dV partial sums to their owners. Both transports
+compute the same attention with the same precision policy (BF16 kernel
+partials, FP32 cross-rank accumulation). The window holds `ring_size` shards
+per direction, and its collectives (two all-gathers forward, two all-gathers
+and one reduce-scatter backward) are not overlapped with the kernel.
+Both cyclic and contiguous ownership use the layout's explicit block map.
+This is a launch-consolidation prototype: one K/V window and one routing table
+per BSA call. Communication remains outside the kernels; persistent scheduling,
+arrival flags and device-side transport are not implemented in this draft.
+
+To compare an archived main checkout and this branch on the same four GPUs:
+
+```bash
+python -m benchmark.compare_window --baseline-root /path/to/main \
+  --output /path/to/evidence
+```
+
+The runner checks the unit suite and runnable README programs, then compares
+Ring and window on small/64k packs and on `thd720p44s` for both ownership
+policies. Long runs use seed 937, H1/D128, ordinary-priority NCCL, backend
+backward buckets, and 10 warmups / 50 timed CUDA Graph replays, with reversed
+run order in the second round. It preserves every exit status, log, native
+benchmark JSON and before/after source hashes; any failure makes the runner
+exit nonzero. Window runs use `VSA_BSA_IMPL=local`; Ring uses the installed BSA.
+See the [2026-11-09 GB200 comparison](docs/window_transport_benchmark_20261109.md)
+for the measured main/Ring/window results and raw timing evidence.
+
+### Local kernel copy
+
+`bsa_cute/` is a vendored copy of cudnn-frontend v1.28.0's
+`cudnn.block_sparse_attention` CuTe DSL package (provenance, mechanical import
+rewrite and licenses in `bsa_cute/PROVENANCE.md`). `VSA_BSA_IMPL=local`
+selects it instead of the installed package (`VSA_BSA_IMPL=cudnn`, the
+default); `benchmark.perf_vsa` records the choice as `bsa_impl`.
+`tests/test_bsa_cute_cuda.py` checks both packages agree before the local
+copy is modified. Fused Ring kernel work edits `bsa_cute/` and keeps the
+installed package as the control.
+
 ### Why this design
 
 - **Whole blocks, compact inputs**: preserve pooling/routing units without

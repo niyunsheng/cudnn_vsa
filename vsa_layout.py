@@ -79,12 +79,15 @@ class _RingMetadata:
     partition: str
     batch_p2p: bool | None
     bwd_bucket_size: str | int | None
+    transport: str
     global_tokens: int
     # Sample, local query begin/end, local dense-query end.
     local_groups: tuple[tuple[SampleBlocks, int, int, int], ...]
     block_ids: torch.Tensor
     peer_block_sizes: torch.Tensor
     global_to_gather: torch.Tensor
+    # Valid lengths of the ring_size * capacity window blocks, in gather order.
+    window_block_sizes: torch.Tensor
     _runtime: dict = field(default_factory=dict, repr=False)
 
 
@@ -237,8 +240,8 @@ def _plan_ring_blocks(groups, ring_size, partition="cyclic"):
 
 def _finalize_layout(samples, global_rows, groups, sample_slices, *, head_num,
                      dense_query_full, device, input_order, ring_size, ring_rank,
-                     ring_cp_group, ring_cp_batch_p2p,
-                     ring_cp_bwd_bucket_size, ring_partition="cyclic") -> VSALayout:
+                     ring_cp_group, ring_cp_batch_p2p, ring_cp_bwd_bucket_size,
+                     ring_partition="cyclic", ring_cp_transport="ring") -> VSALayout:
     """Materialize padding, inverse maps and coarse metadata from planned blocks.
 
     Each block lists its valid original token rows. Block order, sample bounds
@@ -271,14 +274,15 @@ def _finalize_layout(samples, global_rows, groups, sample_slices, *, head_num,
                 global_to_gather[bid] = rank * capacity + local
         ring = _RingMetadata(
             group=ring_cp_group, batch_p2p=ring_cp_batch_p2p,
-            bwd_bucket_size=ring_cp_bwd_bucket_size,
+            bwd_bucket_size=ring_cp_bwd_bucket_size, transport=ring_cp_transport,
             size=ring_size, rank=ring_rank, partition=ring_partition, global_tokens=sum(sizes),
             local_groups=tuple(local_groups),
             block_ids=tensor(owned + [-1] * (capacity - len(owned))),
             # Each peer slice needs a 16-byte-aligned base for the CuTe frontend.
             peer_block_sizes=tensor([row + [0] * (-capacity % 4) for row in peer_sizes],
                                     torch.int32)[:, :capacity],
-            global_to_gather=tensor(global_to_gather))
+            global_to_gather=tensor(global_to_gather),
+            window_block_sizes=tensor([size for row in peer_sizes for size in row], torch.int32))
     else:
         local_groups = [(g, g.start, g.end, g.start + g.dense_blocks_num) for g in groups]
     token_count = sum(map(len, block_rows))
@@ -373,9 +377,9 @@ def _build_sample_blocks(segments, *, token_offset, block_offset):
 
 
 def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
-                     input_order="raster", ring_cp_group=None,
-                     ring_cp_batch_p2p=None,
-                     ring_cp_bwd_bucket_size="auto", ring_partition="cyclic") -> VSALayout:
+                     input_order="raster", ring_cp_group=None, ring_cp_batch_p2p=None,
+                     ring_cp_bwd_bucket_size="auto", ring_partition="cyclic",
+                     ring_cp_transport="ring") -> VSALayout:
     """Build a full layout or an explicitly requested ring shard from Segments.
 
     input_order="raster" (the default) concatenates samples/segments
@@ -421,11 +425,20 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
     ring_cp_bwd_bucket_size="auto" selects the
     measured SM100/H2/local-128-block/single-sample setting; None uses the backend
     default, and a positive integer overrides it. These options require a group.
+    ring_cp_transport="ring" circulates K/V shards step by step with P2P and
+    merges partial outputs. "window" all-gathers every peer's padded shard into
+    one KV window per direction and issues a single block-sparse call with the
+    global routing lists; backward reduce-scatters FP32 dK/dV partial sums to
+    their owners. Both transports compute the same attention with the same
+    precision policy; "window" holds ring_size shards per direction and does
+    not overlap its collectives with the kernel.
     """
     if input_order not in ("raster", "block"):
         raise ValueError('input_order must be "raster" or "block"')
     if ring_partition not in ("cyclic", "contiguous"):
         raise ValueError('ring_partition must be "cyclic" or "contiguous"')
+    if ring_cp_transport not in ("ring", "window"):
+        raise ValueError('ring_cp_transport must be "ring" or "window"')
     if ring_cp_batch_p2p is not None and not isinstance(ring_cp_batch_p2p, bool):
         raise ValueError("ring_cp_batch_p2p must be a bool or None")
     if ring_cp_bwd_bucket_size not in (None, "auto") and (
@@ -447,8 +460,8 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
             raise ValueError("head_num must be a positive integer")
         if not isinstance(dense_query_full, bool):
             raise ValueError("dense_query_full must be a bool")
-    elif (ring_cp_batch_p2p is not None
-          or ring_cp_bwd_bucket_size != "auto" or ring_partition != "cyclic"):
+    elif (ring_cp_batch_p2p is not None or ring_cp_bwd_bucket_size != "auto"
+          or ring_partition != "cyclic" or ring_cp_transport != "ring"):
         raise ValueError("Ring transport options require ring_cp_group")
     samples, block_rows, groups, sample_slices = _plan_samples(samples)
     if is_ring:
@@ -459,10 +472,9 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
     return _finalize_layout(samples, block_rows, groups, sample_slices,
                             head_num=head_num, dense_query_full=dense_query_full, device=device,
                             input_order=input_order, ring_size=ring_size, ring_rank=ring_rank,
-                            ring_cp_group=ring_cp_group,
-                            ring_cp_batch_p2p=ring_cp_batch_p2p,
+                            ring_cp_group=ring_cp_group, ring_cp_batch_p2p=ring_cp_batch_p2p,
                             ring_cp_bwd_bucket_size=ring_cp_bwd_bucket_size,
-                            ring_partition=ring_partition)
+                            ring_partition=ring_partition, ring_cp_transport=ring_cp_transport)
 
 
 def _plan_samples(samples):

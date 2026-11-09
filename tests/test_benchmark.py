@@ -137,12 +137,15 @@ def test_unified_cli_defaults_and_layouts():
     assert parse_args(["--input-order", "block", "--no-profile"]).input_order == "block"
     args = parse_args(["--ring", "--heads", "2", "4", "--bwd-bucket-size", "backend", "--output", "run.json"])
     assert args.bwd_bucket_size is None and args.heads == [2, 4] and args.output.name == "run.json"
+    assert single.transport == ring.transport == "ring"
+    assert parse_args(["--ring", "--transport", "window"]).transport == "window"
 
 
 @pytest.mark.parametrize("argv", [
     ["--ring-partition", "contiguous"], ["--ring", "--ring-partition", "unknown"],
     ["--ring", "--high-priority-group"],
     ["--ring", "--input-order", "raster"], ["--ring-size", "2"], ["--batch-p2p"],
+    ["--transport", "window"], ["--ring", "--transport", "p2p"],
     ["--ring", "--ring-size", "0"], ["--ring", "--bwd-bucket-size", "0"],
     ["--heads", "0"], ["--heads", "-1"],
     ["--warmup", "0"], ["--repeats", "0"], ["--eps", "nan"],
@@ -178,6 +181,9 @@ def test_ring_groups_use_ordinary_priority(ring_size, eager, monkeypatch):
         created.append((ranks, group))
         return group
     monkeypatch.setenv("LOCAL_RANK", "3")
+    # This test inspects group-construction arguments without a CUDA/NCCL backend.
+    monkeypatch.setattr(perf_vsa.dist, "ProcessGroupNCCL",
+                        SimpleNamespace(Options=lambda **kw: SimpleNamespace(**kw)), raising=False)
     monkeypatch.setattr(perf_vsa.dist, "init_process_group", check)
     monkeypatch.setattr(perf_vsa.dist, "new_group", new_group)
     monkeypatch.setattr(perf_vsa.dist, "group", SimpleNamespace(WORLD=world))

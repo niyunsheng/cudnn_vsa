@@ -14,6 +14,7 @@ from .utils import (backward, barrier, capture_graph, check_tensors, environment
                     packed_geometry_and_flops, profile_step, summarize)
 from tests.reference import reference_pack
 from vsa import raster_to_block_wo_padding, vsa_attention
+import vsa_core
 from vsa_layout import build_vsa_layout
 
 
@@ -59,10 +60,13 @@ def parse_args(argv=None):
     parser.add_argument("--ring-size", type=int, help="Interleaved subgroup size; must divide world size")
     parser.add_argument("--ring-partition", choices=("cyclic", "contiguous"), default="cyclic",
                         help="Ring block ownership; default cyclic")
+    parser.add_argument("--transport", choices=("ring", "window"), default="ring",
+                        help="Fine KV transport: per-step Ring P2P, or one all-gathered "
+                             "KV window and one block-sparse call per direction")
     args = parser.parse_args(argv)
     if not args.ring and (args.ring_size is not None or args.eager_group
                          or args.batch_p2p is not None or args.bwd_bucket_size != "auto"
-                         or args.ring_partition != "cyclic"):
+                         or args.ring_partition != "cyclic" or args.transport != "ring"):
         parser.error("Ring transport options require --ring")
     args.cases = args.cases or (["ragged", "single64k", "thd64k"]
                                if args.ring else ["default"])
@@ -119,7 +123,7 @@ def run_case(name, heads, args, group):
                                 input_order=args.input_order,
                                 ring_cp_batch_p2p=args.batch_p2p,
                                 ring_cp_bwd_bucket_size=args.bwd_bucket_size,
-                                ring_partition=args.ring_partition)
+                                ring_partition=args.ring_partition, ring_cp_transport=args.transport)
     else:
         local = full if args.input_order == "raster" else build_vsa_layout(samples, **kwargs, input_order="block")
     global_xs, global_dy = make_inputs(heads, samples=samples, seed=args.seed)
@@ -188,6 +192,7 @@ def main():
         args.output.parent.mkdir(parents=True, exist_ok=True)
         barrier(group)
         result = {"schema": "vsa-perf/v5", "environment": environment(), "cases": {},
+                  "bsa_impl": vsa_core.BSA_IMPL,
                   "config": {k: v for k, v in vars(args).items() if k != "output"},
                   "scope": "Full forward/backward; timing excludes validation, capture and profiling"}
         if group is not None:

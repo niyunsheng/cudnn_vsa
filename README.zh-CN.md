@@ -85,6 +85,7 @@ position_ids_block = raster_to_block_wo_padding(position_ids_global, vsa_layout=
 
 `input_order` 由调用方声明，VSA 不会检测张量的实际行顺序。
 位置、target 和 mask 应使用相同的行映射。
+3D RoPE 的 position IDs 形状为 `[T_global, 3]`；重排保持每行原始的 `(f, h, w)` 坐标不变。
 
 ## 注意力语义
 
@@ -405,8 +406,16 @@ layout = build_vsa_layout(
 )
 torch.manual_seed(1234)  # Identical mock input and replicated weights on all ranks.
 tokens_global = torch.randn(T, C, device=device, dtype=torch.bfloat16)
-# Row IDs illustrate the mapping; use the model's original coordinates for RoPE.
-position_ids_global = torch.arange(T, device=device)
+# Example 3D RoPE convention: text uses (1..L, 0, 0), video time starts at L+1.
+position_rows = []
+for video, text in samples:
+    axes = [torch.arange(n, device=device) for n in video.size]
+    axes[0] += text.tokens + 1
+    video_ids = torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1).reshape(-1, 3)
+    text_ids = torch.zeros(text.tokens, 3, device=device, dtype=torch.long)
+    text_ids[:, 0] = torch.arange(1, text.tokens + 1, device=device)
+    position_rows.extend((video_ids, text_ids))
+position_ids_global = torch.cat(position_rows)  # [T, 3]: original (f, h, w) coordinates.
 
 # Ring only: reorder and select whole blocks before the layers.
 tokens_attention = tokens_global
@@ -423,7 +432,7 @@ A = (max_tokens + U - 1) // U
 tail = U * A - layout.tokens
 start = (rank % U) * A
 x = F.pad(tokens_attention, (0, 0, 0, tail))[start:start + A].contiguous()
-position_ids_local = F.pad(position_ids_attention, (0, tail), value=-1)[start:start + A]
+position_ids_local = F.pad(position_ids_attention, (0, 0, 0, tail), value=-1)[start:start + A]
 valid = torch.arange(start, start + A, device=device) < layout.tokens
 
 layers = torch.nn.ModuleList([

@@ -198,69 +198,21 @@ rank 开始。`extra=0` 时起点不变。
 
 ### 示例：三个 rank 上的两个样本
 
-打包以下相互独立的样本，R=3。下图使用 `ring_partition="contiguous"`：
+`R=3`，样本 A 包含文本 block `b0` 和视频 block `b1..b4`（`sparsity=0.5`）；
+样本 B 包含稠密图像 block `b5` 和文本 block `b6`。全局 block ID 跨样本连续编号。
 
-- **A：** 稀疏视频 `(4, 6, 8)`，`sparsity=0.5`，后面跟随 20 个文本 token。
-  Block 顺序将文本放在前面：`b0` 有 20 个 token；四个视频 tile
-  `b1..b4` 分别有 64、64、32 和 32 个 token。
-- **B：** 稠密图像 `(1, 3, 5)`，`sparsity=None`，后面跟随 7 个文本 token。
-  两个 segment 都是稠密的，因此保持声明顺序：`b5` 有 15 个图像 token，
-  `b6` 有 7 个文本 token。
+| 策略 | 样本 / 数量 | Rank 0 | Rank 1 | Rank 2 |
+| --- | --- | --- | --- | --- |
+| `contiguous` | A | `b0, b1` | `b2, b3` | `b4` |
+| `contiguous` | B | `b6` | — | `b5` |
+| `contiguous` | 累计 block 数 | 3 | 2 | 2 |
+| `cyclic` | A | `b0, b3` | `b1, b4` | `b2` |
+| `cyclic` | B | `b6` | — | `b5` |
+| `cyclic` | 累计 block 数 | 3 | 2 | 2 |
 
-Block ID 跨样本连续编号。A 有五个 block，B 有两个，都不能被 R 整除。
-下图的箭头表示在数据集/模型边界执行的一次性分发。
-Rank 方框内**仅包含有效输入 token**。
-
-```mermaid
-flowchart LR
-    A["Sample A: b0, b1, b2, b3, b4<br/>212 tokens"]
-    B["Sample B: b5, b6<br/>22 tokens"]
-    R0["rank 0: b0 | b1 | b6<br/>91 tokens"]
-    R1["rank 1: b2 | b3<br/>96 tokens"]
-    R2["rank 2: b4 | b5<br/>47 tokens"]
-    A -->|b0, b1| R0
-    A -->|b2, b3| R1
-    A -->|b4| R2
-    B -->|b5| R2
-    B -->|b6| R0
-```
-
-每个 rank 按全局 ID 递增顺序拼接自己的 block，保持每个 block 内的有效 token 顺序。
-Rank 0 先提供 `b0` 的 20 个 token，再提供 `b1` 的 64 个和 `b6` 的 7 个，中间没有空隙。
-A 从 rank 0 开始，向 rank 0/1/2 分配 `[2, 2, 1]` 个 block。
-因此 B 从 rank 2 开始：将 `b5` 分给 rank 2，`b6` 分给 rank 0。
-累计 block 数变为 `[3, 2, 2]`，第三个样本将从 rank 1 开始。
-无需计算 token 负载或对 rank 排序。此例中 A 的不完整 block 有意造成 token 总数不均；
-归属策略均衡的是 block 数量。
-
-按 rank 顺序拼接各 rank 的输出，会得到 block 序列
-`[b0, b1, b6, b2, b3, b4, b5]`。
-要恢复全局顺序，需要使用归属映射和行映射；`input_rows` 给出每个本地行
-在全局 raster 顺序中的目标位置。仅按 rank 顺序拼接，不足以直接使用
-完整 layout 的逆重排辅助函数。
-
-注意力在内部为每个 rank 分配 `ceil(7 / 3) = 3` 个 block，每个 block 有 64 个 slot：
-
-| 组内 rank | 按本地 slot 顺序排列的全局 block ID | 每个 slot block 的有效大小 | 紧凑输入行数 | 内部 slot 行数 |
-| --- | --- | --- | ---: | ---: |
-| 0 | `b0, b1, b6` | `20, 64, 7` | 91 | 192 |
-| 1 | `b2, b3, dummy` | `64, 32, 0` | 96 | 192 |
-| 2 | `b4, b5, dummy` | `32, 15, 0` | 47 | 192 |
-
-未使用的 slot 填零，不参与注意力和 pooling。
-调用方总共提供 234 个有效 token，而非 576 行 slot。
-Q/K/V/gate 和位置使用相同的本地顺序；输出及其梯度保持该顺序。
-
-使用默认的 `ring_partition="cyclic"` 时，同样的全局 block 会分配为：
-
-| 组内 rank | 拥有的全局 block | 有效 token 数 |
-| --- | --- | ---: |
-| 0 | `b0, b3, b6` | 59 |
-| 1 | `b1, b4` | 96 |
-| 2 | `b2, b5` | 79 |
-
-总数仍为 234 个 token，每个 rank 的内部容量仍为三个 block。
-后面的路由示例使用连续分配图中的归属关系。
+`contiguous` 下，A 从 rank 0 开始，向 rank 0/1/2 分配 `[2, 2, 1]` 个 block。
+B 从分得较少的 rank 2 开始，依次给 rank 2、0 各一个 block；下一个样本从 rank 1 开始。
+后面的路由和执行流程示例使用 `contiguous` 分配。
 
 ### 路由与 top-k
 

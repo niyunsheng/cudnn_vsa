@@ -205,71 +205,23 @@ blocks of 64 slots; partial and dummy slots are excluded from the math.
 
 ### Worked example: two samples on three ranks
 
-Pack these independent samples, with R=3. The diagram below uses
-`ring_partition="contiguous"`:
+With `R=3`, sample A contains text block `b0` and video blocks `b1..b4`
+(`sparsity=0.5`); sample B contains dense-image block `b5` and text block `b6`.
+Global block IDs continue across samples.
 
-- **A:** sparse video `(4, 6, 8)` with `sparsity=0.5`, then 20 text tokens.
-  Block order places text first: `b0` has 20 tokens; the four video tiles
-  `b1..b4` have 64, 64, 32 and 32 tokens.
-- **B:** a dense image `(1, 3, 5)` with `sparsity=None`, then 7 text tokens.
-  Both segments are dense, so their declared order is retained: `b5` has
-  15 image tokens and `b6` has 7 text tokens.
+| Policy | Sample / count | Rank 0 | Rank 1 | Rank 2 |
+| --- | --- | --- | --- | --- |
+| `contiguous` | A | `b0, b1` | `b2, b3` | `b4` |
+| `contiguous` | B | `b6` | — | `b5` |
+| `contiguous` | Total blocks | 3 | 2 | 2 |
+| `cyclic` | A | `b0, b3` | `b1, b4` | `b2` |
+| `cyclic` | B | `b6` | — | `b5` |
+| `cyclic` | Total blocks | 3 | 2 | 2 |
 
-Block IDs continue across samples. A has five blocks and B has two; neither
-count is divisible by R. Arrows below show the one-time distribution at the
-dataset/model boundary. The rank boxes contain **only valid input tokens**.
-
-```mermaid
-flowchart LR
-    A["Sample A: b0, b1, b2, b3, b4<br/>212 tokens"]
-    B["Sample B: b5, b6<br/>22 tokens"]
-    R0["rank 0: b0 | b1 | b6<br/>91 tokens"]
-    R1["rank 1: b2 | b3<br/>96 tokens"]
-    R2["rank 2: b4 | b5<br/>47 tokens"]
-    A -->|b0, b1| R0
-    A -->|b2, b3| R1
-    A -->|b4| R2
-    B -->|b5| R2
-    B -->|b6| R0
-```
-
-Each rank concatenates its blocks in increasing global-ID order, preserving
-valid-token order within each block. Rank 0 supplies 20 tokens from `b0`,
-then 64 from `b1` and 7 from `b6`, with no gaps. A starts at rank 0 and gives
-`[2, 2, 1]` blocks to ranks 0/1/2. B therefore starts at rank 2: it gives `b5`
-to rank 2 and `b6` to rank 0. The cumulative counts become `[3, 2, 2]`, and a
-third sample would start at rank 1. No token-load calculation or rank sorting
-is needed. A's partial blocks deliberately make the token totals unequal in
-this example; ownership balances block counts.
-
-Concatenating rank outputs in rank order gives blocks
-`[b0, b1, b6, b2, b3, b4, b5]`. To reconstruct global order, use the ownership
-and row maps; `input_rows` gives each local row's destination in global raster
-order. A rank-order concatenation alone is insufficient for the full layout's
-inverse reorder helper.
-
-Attention internally allocates `ceil(7 / 3) = 3` blocks of 64 slots per rank:
-
-| Group rank | Global block IDs in local slot order | Valid sizes per slot block | Compact input rows | Internal slot rows |
-| --- | --- | --- | ---: | ---: |
-| 0 | `b0, b1, b6` | `20, 64, 7` | 91 | 192 |
-| 1 | `b2, b3, dummy` | `64, 32, 0` | 96 | 192 |
-| 2 | `b4, b5, dummy` | `32, 15, 0` | 47 | 192 |
-
-Unused slots are zero-filled and excluded from attention and pooling. The
-caller supplies 234 valid tokens in total, not 576 slot rows. Q/K/V/gate and
-positions use the same local order; the output and its gradients retain it.
-
-With the default `ring_partition="cyclic"`, the same global blocks instead give:
-
-| Group rank | Owned global blocks | Valid tokens |
-| --- | --- | ---: |
-| 0 | `b0, b3, b6` | 59 |
-| 1 | `b1, b4` | 96 |
-| 2 | `b2, b5` | 79 |
-
-The total remains 234 tokens and internal capacity remains three blocks per
-rank. The following routing example uses the contiguous ownership diagram.
+With `contiguous`, A starts at rank 0 and gives `[2, 2, 1]` blocks to ranks
+0/1/2. B starts at rank 2, which received fewer blocks, and gives one block
+each to ranks 2 and 0. The next sample starts at rank 1.
+The routing and execution examples below use the `contiguous` allocation.
 
 ### Routing and top-k
 

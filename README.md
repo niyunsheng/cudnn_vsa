@@ -143,214 +143,6 @@ A sample whose segments all have `sparsity=None` uses **full attention through
 BSA**, with no coarse branch. This is how the independent images above are
 handled; a dense image inside a VSA sample still participates in coarse.
 
-## Examples with and without context parallelism
-
-The following example uses two attention layers with residual connections and
-one optimizer step. It supports all three modes through the same VSA API.
-The entire process world is one context-parallel group; `H` must be divisible
-by the Ulysses size `U`, and the world size must equal `U * R`.
-
-| Mode | Input preparation before the layers | Q/K/V/gate passed to VSA |
-| --- | --- | --- |
-| No CP (`U=1, R=1`) | Keep raster order | All tokens and all heads |
-| Ulysses only (`U>1, R=1`) | Split the raster stream into U token slices | All tokens and H/U heads after All-to-All |
-| Ring + Ulysses (`U>1, R>1`) | Select whole Ring-owned blocks and reorder once; then split each compact Ring stream into U token slices | This Ring owner's valid tokens and H/U heads after All-to-All |
-
-Ulysses All-to-All reconstructs the token stream before VSA runs: raster order
-without Ring, compact block order with Ring.
-Only trailing **transport padding** is added to equalize Ulysses message sizes;
-it is removed before attention and excluded from the loss. This is separate
-from VSA's internal 64-slot block padding.
-
-### No CP
-
-Save the shared Python example below as `demo_cp.py` in this repository, then run:
-
-```bash
-python demo_cp.py
-```
-
-### Ulysses CP only
-
-Use raster input as in the no-CP example. Four GPUs split tokens before the
-layers and exchange tokens for heads inside each layer; no input reorder is needed:
-
-```bash
-torchrun --standalone --nproc-per-node=4 demo_cp.py --ulysses-size 4
-```
-
-### Ring + Ulysses CP
-
-For eight GPUs with `U=4, R=2`, Ulysses groups are `[0,1,2,3]` and
-`[4,5,6,7]`; Ring groups are `[0,4]`, `[1,5]`, `[2,6]`, `[3,7]`.
-Each Ring pair handles the same head slice and complementary block ownership.
-Both ownership policies use the same preparation and attention calls:
-
-```bash
-torchrun --standalone --nproc-per-node=8 demo_cp.py \
-  --ulysses-size 4 --ring-size 2 --ring-partition cyclic
-torchrun --standalone --nproc-per-node=8 demo_cp.py \
-  --ulysses-size 4 --ring-size 2 --ring-partition contiguous
-```
-
-### Shared example
-
-This example uses PyTorch's differentiable All-to-All, replicated weights and
-the same full raster pack on every rank. Ulysses, projections, loss normalization
-and gradient reduction are caller code. For clarity, it materializes a Ring
-shard before the Ulysses slice; data loading can gather the final local rows
-directly by composing those maps.
-
-<details>
-<summary>Complete Python example: demo_cp.py</summary>
-
-```python
-import argparse
-import os
-
-import torch
-import torch.distributed as dist
-import torch.nn.functional as F
-from torch.distributed.nn.functional import all_to_all_single
-
-from vsa import raster_to_block_wo_padding, vsa_attention
-from vsa_layout import Segment, build_vsa_layout
-
-
-def exchange_heads(mixed, group):
-    # [A,H,4,D] -> four [U*A,H/U,D] tensors; backward exchanges gradients.
-    if group is None:
-        return mixed.unbind(2)
-    u = dist.get_world_size(group)
-    a, h, n, d = mixed.shape
-    send = mixed.reshape(a, u, h // u, n, d).transpose(0, 1).contiguous()
-    recv = all_to_all_single(torch.empty_like(send), send, group=group)
-    return recv.reshape(u * a, h // u, n, d).unbind(2)
-
-
-def exchange_tokens(out, group):
-    # [U*A,H/U,D] -> [A,H,D], reversing the forward head exchange.
-    if group is None:
-        return out
-    u = dist.get_world_size(group)
-    t, h, d = out.shape
-    send = out.reshape(u, t // u, h, d).contiguous()
-    recv = all_to_all_single(torch.empty_like(send), send, group=group)
-    return recv.permute(1, 0, 2, 3).reshape(t // u, u * h, d)
-
-
-parser = argparse.ArgumentParser()
-parser.add_argument("--ulysses-size", type=int, default=1)
-parser.add_argument("--ring-size", type=int, default=1)
-parser.add_argument("--ring-partition", choices=("cyclic", "contiguous"), default="cyclic")
-args = parser.parse_args()
-U, R, H, D = args.ulysses_size, args.ring_size, 8, 128
-input_order = "block" if R > 1 else "raster"
-C = H * D
-world = int(os.environ.get("WORLD_SIZE", "1"))
-if U < 1 or R < 1 or H % U or world != U * R:
-    parser.error("Require U >= 1, R >= 1, H % U == 0 and WORLD_SIZE == U * R")
-device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
-torch.cuda.set_device(device)
-rank = 0
-if world > 1:
-    dist.init_process_group("nccl")
-    rank = dist.get_rank()
-
-# All ranks create all subgroups in the same order, once before the layers.
-ulysses_group = ring_group = None
-if U > 1:
-    for r in range(R):
-        group = dist.new_group(list(range(r * U, (r + 1) * U)))
-        if rank // U == r:
-            ulysses_group = group
-if R > 1:
-    for u in range(U):
-        group = dist.new_group([r * U + u for r in range(R)])
-        if rank % U == u:
-            ring_group = group
-
-samples = [
-    [Segment("video", (5, 9, 11), sparsity=0.9), Segment("text", 67)],
-    [Segment("video", (1, 3, 5)), Segment("text", 7)],
-]
-T = sum(segment.tokens for sample in samples for segment in sample)  # 584
-layout = build_vsa_layout(
-    samples, head_num=H // U, input_order=input_order, device=device,
-    ring_cp_group=ring_group, ring_partition=args.ring_partition,
-)
-torch.manual_seed(1234)  # Identical mock input and replicated weights on all ranks.
-tokens_global = torch.randn(T, C, device=device, dtype=torch.bfloat16)
-# Row IDs illustrate the mapping; use the model's original coordinates for RoPE.
-position_ids_global = torch.arange(T, device=device)
-
-# Ring only: reorder and select whole blocks before the layers.
-tokens_attention = tokens_global
-position_ids_attention = position_ids_global
-if R > 1:
-    tokens_attention = raster_to_block_wo_padding(tokens_global, vsa_layout=layout)
-    position_ids_attention = raster_to_block_wo_padding(position_ids_global, vsa_layout=layout)
-
-# Equal Ulysses capacity across Ring owners, including partial edge blocks.
-max_tokens = layout.tokens
-if layout.ring is not None:
-    max_tokens = int(layout.ring.peer_block_sizes.sum(dim=1).max().item())
-A = (max_tokens + U - 1) // U
-tail = U * A - layout.tokens
-start = (rank % U) * A
-x = F.pad(tokens_attention, (0, 0, 0, tail))[start:start + A].contiguous()
-position_ids_local = F.pad(position_ids_attention, (0, tail), value=-1)[start:start + A]
-valid = torch.arange(start, start + A, device=device) < layout.tokens
-
-layers = torch.nn.ModuleList([
-    torch.nn.ModuleList([
-        torch.nn.Linear(C, 4 * C, bias=False, device=device, dtype=torch.bfloat16),
-        torch.nn.Linear(C, C, bias=False, device=device, dtype=torch.bfloat16),
-    ]) for _ in range(2)
-])
-optimizer = torch.optim.SGD(layers.parameters(), lr=1e-3)
-for qkvg_projection, output_projection in layers:
-    mixed = qkvg_projection(x).view(A, H, 4, D)
-    q, k, v, gate = (
-        t[:layout.tokens].contiguous() for t in exchange_heads(mixed, ulysses_group)
-    )
-    # If applying RoPE here, use position_ids_attention for these unpadded rows.
-    out = vsa_attention(q, k, v, gate, layout)
-    out = F.pad(out, (0, 0, 0, 0, 0, tail))
-    out = exchange_tokens(out, ulysses_group).reshape(A, C)
-    x = (x + output_projection(out)).masked_fill(~valid[:, None], 0)
-
-# Sum local contributions to a global-token-normalized illustrative loss.
-loss = x.float().square().masked_fill(~valid[:, None], 0).sum() / (T * C)
-loss.backward()
-if world > 1:
-    # SUM, not average: each local loss already uses the global denominator.
-    for parameter in layers.parameters():
-        dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
-optimizer.step()
-reported_loss = loss.detach()
-if world > 1:
-    dist.all_reduce(reported_loss, op=dist.ReduceOp.SUM)
-if rank == 0:
-    print(f"U={U}, R={R}, order={input_order}, loss={reported_loss.item():.6f}")
-if world > 1:
-    dist.destroy_process_group()
-```
-
-</details>
-
-For the example, each layer projects `[A, 1024]` into Q/K/V/gate with shape
-`[A, 8, 128]`. After Ulysses exchange and removal of transport padding, each
-has shape `[layout.tokens, 8/U, 128]`; the inverse exchange and output
-projection restore `[A, 1024]`. With no CP, `A = layout.tokens = 584`.
-The output stays in the rank's input order across layers. Apply the same row
-selection to targets and masks; preserve original position values rather than
-renumbering the local shard. Collect output token shards only if the application
-needs a full global tensor after the stack; attention's internal Ring merging
-is already handled by VSA.
-When using a training framework's parameter-gradient reduction, use that
-instead of the example's manual reduction, so gradients are not reduced twice.
-
 ## Ring context parallelism
 
 Pass an existing Ring process group to the same layout builder and attention API:
@@ -367,7 +159,8 @@ position_ids_local = raster_to_block_wo_padding(position_ids_global, vsa_layout=
 out = vsa_attention(q, k, v, gate, layout)
 ```
 
-Here `H` is the head count seen by VSA (`H_total // U` with Ulysses).
+Here `U` is the Ulysses group size, and `H` is the head count seen by VSA
+(`H_total // U` with Ulysses).
 `ring_cp_group=None` creates a full `VSALayout` (`layout.ring is None`),
 without distributed initialization, including on CPU. A member group creates
 a local Ring layout and supplies its rank and size. Nonmember handles are
@@ -647,6 +440,214 @@ requires a global gather, and larger rings add hops. Partial blocks, sample
 lengths, sparsity and selected owners affect load balance and overlap.
 Compare full-workload latency for both policies; balanced block counts and
 visible P2P overlap alone do not guarantee better throughput.
+
+## Examples with and without context parallelism
+
+The following example uses two attention layers with residual connections and
+one optimizer step. It supports all three modes through the same VSA API.
+The entire process world is one context-parallel group; `H` must be divisible
+by the Ulysses size `U`, and the world size must equal `U * R`.
+
+| Mode | Input preparation before the layers | Q/K/V/gate passed to VSA |
+| --- | --- | --- |
+| No CP (`U=1, R=1`) | Keep raster order | All tokens and all heads |
+| Ulysses only (`U>1, R=1`) | Split the raster stream into U token slices | All tokens and H/U heads after All-to-All |
+| Ring + Ulysses (`U>1, R>1`) | Select whole Ring-owned blocks and reorder once; then split each compact Ring stream into U token slices | This Ring owner's valid tokens and H/U heads after All-to-All |
+
+Ulysses All-to-All reconstructs the token stream before VSA runs: raster order
+without Ring, compact block order with Ring.
+Only trailing **transport padding** is added to equalize Ulysses message sizes;
+it is removed before attention and excluded from the loss. This is separate
+from VSA's internal 64-slot block padding.
+
+### No CP
+
+Save the shared Python example below as `demo_cp.py` in this repository, then run:
+
+```bash
+python demo_cp.py
+```
+
+### Ulysses CP only
+
+Use raster input as in the no-CP example. Four GPUs split tokens before the
+layers and exchange tokens for heads inside each layer; no input reorder is needed:
+
+```bash
+torchrun --standalone --nproc-per-node=4 demo_cp.py --ulysses-size 4
+```
+
+### Ring + Ulysses CP
+
+For eight GPUs with `U=4, R=2`, Ulysses groups are `[0,1,2,3]` and
+`[4,5,6,7]`; Ring groups are `[0,4]`, `[1,5]`, `[2,6]`, `[3,7]`.
+Each Ring pair handles the same head slice and complementary block ownership.
+Both ownership policies use the same preparation and attention calls:
+
+```bash
+torchrun --standalone --nproc-per-node=8 demo_cp.py \
+  --ulysses-size 4 --ring-size 2 --ring-partition cyclic
+torchrun --standalone --nproc-per-node=8 demo_cp.py \
+  --ulysses-size 4 --ring-size 2 --ring-partition contiguous
+```
+
+### Shared example
+
+This example uses PyTorch's differentiable All-to-All, replicated weights and
+the same full raster pack on every rank. Ulysses, projections, loss normalization
+and gradient reduction are caller code. For clarity, it materializes a Ring
+shard before the Ulysses slice; data loading can gather the final local rows
+directly by composing those maps.
+
+<details>
+<summary>Complete Python example: demo_cp.py</summary>
+
+```python
+import argparse
+import os
+
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from torch.distributed.nn.functional import all_to_all_single
+
+from vsa import raster_to_block_wo_padding, vsa_attention
+from vsa_layout import Segment, build_vsa_layout
+
+
+def exchange_heads(mixed, group):
+    # [A,H,4,D] -> four [U*A,H/U,D] tensors; backward exchanges gradients.
+    if group is None:
+        return mixed.unbind(2)
+    u = dist.get_world_size(group)
+    a, h, n, d = mixed.shape
+    send = mixed.reshape(a, u, h // u, n, d).transpose(0, 1).contiguous()
+    recv = all_to_all_single(torch.empty_like(send), send, group=group)
+    return recv.reshape(u * a, h // u, n, d).unbind(2)
+
+
+def exchange_tokens(out, group):
+    # [U*A,H/U,D] -> [A,H,D], reversing the forward head exchange.
+    if group is None:
+        return out
+    u = dist.get_world_size(group)
+    t, h, d = out.shape
+    send = out.reshape(u, t // u, h, d).contiguous()
+    recv = all_to_all_single(torch.empty_like(send), send, group=group)
+    return recv.permute(1, 0, 2, 3).reshape(t // u, u * h, d)
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--ulysses-size", type=int, default=1)
+parser.add_argument("--ring-size", type=int, default=1)
+parser.add_argument("--ring-partition", choices=("cyclic", "contiguous"), default="cyclic")
+args = parser.parse_args()
+U, R, H, D = args.ulysses_size, args.ring_size, 8, 128
+input_order = "block" if R > 1 else "raster"
+C = H * D
+world = int(os.environ.get("WORLD_SIZE", "1"))
+if U < 1 or R < 1 or H % U or world != U * R:
+    parser.error("Require U >= 1, R >= 1, H % U == 0 and WORLD_SIZE == U * R")
+device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
+torch.cuda.set_device(device)
+rank = 0
+if world > 1:
+    dist.init_process_group("nccl")
+    rank = dist.get_rank()
+
+# All ranks create all subgroups in the same order, once before the layers.
+ulysses_group = ring_group = None
+if U > 1:
+    for r in range(R):
+        group = dist.new_group(list(range(r * U, (r + 1) * U)))
+        if rank // U == r:
+            ulysses_group = group
+if R > 1:
+    for u in range(U):
+        group = dist.new_group([r * U + u for r in range(R)])
+        if rank % U == u:
+            ring_group = group
+
+samples = [
+    [Segment("video", (5, 9, 11), sparsity=0.9), Segment("text", 67)],
+    [Segment("video", (1, 3, 5)), Segment("text", 7)],
+]
+T = sum(segment.tokens for sample in samples for segment in sample)  # 584
+layout = build_vsa_layout(
+    samples, head_num=H // U, input_order=input_order, device=device,
+    ring_cp_group=ring_group, ring_partition=args.ring_partition,
+)
+torch.manual_seed(1234)  # Identical mock input and replicated weights on all ranks.
+tokens_global = torch.randn(T, C, device=device, dtype=torch.bfloat16)
+# Row IDs illustrate the mapping; use the model's original coordinates for RoPE.
+position_ids_global = torch.arange(T, device=device)
+
+# Ring only: reorder and select whole blocks before the layers.
+tokens_attention = tokens_global
+position_ids_attention = position_ids_global
+if R > 1:
+    tokens_attention = raster_to_block_wo_padding(tokens_global, vsa_layout=layout)
+    position_ids_attention = raster_to_block_wo_padding(position_ids_global, vsa_layout=layout)
+
+# Equal Ulysses capacity across Ring owners, including partial edge blocks.
+max_tokens = layout.tokens
+if layout.ring is not None:
+    max_tokens = int(layout.ring.peer_block_sizes.sum(dim=1).max().item())
+A = (max_tokens + U - 1) // U
+tail = U * A - layout.tokens
+start = (rank % U) * A
+x = F.pad(tokens_attention, (0, 0, 0, tail))[start:start + A].contiguous()
+position_ids_local = F.pad(position_ids_attention, (0, tail), value=-1)[start:start + A]
+valid = torch.arange(start, start + A, device=device) < layout.tokens
+
+layers = torch.nn.ModuleList([
+    torch.nn.ModuleList([
+        torch.nn.Linear(C, 4 * C, bias=False, device=device, dtype=torch.bfloat16),
+        torch.nn.Linear(C, C, bias=False, device=device, dtype=torch.bfloat16),
+    ]) for _ in range(2)
+])
+optimizer = torch.optim.SGD(layers.parameters(), lr=1e-3)
+for qkvg_projection, output_projection in layers:
+    mixed = qkvg_projection(x).view(A, H, 4, D)
+    q, k, v, gate = (
+        t[:layout.tokens].contiguous() for t in exchange_heads(mixed, ulysses_group)
+    )
+    # If applying RoPE here, use position_ids_attention for these unpadded rows.
+    out = vsa_attention(q, k, v, gate, layout)
+    out = F.pad(out, (0, 0, 0, 0, 0, tail))
+    out = exchange_tokens(out, ulysses_group).reshape(A, C)
+    x = (x + output_projection(out)).masked_fill(~valid[:, None], 0)
+
+# Sum local contributions to a global-token-normalized illustrative loss.
+loss = x.float().square().masked_fill(~valid[:, None], 0).sum() / (T * C)
+loss.backward()
+if world > 1:
+    # SUM, not average: each local loss already uses the global denominator.
+    for parameter in layers.parameters():
+        dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
+optimizer.step()
+reported_loss = loss.detach()
+if world > 1:
+    dist.all_reduce(reported_loss, op=dist.ReduceOp.SUM)
+if rank == 0:
+    print(f"U={U}, R={R}, order={input_order}, loss={reported_loss.item():.6f}")
+if world > 1:
+    dist.destroy_process_group()
+```
+
+</details>
+
+For the example, each layer projects `[A, 1024]` into Q/K/V/gate with shape
+`[A, 8, 128]`. After Ulysses exchange and removal of transport padding, each
+has shape `[layout.tokens, 8/U, 128]`; the inverse exchange and output
+projection restore `[A, 1024]`. With no CP, `A = layout.tokens = 584`.
+The output stays in the rank's input order across layers. Apply the same row
+selection to targets and masks; preserve original position values rather than
+renumbering the local shard. Collect output token shards only if the application
+needs a full global tensor after the stack; attention's internal Ring merging
+is already handled by VSA.
+When using a training framework's parameter-gradient reduction, use that
+instead of the example's manual reduction, so gradients are not reduced twice.
 
 ## Performance
 

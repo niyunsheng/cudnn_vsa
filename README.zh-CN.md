@@ -169,10 +169,9 @@ VSA 借用进程组，调用方应使其存活到反向和 CUDA Graph replay 完
 
 ### Block 归属
 
-Ring 输入仅包含拥有的 block 的有效 token，按全局 block ID 递增排列。
+Ring 模式调用 `vsa_attention` 时，Q/K/V/gate 必须符合 layout 定义的本地 block 顺序：
+仅包含本 rank 拥有的 block 的有效 token，按全局 block ID 递增排列，不含 padding。
 `raster_to_block_wo_padding` 融合分片选择与重排，不物化完整的全局 block 中间张量，也不通信。
-已有本地 block 输入时跳过转换。全局数据已经按 block 排列时，直接分发拥有的 block，
-不要再次执行 raster 转换。
 
 `ring_partition` 独立于 `input_order` 选择归属方式，结果记录在
 `layout.ring.partition` 中：

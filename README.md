@@ -173,11 +173,11 @@ the same `ring_cp_group`.
 
 ### Block ownership
 
-Ring input contains only valid tokens from owned blocks, in increasing global
-block-ID order. `raster_to_block_wo_padding` fuses selection and reordering without a full
-block-ordered intermediate or communication. Already-local block input skips
-it. For globally block-ordered data, distribute owned blocks directly instead
-of applying the raster conversion again.
+When calling `vsa_attention` in Ring mode, Q/K/V/gate must follow the layout's
+local block order: only valid tokens from this rank's owned blocks, in
+increasing global block-ID order, without padding.
+`raster_to_block_wo_padding` fuses selection and reordering without a full
+block-ordered intermediate or communication.
 
 `ring_partition` chooses ownership independently of `input_order`; the choice
 is stored in `layout.ring.partition`:

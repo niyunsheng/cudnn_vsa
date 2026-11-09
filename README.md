@@ -273,11 +273,12 @@ actual overlap depends on kernel resource usage and must be measured.
 
 ### Why this design
 
-- **Whole blocks, compact inputs:** preserve pooling/routing units without
+- **Whole blocks, compact inputs**: preserve pooling/routing units without
   adding attention padding to projections or MLPs.
-- **Gather summaries, circulate K/V:** enable global routing and coarse
+- **Gather summaries, circulate K/V**: enable global routing and coarse
   attention without keeping full token-level K/V on every rank.
-- **Fixed internal capacities:** keep P2P shapes consistent and allow CUDA Graph reuse.
+- **Equal-sized buffers**: pad internal buffers to the maximum per-rank block
+  count for matching P2P shapes and CUDA Graph reuse.
 
 Fine attention sends whole padded K/V shards, so sparsity reduces computation,
 not Ring transfer volume. Compare both ownership policies on the actual workload.

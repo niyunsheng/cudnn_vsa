@@ -262,9 +262,9 @@ VSA 在 fine attention 之前将 P2P 入队，以重叠通信和计算；
 
 ### 设计原因
 
-- **完整 block、紧凑输入：**保持 pooling/路由单元完整，避免投影和 MLP 处理 attention padding。
-- **汇总均值、轮转 K/V：**支持全局路由和 coarse attention，无需每个 rank 保存完整的 token 级 K/V。
-- **固定内部容量：**保证 P2P 形状一致，支持 CUDA Graph 复用。
+- **完整 block、紧凑输入**：保持 pooling/路由单元完整，避免投影和 MLP 处理 attention padding。
+- **汇总均值、轮转 K/V**：支持全局路由和 coarse attention，无需每个 rank 保存完整的 token 级 K/V。
+- **统一缓冲区大小**：按 Ring 组内最多的 block 数补齐内部缓冲区，保证 P2P 形状一致，支持 CUDA Graph 复用。
 
 Fine attention 仍传输完整的带 padding K/V 分片，因此稀疏度减少计算量，不减少 Ring 传输量。
 两种归属策略应在实际工作负载中比较。

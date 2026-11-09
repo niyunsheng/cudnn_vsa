@@ -273,25 +273,14 @@ actual overlap depends on kernel resource usage and must be measured.
 
 ### Why this design
 
-- **Whole-block ownership** keeps each pooling/routing/BSA unit on one Ring
-  rank. Compact inputs avoid sending attention-slot padding through projections
-  and MLPs; reordering happens once at the model boundary.
-- **Two ownership policies** support different workloads. Cyclic spreads
-  neighboring blocks; contiguous gives each sample/rank one interval and rotates
-  remainder recipients. Both compute ownership once and reuse the maps in all layers.
-- **Global block summaries** let local Q choose top-k over the full sample and
-  compute coarse attention. Fine attention circulates token-level K/V through
-  two receive/compute buffers; Q, output accumulation and dQ stay local.
-- **Equal internal capacities** give matching P2P shapes and support CUDA Graph
-  reuse. Valid sizes and explicit sample boundaries exclude padding and prevent
-  cross-sample attention, including when fine-only and coarse samples share ranks.
+- **Whole blocks, compact inputs:** preserve pooling/routing units without
+  adding attention padding to projections or MLPs.
+- **Gather summaries, circulate K/V:** enable global routing and coarse
+  attention without keeping full token-level K/V on every rank.
+- **Fixed internal capacities:** keep P2P shapes consistent and allow CUDA Graph reuse.
 
-Fine attention sends **whole padded K/V shards**, even when few blocks from a
-peer are selected. Sparsity reduces compute, not these bytes; pooled K/V still
-requires a global gather, and larger rings add hops. Partial blocks, sample
-lengths, sparsity and selected owners affect load balance and overlap.
-Compare full-workload latency for both policies; balanced block counts and
-visible P2P overlap alone do not guarantee better throughput.
+Fine attention sends whole padded K/V shards, so sparsity reduces computation,
+not Ring transfer volume. Compare both ownership policies on the actual workload.
 
 ## Examples with and without context parallelism
 

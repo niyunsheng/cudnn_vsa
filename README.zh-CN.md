@@ -262,22 +262,12 @@ VSA 在 fine attention 之前将 P2P 入队，以重叠通信和计算；
 
 ### 设计原因
 
-- **完整 block 归属**让 pooling、路由和 BSA 的每个计算单元留在一个 Ring rank 上。
-  紧凑输入避免投影和 MLP 处理 attention slot padding；重排在模型边界只做一次。
-- **两种归属策略**适配不同工作负载。循环分配将相邻 block 分散开；
-  连续分配为每个样本/rank 保留一个区间，并轮转余数 block 的接收者。
-  两者均只计算一次归属，所有层复用映射。
-- **全局 block 汇总**让本地 Q 在完整样本内选择 top-k 并计算 coarse attention。
-  Fine attention 通过两个接收/计算缓冲区轮转 token 级 K/V；Q、输出累加和 dQ 留在本地。
-- **相同的内部容量**保证 P2P 形状匹配，支持 CUDA Graph 复用。
-  有效大小和显式样本边界排除 padding、避免跨样本 attention，
-  同样适用于 fine-only 与 coarse 样本分布在多个 rank 的情况。
+- **完整 block、紧凑输入：**保持 pooling/路由单元完整，避免投影和 MLP 处理 attention padding。
+- **汇总均值、轮转 K/V：**支持全局路由和 coarse attention，无需每个 rank 保存完整的 token 级 K/V。
+- **固定内部容量：**保证 P2P 形状一致，支持 CUDA Graph 复用。
 
-Fine attention 传输**整个带 padding 的 K/V 分片**，即使只选择了某个 peer 的少数 block。
-稀疏度减少计算量，不会减少这些字节；池化 K/V 仍需全局 gather，Ring 越大跳数越多。
-不完整 block、样本长度、稀疏度和选中的 owner 都会影响负载均衡与重叠。
-应对两种策略比较完整工作负载的延迟；block 数均衡或 trace 中可见 P2P 重叠，
-都不能单独保证吞吐提升。
+Fine attention 仍传输完整的带 padding K/V 分片，因此稀疏度减少计算量，不减少 Ring 传输量。
+两种归属策略应在实际工作负载中比较。
 
 ## 无 CP、Ulysses CP 和混合 CP 示例
 

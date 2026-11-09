@@ -213,100 +213,31 @@ rank 开始。`extra=0` 时起点不变。
 
 `contiguous` 下，A 从 rank 0 开始，向 rank 0/1/2 分配 `[2, 2, 1]` 个 block。
 B 从分得较少的 rank 2 开始，依次给 rank 2、0 各一个 block；下一个样本从 rank 1 开始。
-后面的路由和执行流程示例使用 `contiguous` 分配。
 
 ### 路由与 top-k
 
-1. [vsa_layout.py](vsa_layout.py) 的 `_build_sample_blocks` 固定样本边界及每个视频的
-   `keep = max(1, ceil((1 - sparsity) * region_blocks))` 预算。
-   选中的 ID 随每次前向的 Q/K 改变；稠密 KV 始终保留。
-2. [vsa_core.py](vsa_core.py) 的 `ring_attention_slots` 按有效 token 数计算本地
-   Q/K/V 的 FP32 均值，dummy 均值为零。K/V 汇总按 rank 顺序 all-gather，
-   再由 `global_to_gather` 恢复全局 block 顺序并移除 dummy。
-   本地 Q 均值由此获得自己样本内的全部候选 K 均值。
-3. 共用的 `route` / `_route_group` 禁用 TF32/autocast，计算未缩放的 FP32
-   `Q_mean @ K_mean.T`。每个 Q block/head 在每个视频 region 内，跨所有 peer
-   独立选择 top-k。`topk(..., sorted=False)` 返回相对 ID，再通过
-   `selected.sort(-1)` 和 `+ start` 得到排序后的全局 ID。
-   稠密 KV 和完整保留的 region 使用静态模板；豁免的稠密 Q 行
-   （`dense_query_full=True`）跳过 top-k。没有动态选择时直接复用模板。
-   路由运行在 `no_grad` 下；梯度通过 fine/coarse attention，不经过离散选择。
-   全局 K 均值使额外的分数/索引 collective 不再需要。Softmax 缩放在 attention 中进行。
-4. [vsa_kernels.py](vsa_kernels.py) 的 `partition_indices` 使用 `global_to_gather`，
-   将选中的全局 ID 映射为各 owner 的本地 block ID 和有效数量。
-   某个 peer 可以没有选中的 key；K/V 到达时，fine attention 使用这些列表。
+1. 按有效 token 计算本地 block 均值，all-gather K 均值并恢复全局 block 顺序，
+   使本地 Q 可以跨所有 Ring rank 选择 KV。
+2. 默认每个 query block/head 用 FP32 `Q_mean @ K_mean.T` 打分，
+   在同一样本的每个视频 region 内独立选 top-k。
+   每个 region 保留 `max(1, ceil((1 - sparsity) * region_blocks))` 个 block。
+3. 将选中的全局 block ID 映射到所属 rank 和本地 block ID，供 fine attention 使用。
+   稠密 KV 始终保留，padding 和其他样本被排除；离散选择不参与求导。
 
-对于上面的样本 A，四个视频 block、稀疏度 0.5 对应 `keep=2`。
-假设 query block `b3` 的某个 head 得到以下分数：
-
-```text
-Video KV block       b1    b2    b3    b4
-Q_mean @ K_mean.T   0.2   0.8   0.1   0.9
-Selected video IDs        b2          b4
-Final global IDs:   [b0, b2, b4]   (b0 is the always-visible text block)
-```
-
-当 R=3 时，peer 列表分别为 rank 0 的 `[0]`（全局 `b0`）、rank 1 的 `[0]`
-（全局 `b2`）和 rank 2 的 `[0]`（全局 `b4`）。
-样本 A 中的 Q block 永远不会将 B 的 `b5/b6` 作为候选。
-存在多个视频 region 时，每个 region 都有自己的 top-k 预算；
-不会对整个 pack 中的所有视频 region 统一执行一次 top-k。
+样本 A 有四个视频 block，`sparsity=0.5` 时 `keep=2`。
+若 top-k 选中 `b2, b4`，加上文本 block `b0`，最终得到 `[b0, b2, b4]`。
 
 ### 执行流程
 
-两种模式共用可微的 FP32 `block_means`。单设备执行选取 coarse block，
-通过 `routing_and_coarse_means` 融合路由 detach 和 coarse 类型转换。
-Ring 对全部本地 slot 做 pooling，包括零值 dummy。
-`_GatherMeans` 将 **FP32 K + BF16 V** 按原始字节打包为一次 all-gather，
-不量化 K。V 在通信 autograd 边界内转换；反向将 dK/dV 合并为一次
-**FP32 reduce-scatter SUM**，向 pooling 返回 FP32 梯度。
-前向汇总的传输量比 FP32 K/V 少 25%；collective 次数仍为前向一次、反向一次。
+| 阶段 | 操作 |
+| --- | --- |
+| Block 汇总 | 计算本地 Q/K/V 均值，all-gather **FP32 K + BF16 V**。 |
+| Fine attention | Q 保持本地，整个 K/V 分片沿 Ring 轮转；计算选中的 block，并在全部选中 key 上用统一的 softmax 归一化合并各步结果。 |
+| Coarse attention | 本地 Q 均值关注同一样本的全部 K/V 均值，随后合并 `fine + gate * coarse[query_block]`；完全稠密的样本仅使用 fine。 |
+| 反向 | 反向遍历 Ring，以 FP32 累加 dQ/dK/dV，并通过 FP32 SUM reduce-scatter 归约池化梯度。 |
 
-对于上面的示例，令 `KV_r` 表示 rank r 的整个内部 K/V 分片，包含 slot padding。
-在整个 fine attention 过程中，Q 保持在原 rank，K/V 传给组内下一个 rank：
-
-```mermaid
-flowchart LR
-    R0["rank 0<br/>Q0 stays local"] -->|K/V| R1["rank 1<br/>Q1 stays local"]
-    R1 -->|K/V| R2["rank 2<br/>Q2 stays local"]
-    R2 -->|K/V| R0
-```
-
-| Fine attention 步骤 | Rank 0 使用 | Rank 1 使用 | Rank 2 使用 |
-| --- | --- | --- | --- |
-| 0：自己的分片 | `Q0, KV0` | `Q1, KV1` | `Q2, KV2` |
-| 1：经过一跳 | `Q0, KV2` | `Q1, KV0` | `Q2, KV1` |
-| 2：经过两跳 | `Q0, KV1` | `Q1, KV2` | `Q2, KV0` |
-
-每一步只计算该 peer 拥有且被选中的 KV block。
-例如，全局 `b5` 映射到以 rank 为主序的位置 7：owner 为 `7 // 3 = 2`，
-本地 block 为 `7 % 3 = 1`。当 rank 0 收到 `KV2` 时，其中属于 B 的 query block
-`b6` 可以关注 B 的 `b5`，而属于 A 的 query block 不能关注 `b5`。
-**Layout/router** 通过 block 列表保证样本隔离。
-**传输层**仅移动缓冲区，不解释 FHW 坐标，也不推断 THD 的样本边界。
-各部分输出使用各自的 log-sum-exp 归一化量加权合并，
-使最终 fine 输出在所有选中的 KV block 上具有统一的 softmax 归一化。
-
-将 fine 阶段入队后，`coarse_attention` 使用本地池化 Q 和全局池化 K/V，
-精度为 BF16，并为每个样本分别设置 Q/KV 边界。
-Q/K 均值在 coarse 边界转换类型；V 均值到达时已经是 BF16。
-Coarse attention 覆盖每个参与样本的所有 block，不受 fine top-k 列表限制。
-`vsa_attention` 恢复紧凑的有效行，并合并为
-`fine + gate * coarse[query_block]`。完全稠密的样本仅使用 fine。
-
-反向以相反方向遍历 Ring，使用最终 fine 输出和 log-sum-exp，
-以 FP32 累加 dQ/dK/dV。池化均值 gather 的伴随操作是 reduce-scatter。
-没有本地 coarse query 的 rank 仍会参与必要的 collective；
-保存的接收缓冲区支持保留计算图后的再次反向。
-
-在 `build_vsa_layout` 中与 `ring_cp_group` 一起设置传输选项。
-`ring_cp_batch_p2p=None` 对延迟初始化的 NCCL 进程组使用独立 P2P，
-对绑定设备的进程组使用批量 P2P，前反向使用相同模式。
-传入布尔值可以显式选择该模式。
-在 SM100、H=2、单样本、128 个物理本地 block 的情况下，
-`ring_cp_bwd_bucket_size="auto"` 为每个反向 bucket 使用 64 个 query block；
-其他形状使用后端默认值。传入 `None` 可使所有情况都使用后端默认值，
-也可以传入正整数指定 bucket 大小。
+`vsa_attention` 内部完成结果合并，输出为按本地 block 顺序排列的有效 token。
+通信调优参数见 [`build_vsa_layout`](vsa_layout.py)。
 
 ### 前向通信重叠
 

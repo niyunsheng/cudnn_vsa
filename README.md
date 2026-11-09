@@ -222,103 +222,33 @@ Global block IDs continue across samples.
 With `contiguous`, A starts at rank 0 and gives `[2, 2, 1]` blocks to ranks
 0/1/2. B starts at rank 2, which received fewer blocks, and gives one block
 each to ranks 2 and 0. The next sample starts at rank 1.
-The routing and execution examples below use the `contiguous` allocation.
 
 ### Routing and top-k
 
-1. [vsa_layout.py](vsa_layout.py)'s `_build_sample_blocks` fixes sample boundaries
-   and each video's `keep = max(1, ceil((1 - sparsity) * region_blocks))` budget.
-   Selected IDs change with Q/K on every forward; dense KV is always included.
-2. [vsa_core.py](vsa_core.py)'s `ring_attention_slots` pools local Q/K/V in FP32
-   using valid token counts; dummy means are zero. K/V summaries are all-gathered
-   in rank order, then `global_to_gather` restores global block order and removes
-   dummies. Local Q means now see all candidate K means in their own sample.
-3. The shared `route` / `_route_group` computes unscaled FP32 `Q_mean @ K_mean.T`
-   with TF32/autocast disabled. Each Q block/head selects top-k independently
-   within each video region, across all peers. `topk(..., sorted=False)` returns
-   relative IDs; `selected.sort(-1)` and `+ start` produce sorted global IDs.
-   Dense KV and fully retained regions use static templates; exempt dense Q
-   rows (`dense_query_full=True`) skip top-k. No dynamic selections means the
-   template is reused directly. Routing runs under `no_grad`; gradients pass
-   through fine/coarse attention, not discrete selection. Global K means avoid
-   any extra score/index collective. Attention applies softmax scaling later.
-4. [vsa_kernels.py](vsa_kernels.py)'s `partition_indices` maps selected global IDs
-   to each owner's local block IDs and valid counts, using `global_to_gather`.
-   A peer can contribute zero keys. These lists drive fine attention as K/V arrives.
+1. Compute local block means from valid tokens. All-gather K means and restore
+   global block order so local Q can select keys across all Ring ranks.
+2. By default, each query block/head scores keys with FP32 `Q_mean @ K_mean.T`
+   and selects top-k independently within each video region of the same sample.
+   Each region keeps `max(1, ceil((1 - sparsity) * region_blocks))` blocks.
+3. Map selected global block IDs to their owning ranks and local block IDs
+   for fine attention. Dense KV is always included; padding and other samples
+   are excluded. The discrete selection does not receive gradients.
 
-For sample A above, four video blocks at sparsity 0.5 give `keep=2`. Suppose
-one head of query block `b3` has these scores:
-
-```text
-Video KV block       b1    b2    b3    b4
-Q_mean @ K_mean.T   0.2   0.8   0.1   0.9
-Selected video IDs        b2          b4
-Final global IDs:   [b0, b2, b4]   (b0 is the always-visible text block)
-```
-
-For R=3, the peer lists are rank 0 `[0]` (global `b0`), rank 1 `[0]` (global
-`b2`) and rank 2 `[0]` (global `b4`). A Q block in sample A never considers B's
-`b5/b6`. With multiple video regions, each region gets its own top-k budget;
-there is no single top-k across all video regions in the pack.
+For sample A, four video blocks at `sparsity=0.5` give `keep=2`. If top-k
+selects `b2, b4`, adding text block `b0` gives `[b0, b2, b4]`.
 
 ### Execution
 
-Both modes share differentiable FP32 `block_means`. Single-device execution
-selects coarse blocks and fuses routing detach/coarse casts in
-`routing_and_coarse_means`. Ring pools all local slots, including zero dummies.
-Its `_GatherMeans` packs **FP32 K + BF16 V** as raw bytes in one all-gather,
-without quantizing K. V is cast inside the communication autograd boundary;
-backward combines dK/dV in one **FP32 reduce-scatter SUM**, returning FP32
-pooling gradients. Forward summary traffic is 25% smaller than FP32 K/V;
-collective counts remain one forward and one backward.
+| Stage | Operation |
+| --- | --- |
+| Block summaries | Compute local Q/K/V means; all-gather **FP32 K + BF16 V**. |
+| Fine attention | Keep Q local and circulate whole K/V shards around the Ring. Compute selected blocks and merge partial outputs with one softmax normalization over all selected keys. |
+| Coarse attention | Attend from local Q means to all K/V means in the same sample, then combine `fine + gate * coarse[query_block]`. Entirely dense samples use fine only. |
+| Backward | Traverse the Ring in reverse, accumulate dQ/dK/dV in FP32, and reduce-scatter pooled gradients with FP32 SUM. |
 
-For the example above, let `KV_r` be rank r's entire internal K/V shard,
-including its slot padding. Q stays on its original rank throughout fine
-attention; K/V moves to the next group rank:
-
-```mermaid
-flowchart LR
-    R0["rank 0<br/>Q0 stays local"] -->|K/V| R1["rank 1<br/>Q1 stays local"]
-    R1 -->|K/V| R2["rank 2<br/>Q2 stays local"]
-    R2 -->|K/V| R0
-```
-
-| Fine-attention step | Rank 0 uses | Rank 1 uses | Rank 2 uses |
-| --- | --- | --- | --- |
-| 0: own shard | `Q0, KV0` | `Q1, KV1` | `Q2, KV2` |
-| 1: after one hop | `Q0, KV2` | `Q1, KV0` | `Q2, KV1` |
-| 2: after two hops | `Q0, KV1` | `Q1, KV2` | `Q2, KV0` |
-
-Each step evaluates only the selected KV blocks owned by that peer. For
-example, global `b5` maps to rank-major position 7: owner `7 // 3 = 2`,
-local block `7 % 3 = 1`. When rank 0 receives `KV2`, its B query block `b6`
-may attend to B's `b5`; its A query blocks cannot attend to `b5`. The **layout/router** enforce this
-sample isolation through the block lists. The **transport** just moves
-buffers; it does not interpret FHW coordinates or infer THD sample boundaries.
-Partial outputs are weighted using their log-sum-exp normalizers so the final
-fine output has one softmax normalization over all selected KV blocks.
-
-After enqueuing the fine pass, `coarse_attention` uses local pooled Q and
-global pooled K/V in BF16, with separate per-sample Q/KV boundaries. Q/K means
-are cast at the coarse boundary; V means already arrive in BF16.
-Coarse attention covers all blocks in each participating sample, independently
-of the fine top-k lists. `vsa_attention` restores compact valid rows and merges
-`fine + gate * coarse[query_block]`. Entirely dense samples use fine only.
-
-Backward traverses the ring in reverse, using the final fine output and
-log-sum-exp, and accumulates dQ/dK/dV in FP32. The pooled-mean gather has a
-reduce-scatter adjoint. Ranks without local coarse queries still participate
-in the required collectives; saved receive buffers support retained-graph
-backward.
-
-Set transport options on `build_vsa_layout`, alongside `ring_cp_group`.
-`ring_cp_batch_p2p=None` uses individual P2P for lazy NCCL groups and batched
-P2P for device-bound groups, using the same mode in forward and backward.
-A boolean selects that mode explicitly.
-`ring_cp_bwd_bucket_size="auto"` uses 64 query blocks per backward bucket for
-SM100, H=2, one sample and 128 physical local blocks; other shapes use the
-backend default. Pass `None` for the backend default everywhere, or a positive
-integer to select a bucket size.
+`vsa_attention` handles the merging and returns valid tokens in local block
+order. Communication tuning options are documented in
+[`build_vsa_layout`](vsa_layout.py).
 
 ### Forward communication overlap
 

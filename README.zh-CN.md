@@ -79,7 +79,9 @@ Block 输入只包含按 block 排列的有效 token，不含 padding。
 from vsa import raster_to_block_wo_padding
 
 layout = build_vsa_layout(samples, head_num=H, input_order="block", device="cuda")
+# [T_global, C] -> [T_global, C]: reorder rows, without padding.
 tokens_block = raster_to_block_wo_padding(tokens_global, vsa_layout=layout)
+# [T_global, 3] -> [T_global, 3]: preserve each (f, h, w) coordinate.
 position_ids_block = raster_to_block_wo_padding(position_ids_global, vsa_layout=layout)
 ```
 
@@ -151,11 +153,13 @@ layout = build_vsa_layout(
     samples, head_num=H, input_order="block", device="cuda",
     ring_cp_group=group, ring_partition="cyclic",  # Or "contiguous".
 )
-# Global raster inputs -> this Ring rank's compact block stream, once per pack.
+# T_ring = layout.tokens: valid tokens owned by this Ring rank; C is hidden size.
+# [T_global, C] -> [T_ring, C]: select owned blocks and reorder, without padding.
 tokens_local = raster_to_block_wo_padding(tokens_global, vsa_layout=layout)
+# [T_global, 3] -> [T_ring, 3], with the same row mapping.
 position_ids_local = raster_to_block_wo_padding(position_ids_global, vsa_layout=layout)
-# Project tokens_local into local Q/K/V/gate before attention:
-out = vsa_attention(q, k, v, gate, layout)
+# Project tokens_local into Q/K/V/gate, each [T_ring, H, D].
+out = vsa_attention(q, k, v, gate, layout)  # [T_ring, H, D]
 ```
 
 这里的 `H` 是 VSA 收到的 head 数。
@@ -350,8 +354,8 @@ def exchange_heads(mixed, group):
         return mixed.unbind(2)
     u = dist.get_world_size(group)
     a, h, n, d = mixed.shape
-    send = mixed.reshape(a, u, h // u, n, d).transpose(0, 1).contiguous()
-    recv = all_to_all_single(torch.empty_like(send), send, group=group)
+    send = mixed.reshape(a, u, h // u, n, d).transpose(0, 1).contiguous()  # [U,A,H/U,4,D]
+    recv = all_to_all_single(torch.empty_like(send), send, group=group)  # [U,A,H/U,4,D]
     return recv.reshape(u * a, h // u, n, d).unbind(2)
 
 
@@ -361,8 +365,8 @@ def exchange_tokens(out, group):
         return out
     u = dist.get_world_size(group)
     t, h, d = out.shape
-    send = out.reshape(u, t // u, h, d).contiguous()
-    recv = all_to_all_single(torch.empty_like(send), send, group=group)
+    send = out.reshape(u, t // u, h, d).contiguous()  # [U,A,H/U,D]
+    recv = all_to_all_single(torch.empty_like(send), send, group=group)  # [U,A,H/U,D]
     return recv.permute(1, 0, 2, 3).reshape(t // u, u * h, d)
 
 
@@ -373,7 +377,7 @@ parser.add_argument("--ring-partition", choices=("cyclic", "contiguous"), defaul
 args = parser.parse_args()
 U, R, H, D = args.ulysses_size, args.ring_size, 8, 128
 input_order = "block" if R > 1 else "raster"
-C = H * D
+C = H * D  # Hidden size: 1024.
 world = int(os.environ.get("WORLD_SIZE", "1"))
 if U < 1 or R < 1 or H % U or world != U * R:
     parser.error("Require U >= 1, R >= 1, H % U == 0 and WORLD_SIZE == U * R")
@@ -401,13 +405,15 @@ samples = [
     [Segment("video", (5, 9, 11), sparsity=0.9), Segment("text", 67)],
     [Segment("video", (1, 3, 5)), Segment("text", 7)],
 ]
-T = sum(segment.tokens for sample in samples for segment in sample)  # 584
+T = sum(segment.tokens for sample in samples for segment in sample)  # T_global = 584.
 layout = build_vsa_layout(
     samples, head_num=H // U, input_order=input_order, device=device,
     ring_cp_group=ring_group, ring_partition=args.ring_partition,
 )
+# Shape notation: T_ring = layout.tokens (T if R=1); H is the total head count.
+# T_ring can differ across Ring ranks; it need not equal T/R.
 torch.manual_seed(1234)  # Identical mock input and replicated weights on all ranks.
-tokens_global = torch.randn(T, C, device=device, dtype=torch.bfloat16)
+tokens_global = torch.randn(T, C, device=device, dtype=torch.bfloat16)  # [T,C] = [584,1024]
 # Example 3D RoPE convention: text uses (1..L, 0, 0), video time starts at L+1.
 position_rows = []
 for video, text in samples:
@@ -417,13 +423,15 @@ for video, text in samples:
     text_ids = torch.zeros(text.tokens, 3, device=device, dtype=torch.long)
     text_ids[:, 0] = torch.arange(1, text.tokens + 1, device=device)
     position_rows.extend((video_ids, text_ids))
-position_ids_global = torch.cat(position_rows)  # [T, 3]: original (f, h, w) coordinates.
+position_ids_global = torch.cat(position_rows)  # [T,3] = [584,3]: original (f, h, w).
 
 # Ring sharding + reorder: layout.ring.partition selects cyclic/contiguous blocks.
 tokens_attention = tokens_global
 position_ids_attention = position_ids_global
 if R > 1:
+    # [T,C] -> [T_ring,C]: this Ring rank's valid tokens in compact block order.
     tokens_attention = raster_to_block_wo_padding(tokens_global, vsa_layout=layout)
+    # [T,3] -> [T_ring,3]: select/reorder the same token rows.
     position_ids_attention = raster_to_block_wo_padding(position_ids_global, vsa_layout=layout)
 
 # Ulysses preparation: equal message sizes, then U token slices of this Ring shard.
@@ -431,12 +439,14 @@ if R > 1:
 max_tokens = layout.tokens
 if layout.ring is not None:
     max_tokens = int(layout.ring.peer_block_sizes.sum(dim=1).max().item())
-A = (max_tokens + U - 1) // U
-tail = U * A - layout.tokens
+A = (max_tokens + U - 1) // U  # Token rows per Ulysses rank, including transport padding.
+tail = U * A - layout.tokens  # U*A - T_ring.
 start = (rank % U) * A
+# [T_ring,C] -> [U*A,C] -> [A,C].
 x = F.pad(tokens_attention, (0, 0, 0, tail))[start:start + A].contiguous()
+# [T_ring,3] -> [U*A,3] -> [A,3].
 position_ids_local = F.pad(position_ids_attention, (0, 0, 0, tail), value=-1)[start:start + A]
-valid = torch.arange(start, start + A, device=device) < layout.tokens
+valid = torch.arange(start, start + A, device=device) < layout.tokens  # [A]
 
 layers = torch.nn.ModuleList([
     torch.nn.ModuleList([
@@ -446,16 +456,17 @@ layers = torch.nn.ModuleList([
 ])
 optimizer = torch.optim.SGD(layers.parameters(), lr=1e-3)
 for qkvg_projection, output_projection in layers:
-    mixed = qkvg_projection(x).view(A, H, 4, D)
-    # All-to-All restores this Ring shard; remove Ulysses tail padding.
+    mixed = qkvg_projection(x).view(A, H, 4, D)  # [A,C] -> [A,4*C] -> [A,H,4,D]
+    # All-to-All: four [U*A,H/U,D] tensors; trim each to [T_ring,H/U,D].
     q, k, v, gate = (
         t[:layout.tokens].contiguous() for t in exchange_heads(mixed, ulysses_group)
     )
-    # If applying RoPE here, use position_ids_attention for these unpadded rows.
-    out = vsa_attention(q, k, v, gate, layout)
-    out = F.pad(out, (0, 0, 0, 0, 0, tail))
-    out = exchange_tokens(out, ulysses_group).reshape(A, C)
-    x = (x + output_projection(out)).masked_fill(~valid[:, None], 0)
+    # RoPE uses position_ids_attention [T_ring,3] for these unpadded Q/K rows.
+    # VSA adds/removes block padding internally; its public shapes stay compact.
+    out = vsa_attention(q, k, v, gate, layout)  # [T_ring,H/U,D]
+    out = F.pad(out, (0, 0, 0, 0, 0, tail))  # [U*A,H/U,D]
+    out = exchange_tokens(out, ulysses_group).reshape(A, C)  # -> [A,H,D] -> [A,C]
+    x = (x + output_projection(out)).masked_fill(~valid[:, None], 0)  # [A,C]
 
 # Sum local contributions to a global-token-normalized illustrative loss.
 loss = x.float().square().masked_fill(~valid[:, None], 0).sum() / (T * C)

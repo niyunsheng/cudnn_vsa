@@ -311,6 +311,8 @@ backward buckets, and 10 warmups / 50 timed CUDA Graph replays, with reversed
 run order in the second round. It preserves every exit status, log, native
 benchmark JSON and before/after source hashes; any failure makes the runner
 exit nonzero. Window runs use `VSA_BSA_IMPL=local`; Ring uses the installed BSA.
+See the [2026-11-09 GB200 comparison](docs/window_transport_benchmark_20261109.md)
+for the measured main/Ring/window results and raw timing evidence.
 
 ### Local kernel copy
 

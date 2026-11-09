@@ -95,8 +95,11 @@ Already block-ordered inputs skip this conversion.
 
 A full layout reorders all tokens; a Ring layout also selects the owned blocks.
 Both helpers require a layout with `input_order="block"`, even though
-`raster_to_block_wo_padding` reads raster input. `block_wo_padding_to_raster` accepts only full layouts;
-Ring output gathering belongs to the caller.
+`raster_to_block_wo_padding` reads raster input. `block_wo_padding_to_raster`
+accepts only full layouts. Ring VSA already merges attention contributions from
+KV shards into complete outputs for local Q tokens. Only if a full global
+raster tensor is needed after the layer stack does the caller collect the
+output token shards and restore global row order; otherwise outputs stay sharded.
 
 <details>
 <summary>Exact block order and a small example</summary>
@@ -390,7 +393,9 @@ has shape `[layout.tokens, 8/U, 128]`; the inverse exchange and output
 projection restore `[A, 1024]`. With no CP, `A = layout.tokens = 584`.
 The output stays in the rank's input order across layers. Apply the same row
 selection to targets and masks; preserve original position values rather than
-renumbering the local shard. Final global output gathering is caller-owned.
+renumbering the local shard. Collect output token shards only if the application
+needs a full global tensor after the stack; attention's internal Ring merging
+is already handled by VSA.
 When using a training framework's parameter-gradient reduction, use that
 instead of the example's manual reduction, so gradients are not reduced twice.
 
@@ -941,8 +946,10 @@ block padding, separate from the caller's Ulysses tail padding.
 All three conversions support autograd. Slot-conversion backward uses inverse
 row maps; compact Q/K/V gradients are restored together. Boundary-reorder
 backward scatters into the original raster shape. For Ring, unowned rows get
-zero gradients, without cross-rank reduction. This adjoint is not a global
-output gather: Ring output communication and reassembly remain caller-owned.
+zero gradients, without cross-rank reduction. This input-reorder adjoint does
+not collect output token shards. Optional reconstruction of a full global
+output after the stack is caller-owned; VSA already handles the attention
+result merging within the Ring.
 
 `layout.input_rows` maps supplied rows to global raster rows (identity for a
 full raster layout). `tokens`, `blocks` and row/slot maps are local;

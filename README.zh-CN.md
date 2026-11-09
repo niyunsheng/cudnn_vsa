@@ -93,8 +93,10 @@ Q/K/V/gate 及梯度遵循重排后的 token 顺序。输入已经是 block 顺�
 
 完整 layout 重排全部 token；Ring layout 同时选择本 rank 拥有的 block。
 两个辅助函数都要求 layout 的 `input_order="block"`，即使
-`raster_to_block_wo_padding` 读取的是 raster 输入。`block_wo_padding_to_raster` 仅接受完整 layout；
-Ring 输出的聚合由调用方负责。
+`raster_to_block_wo_padding` 读取的是 raster 输入。`block_wo_padding_to_raster`
+仅接受完整 layout。Ring VSA 已将各 KV 分片的 attention 贡献合并为本地 Q token
+的完整输出。只有在层堆栈结束后需要完整的全局 raster 张量时，调用方才需收集各 rank
+的输出 token 分片并恢复全局行顺序；否则输出继续保持分片。
 
 <details>
 <summary>精确的 block 顺序与小例子</summary>
@@ -384,7 +386,8 @@ Ulysses 交换并移除传输 padding 后，每个张量的形状是
 无 CP 时，`A = layout.tokens = 584`。
 输出在各层之间保持本 rank 的输入顺序。对 target 和 mask 应用相同的行选择；
 保留原始 position 值，不要对本地分片重新编号。
-最终完整输出的聚合由调用方负责。
+只有应用在层堆栈结束后需要完整全局张量时，才收集各 rank 的输出 token 分片；
+attention 内部的 Ring 结果合并已由 VSA 完成。
 使用训练框架的参数梯度归约时，应以其替代示例中的手动归约，避免重复归约梯度。
 
 ## Ring 上下文并行
@@ -905,8 +908,9 @@ padding 分开处理。
 
 三类转换均支持 autograd。Slot 转换的反向使用逆行映射，紧凑 Q/K/V 的梯度融合恢复。
 层堆栈边界重排的反向将梯度 scatter 到原始 raster 形状。
-Ring 未拥有的行梯度为零，不执行跨 rank 归约。这个伴随操作不等于全局输出聚合：
-Ring 输出的通信与重建仍由调用方负责。
+Ring 未拥有的行梯度为零，不执行跨 rank 归约。这个输入重排的伴随操作不会收集
+输出 token 分片。层堆栈结束后，可选的完整全局输出重建由调用方负责；
+Ring 内部的 attention 结果合并已由 VSA 完成。
 
 `layout.input_rows` 将输入行映射到全局 raster 行（完整 raster layout 为恒等映射）。
 `tokens`、`blocks` 和 row/slot 映射描述本地输入；

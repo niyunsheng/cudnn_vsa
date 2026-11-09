@@ -300,6 +300,8 @@ by the Ulysses size `U`, and the world size must equal `U * R`.
 
 Ulysses All-to-All reconstructs the token stream before VSA runs: raster order
 without Ring, compact block order with Ring.
+The demo's `[start:start + A]` slices this stream for Ulysses, independently of
+`ring_partition`; a slice may cross a block boundary.
 Only trailing **transport padding** is added to equalize Ulysses message sizes;
 it is removed before attention and excluded from the loss. This is separate
 from VSA's internal 64-slot block padding.
@@ -434,14 +436,15 @@ for video, text in samples:
     position_rows.extend((video_ids, text_ids))
 position_ids_global = torch.cat(position_rows)  # [T, 3]: original (f, h, w) coordinates.
 
-# Ring only: reorder and select whole blocks before the layers.
+# Ring sharding + reorder: layout.ring.partition selects cyclic/contiguous blocks.
 tokens_attention = tokens_global
 position_ids_attention = position_ids_global
 if R > 1:
     tokens_attention = raster_to_block_wo_padding(tokens_global, vsa_layout=layout)
     position_ids_attention = raster_to_block_wo_padding(position_ids_global, vsa_layout=layout)
 
-# Equal Ulysses capacity across Ring owners, including partial edge blocks.
+# Ulysses preparation: equal message sizes, then U token slices of this Ring shard.
+# Tail padding only; per-block padding is added inside vsa_attention.
 max_tokens = layout.tokens
 if layout.ring is not None:
     max_tokens = int(layout.ring.peer_block_sizes.sum(dim=1).max().item())
@@ -461,6 +464,7 @@ layers = torch.nn.ModuleList([
 optimizer = torch.optim.SGD(layers.parameters(), lr=1e-3)
 for qkvg_projection, output_projection in layers:
     mixed = qkvg_projection(x).view(A, H, 4, D)
+    # All-to-All restores this Ring shard; remove Ulysses tail padding.
     q, k, v, gate = (
         t[:layout.tokens].contiguous() for t in exchange_heads(mixed, ulysses_group)
     )

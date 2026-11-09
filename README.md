@@ -7,6 +7,107 @@
 Packed multimodal attention for DiT/MMDiT training:
 **cuDNN block-sparse fine attention + FA4 varlen coarse attention**.
 
+## Code structure
+
+| File | Responsibility |
+| --- | --- |
+| `vsa.py` | Public attention entry and explicit block/raster reorder helpers |
+| `vsa_core.py` | Routing, cuDNN BSA/FA4 calls, single-device execution and ring communication/autograd |
+| `vsa_layout.py` | Static sample/block geometry, row maps, routing templates and coarse boundaries |
+| `vsa_kernels.py` | Fused token reordering, slot gathers, Q/K/V padding, FP32 pooling and gated merge kernels |
+
+Both input orders share the core's attention math, per-region budgets and
+fine-before-coarse schedule. The core does not import the public entry.
+
+<details>
+<summary>Exact block order and a small example</summary>
+
+1. Keep sample order. Within each sample, place `sparsity=None` segments first,
+   then numeric-sparsity videos, preserving segment order within each category.
+2. Split None-sparsity segments into consecutive chunks of at most 64 tokens.
+   Split numeric-sparsity videos into 4×4×4 tiles, visiting tile origins and
+   valid tokens in F/H/W order (W fastest). Clip edge tiles without padding.
+3. Blocks never cross segment or sample boundaries. Numeric `sparsity=0`
+   still uses tiles; `sparsity=None` uses dense chunks. Ring keeps owned blocks
+   in increasing global block-ID order, preserving order within each block.
+
+For `video=(1, 2, 5), sparsity=0.9` followed by three text tokens, raster rows
+`0..9` are video and `10..12` are text. The block stream is:
+
+| Block | Original raster rows, in supplied order | Valid tokens |
+| --- | --- | ---: |
+| b0: text | `10, 11, 12` | 3 |
+| b1: first video tile | `0, 1, 2, 3, 5, 6, 7, 8` | 8 |
+| b2: edge video tile | `4, 9` | 2 |
+
+The input has 13 rows; attention internally allocates 3×64 slots. Changing
+this video's sparsity to `None` preserves video-before-text order and creates
+blocks of 10 and 3 tokens. `layout.input_rows` maps each supplied row back to
+its global raster row; `raster_to_block_wo_padding(x, vsa_layout=layout)` equals
+`x[layout.input_rows]` by value.
+
+</details>
+
+<details>
+<summary>Reorder operators and layout maps</summary>
+
+| Conversion | Where | Forward / output restoration |
+| --- | --- | --- |
+| Raster → padded blocks | Inside each VSA call with raster input | `raster_to_block_w_padding` for each of Q/K/V; `block_w_padding_to_raster` restores raster output |
+| Raster → compact blocks | Once before the layer stack | `raster_to_block_wo_padding`, also selecting Ring-owned blocks; `block_wo_padding_to_raster` restores a full layout |
+| Compact → padded blocks | Inside each VSA call with block input | `block_wo_padding_to_block_w_padding`; `block_w_padding_to_block_wo_padding` removes output padding |
+
+Names state source order, destination order and padding: `w_padding` means
+with block padding, and `wo_padding` means without it. The `_qkv` variant,
+`block_wo_padding_to_block_w_padding_qkv`, fuses three tensors and is used by
+`vsa_attention`; the unsuffixed version converts one tensor. Fusion shares one
+map and kernel launch for Q/K/V, also in backward, instead of three separate
+launches. It covers padding/restoration, not the QKV linear projection. These slot helpers
+live in `vsa_kernels.py`; the two raster/compact boundary helpers live in `vsa.py`.
+
+The boundary helper `raster_to_block_wo_padding` accepts one contiguous CUDA
+`[T_global, ...]` tensor and returns `[layout.tokens, ...]`, preserving dtype
+and trailing dimensions. It adds no padding and selects owned rows for Ring.
+Both boundary helpers require `input_order="block"`; the layout describes VSA's
+input order. For full layouts only, restore
+raster output after the stack with
+`block_wo_padding_to_raster(out_block, vsa_layout=layout)`.
+
+The per-layer conversions run inside `vsa_attention`, after any Ulysses head
+exchange. Input order selects the conversion; Ulysses itself requires neither
+order. Ring requires compact block input. The padding here is VSA's 64-slot
+block padding, separate from the caller's Ulysses tail padding.
+
+All three conversions support autograd. Slot-conversion backward uses inverse
+row maps; compact Q/K/V gradients are restored together. Boundary-reorder
+backward scatters into the original raster shape. For Ring, unowned rows get
+zero gradients, without cross-rank reduction. This input-reorder adjoint does
+not collect output token shards. Optional reconstruction of a full global
+output after the stack is caller-owned; VSA already handles the attention
+result merging within the Ring.
+
+`layout.input_rows` maps supplied rows to global raster rows (identity for a
+full raster layout). `tokens`, `blocks` and row/slot maps are local;
+`groups`, `sample_slices` and `sample_lengths` describe global samples.
+`slot_row` maps 64-token slots to input rows (`-1` for padding), and `row_slot`
+is the inverse on valid rows. Padding is zero and excluded from means and attention.
+
+The three kernel implementations are `_reorder_tokens_kernel` (boundary
+gather/scatter), `_gather` (single-tensor slots), and `_gather_qkv` (fused Q/K/V
+slots). Opposite directions reuse these kernels. `slots_are_input` skips slot
+conversion only for block input with `tokens == blocks * 64` and no
+partial/dummy blocks; raster input always takes the raster-to-slot path.
+
+`layout.ring` stores the group/options, rank/size, global token count, block
+ownership, peer sizes and the all-gather permutation. With capacity C,
+`p = layout.ring.global_to_gather[b]` gives `owner = p // C` and
+`local_block = p % C`. `layout.ring.block_ids` lists local global IDs, with
+`-1` for dummy blocks. All ranks derive these maps from geometry without
+communication. Coarse Q boundaries are local, while KV boundaries span the
+global sample; full layouts share Q/KV boundary and block-ID tensors.
+
+</details>
+
 ## Install
 
 With CUDA-enabled PyTorch installed, run from the repository root:
@@ -63,7 +164,7 @@ Add this directory to `PYTHONPATH`, or copy `vsa.py`, `vsa_core.py`,
 | `input_order` | Input tokens | Slot conversion |
 | --- | --- | --- |
 | `"raster"` (default) | Original sample/segment order, video in FHW order | Reorder into blocks and add padding |
-| `"block"` | Valid tokens in the block order below, no padding | Add padding only; skip conversion when every local slot is valid |
+| `"block"` | Valid tokens in the layout's block order, no padding | Add padding only; skip conversion when every local slot is valid |
 
 ### Raster input
 
@@ -519,13 +620,14 @@ instead of the example's manual reduction, so gradients are not reduced twice.
 ## Performance
 
 MFU counts valid attention GEMM FLOPs; backward is twice forward. Padding,
-routing and non-GEMM operations are excluded from the FLOP numerator. Per-GPU
-TFLOP/s divides global FLOPs by latency and GPU count; MFU divides that value
+routing and non-GEMM operations are excluded from the FLOP numerator.
+TFLOPS is reported per GPU: global FLOPs divided by latency and GPU count.
+MFU divides that value
 by the dense BF16 peak (`--peak-tflops`). Phase medians are independent.
 One-time input sharding/reordering, graph capture and profiling are outside
 timing; attention's slot conversion and padding are included.
 
-Environment: GB200 (2500 TFLOP/s BF16), PyTorch 2.12.0a0/NV26.04, CUDA 13.2, cuDNN 9.22 / frontend 1.28.0, Triton 3.6, CuTe 4.6.2, FA4 4.0.0b35.
+Environment: GB200 (2500 TFLOPS BF16), PyTorch 2.12.0a0/NV26.04, CUDA 13.2, cuDNN 9.22 / frontend 1.28.0, Triton 3.6, CuTe 4.6.2, FA4 4.0.0b35.
 
 `benchmark.perf_vsa` supports ordinary and distributed workloads (`--ring`).
 Both modes share input generation, numerical checks, graph capture and timing.
@@ -562,7 +664,7 @@ Use `--input-order block` to measure compact block inputs, `--eager` for eager
 execution, or `--no-profile` to omit traces. Input generation/reordering is
 outside timing. The comparison writes `benchmark/results/compare.json`.
 
-| Method | H | Forward ms | Forward MFU | Backward ms | Backward MFU | F+B ms | F+B TFLOP/s | F+B MFU |
+| Method | H | Forward ms | Forward MFU | Backward ms | Backward MFU | F+B ms | F+B TFLOPS | F+B MFU |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | FA4 full | 2 | 9.357 | 56.82% | 25.409 | 41.85% | 34.772 | 1146.72 | 45.87% |
 | cuDNN VSA (raster) | 2 | 2.366 | 24.81% | 6.746 | 17.40% | 9.114 | 482.91 | 19.32% |
@@ -601,7 +703,7 @@ for vsa_run in single_0 cyclic_0 contiguous_0 contiguous_1 cyclic_1 single_1; do
 done
 ```
 
-| Mode | Forward ms | Forward MFU | Backward ms | Backward MFU | F+B ms | F+B TFLOP/s/GPU | F+B MFU |
+| Mode | Forward ms | Forward MFU | Backward ms | Backward MFU | F+B ms | F+B TFLOPS | F+B MFU |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | No Ring (1 GPU) | 67.460 | 25.17% | 185.257 | 18.33% | 252.572 | 504.15 | 20.17% |
 | Ring4, contiguous | 18.077 | 23.48% | 48.780 | 17.40% | 66.356 | 479.74 | 19.19% |
@@ -667,107 +769,6 @@ The strict BF16 `fine_only_peer` case has an unresolved numerical failure:
 dQ and dK for a six-token fine-only sample can fall below the 0.99999 native
 reference similarity threshold. The command above reports this failure;
 the case and threshold remain unchanged.
-
-## Code structure
-
-| File | Responsibility |
-| --- | --- |
-| `vsa.py` | Public attention entry and explicit block/raster reorder helpers |
-| `vsa_core.py` | Routing, cuDNN BSA/FA4 calls, single-device execution and ring communication/autograd |
-| `vsa_layout.py` | Static sample/block geometry, row maps, routing templates and coarse boundaries |
-| `vsa_kernels.py` | Fused token reordering, slot gathers, Q/K/V padding, FP32 pooling and gated merge kernels |
-
-Both input orders share the core's attention math, per-region budgets and
-fine-before-coarse schedule. The core does not import the public entry.
-
-<details>
-<summary>Exact block order and a small example</summary>
-
-1. Keep sample order. Within each sample, place `sparsity=None` segments first,
-   then numeric-sparsity videos, preserving segment order within each category.
-2. Split None-sparsity segments into consecutive chunks of at most 64 tokens.
-   Split numeric-sparsity videos into 4×4×4 tiles, visiting tile origins and
-   valid tokens in F/H/W order (W fastest). Clip edge tiles without padding.
-3. Blocks never cross segment or sample boundaries. Numeric `sparsity=0`
-   still uses tiles; `sparsity=None` uses dense chunks. Ring keeps owned blocks
-   in increasing global block-ID order, preserving order within each block.
-
-For `video=(1, 2, 5), sparsity=0.9` followed by three text tokens, raster rows
-`0..9` are video and `10..12` are text. The block stream is:
-
-| Block | Original raster rows, in supplied order | Valid tokens |
-| --- | --- | ---: |
-| b0: text | `10, 11, 12` | 3 |
-| b1: first video tile | `0, 1, 2, 3, 5, 6, 7, 8` | 8 |
-| b2: edge video tile | `4, 9` | 2 |
-
-The input has 13 rows; attention internally allocates 3×64 slots. Changing
-this video's sparsity to `None` preserves video-before-text order and creates
-blocks of 10 and 3 tokens. `layout.input_rows` maps each supplied row back to
-its global raster row; `raster_to_block_wo_padding(x, vsa_layout=layout)` equals
-`x[layout.input_rows]` by value.
-
-</details>
-
-<details>
-<summary>Reorder operators and layout maps</summary>
-
-| Conversion | Where | Forward / output restoration |
-| --- | --- | --- |
-| Raster → padded blocks | Inside each VSA call with raster input | `raster_to_block_w_padding` for each of Q/K/V; `block_w_padding_to_raster` restores raster output |
-| Raster → compact blocks | Once before the layer stack | `raster_to_block_wo_padding`, also selecting Ring-owned blocks; `block_wo_padding_to_raster` restores a full layout |
-| Compact → padded blocks | Inside each VSA call with block input | `block_wo_padding_to_block_w_padding`; `block_w_padding_to_block_wo_padding` removes output padding |
-
-Names state source order, destination order and padding: `w_padding` means
-with block padding, and `wo_padding` means without it. The `_qkv` variant,
-`block_wo_padding_to_block_w_padding_qkv`, fuses three tensors and is used by
-`vsa_attention`; the unsuffixed version converts one tensor. Fusion shares one
-map and kernel launch for Q/K/V, also in backward, instead of three separate
-launches. It covers padding/restoration, not the QKV linear projection. These slot helpers
-live in `vsa_kernels.py`; the two raster/compact boundary helpers live in `vsa.py`.
-
-The boundary helper `raster_to_block_wo_padding` accepts one contiguous CUDA
-`[T_global, ...]` tensor and returns `[layout.tokens, ...]`, preserving dtype
-and trailing dimensions. It adds no padding and selects owned rows for Ring.
-Both boundary helpers require `input_order="block"`; the layout describes VSA's
-input order. For full layouts only, restore
-raster output after the stack with
-`block_wo_padding_to_raster(out_block, vsa_layout=layout)`.
-
-The per-layer conversions run inside `vsa_attention`, after any Ulysses head
-exchange. Input order selects the conversion; Ulysses itself requires neither
-order. Ring requires compact block input. The padding here is VSA's 64-slot
-block padding, separate from the caller's Ulysses tail padding.
-
-All three conversions support autograd. Slot-conversion backward uses inverse
-row maps; compact Q/K/V gradients are restored together. Boundary-reorder
-backward scatters into the original raster shape. For Ring, unowned rows get
-zero gradients, without cross-rank reduction. This input-reorder adjoint does
-not collect output token shards. Optional reconstruction of a full global
-output after the stack is caller-owned; VSA already handles the attention
-result merging within the Ring.
-
-`layout.input_rows` maps supplied rows to global raster rows (identity for a
-full raster layout). `tokens`, `blocks` and row/slot maps are local;
-`groups`, `sample_slices` and `sample_lengths` describe global samples.
-`slot_row` maps 64-token slots to input rows (`-1` for padding), and `row_slot`
-is the inverse on valid rows. Padding is zero and excluded from means and attention.
-
-The three kernel implementations are `_reorder_tokens_kernel` (boundary
-gather/scatter), `_gather` (single-tensor slots), and `_gather_qkv` (fused Q/K/V
-slots). Opposite directions reuse these kernels. `slots_are_input` skips slot
-conversion only for block input with `tokens == blocks * 64` and no
-partial/dummy blocks; raster input always takes the raster-to-slot path.
-
-`layout.ring` stores the group/options, rank/size, global token count, block
-ownership, peer sizes and the all-gather permutation. With capacity C,
-`p = layout.ring.global_to_gather[b]` gives `owner = p // C` and
-`local_block = p % C`. `layout.ring.block_ids` lists local global IDs, with
-`-1` for dummy blocks. All ranks derive these maps from geometry without
-communication. Coarse Q boundaries are local, while KV boundaries span the
-global sample; full layouts share Q/KV boundary and block-ID tensors.
-
-</details>
 
 ## Acknowledgements
 

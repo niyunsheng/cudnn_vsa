@@ -7,6 +7,103 @@
 用于 DiT/MMDiT 训练的打包多模态注意力：
 **cuDNN 块稀疏细粒度注意力（fine attention）+ FA4 变长粗粒度注意力（coarse attention）**。
 
+## 代码结构
+
+| 文件 | 职责 |
+| --- | --- |
+| `vsa.py` | 公共注意力入口，以及显式的 block/raster 重排辅助函数 |
+| `vsa_core.py` | 路由、cuDNN BSA/FA4 调用、单设备执行，以及 Ring 通信和 autograd |
+| `vsa_layout.py` | 静态样本/block 几何信息、行映射、路由模板和 coarse 边界 |
+| `vsa_kernels.py` | 融合 token 重排、slot gather、Q/K/V padding、FP32 pooling 和门控合并 kernel |
+
+两种输入顺序共享 core 中的注意力数学计算、各 region 的预算，以及先 fine 后 coarse 的调度。
+Core 不导入公共入口。
+
+<details>
+<summary>精确的 block 顺序与小例子</summary>
+
+1. 保持样本顺序。每个样本内先放 `sparsity=None` 的 segment，再放数值稀疏度的视频，
+   每类内部保持 segment 的声明顺序。
+2. None 稀疏度的 segment 按连续最多 64 个 token 分块；数值稀疏度的视频按
+   4×4×4 tile 分块。Tile 起点和 tile 内有效 token 均按 F/H/W 顺序遍历
+   （W 最快变化），边缘 tile 直接截断，不补 padding。
+3. Block 不跨 segment 或样本边界。数值 `sparsity=0` 仍使用 tile；
+   `sparsity=None` 使用稠密连续块。Ring 按全局 block ID 递增顺序保留拥有的 block，
+   每个 block 内部顺序不变。
+
+对于 `video=(1, 2, 5), sparsity=0.9` 后接三个文本 token，raster 行
+`0..9` 是视频，`10..12` 是文本。Block 序列为：
+
+| Block | 按输入顺序排列的原始 raster 行 | 有效 token 数 |
+| --- | --- | ---: |
+| b0：文本 | `10, 11, 12` | 3 |
+| b1：第一个视频 tile | `0, 1, 2, 3, 5, 6, 7, 8` | 8 |
+| b2：边缘视频 tile | `4, 9` | 2 |
+
+输入只有 13 行，attention 内部分配 3×64 个 slot。将这个视频的稀疏度改成
+`None` 后，保留视频在文本之前的顺序，产生大小为 10 和 3 的两个 block。
+`layout.input_rows` 将每个输入行映射回全局 raster 行；
+`raster_to_block_wo_padding(x, vsa_layout=layout)` 的值等于 `x[layout.input_rows]`。
+
+</details>
+
+<details>
+<summary>重排算子与 layout 映射</summary>
+
+| 转换 | 执行位置 | 前向 / 输出恢复 |
+| --- | --- | --- |
+| Raster → 带 padding 的 block | 每次使用 raster 输入的 VSA 调用内部 | Q/K/V 分别调用 `raster_to_block_w_padding`；`block_w_padding_to_raster` 恢复 raster 输出 |
+| Raster → 紧凑 block | 层堆栈之前执行一次 | `raster_to_block_wo_padding`，Ring 时同时选择拥有的 block；`block_wo_padding_to_raster` 恢复完整 layout |
+| 紧凑 block → 带 padding 的 block | 每次使用 block 输入的 VSA 调用内部 | `block_wo_padding_to_block_w_padding`；`block_w_padding_to_block_wo_padding` 去掉输出 padding |
+
+名称注明源顺序、目标顺序和 padding：`w_padding` 表示带 block padding，
+`wo_padding` 表示不带。带 `_qkv` 后缀的
+`block_wo_padding_to_block_w_padding_qkv` 融合三个张量，供 `vsa_attention` 使用；
+无后缀的版本转换单个张量。融合版让 Q/K/V 共用一次映射读取和 kernel 调用，
+反向也如此；分别处理则需要三次调用。融合范围是 padding/恢复，不包含 QKV 线性投影。
+Slot 辅助函数位于 `vsa_kernels.py`，
+两个 raster/紧凑 block 边界转换函数位于 `vsa.py`。
+
+边界转换 `raster_to_block_wo_padding` 接受一个内存连续的 CUDA
+`[T_global, ...]` 张量，返回 `[layout.tokens, ...]`，保持 dtype 和后续维度。
+它不添加 padding，Ring 时同时选择拥有的行。两个边界转换函数都要求
+`input_order="block"`：layout 描述 VSA 的输入顺序。
+仅对完整 layout，可在层堆栈结束后调用
+`block_wo_padding_to_raster(out_block, vsa_layout=layout)` 恢复 raster 输出。
+
+逐层转换在 `vsa_attention` 内部执行，位于 Ulysses head 交换之后（若使用 Ulysses）。
+转换由输入顺序决定，Ulysses 本身不要求其中某种顺序。Ring 要求紧凑 block 输入。
+这里的 padding 是 VSA 内部每块 64 个 slot 的 padding，与调用方的 Ulysses 尾部
+padding 分开处理。
+
+三类转换均支持 autograd。Slot 转换的反向使用逆行映射，紧凑 Q/K/V 的梯度融合恢复。
+层堆栈边界重排的反向将梯度 scatter 到原始 raster 形状。
+Ring 未拥有的行梯度为零，不执行跨 rank 归约。这个输入重排的伴随操作不会收集
+输出 token 分片。层堆栈结束后，可选的完整全局输出重建由调用方负责；
+Ring 内部的 attention 结果合并已由 VSA 完成。
+
+`layout.input_rows` 将输入行映射到全局 raster 行（完整 raster layout 为恒等映射）。
+`tokens`、`blocks` 和 row/slot 映射描述本地输入；
+`groups`、`sample_slices` 和 `sample_lengths` 描述全局样本。
+`slot_row` 将每块 64 个 slot 映射到输入行（`-1` 表示 padding），
+`row_slot` 是有效行上的逆映射。Padding 填零，不参与均值和 attention。
+
+底层有三套 kernel：`_reorder_tokens_kernel`（边界 gather/scatter）、
+`_gather`（单张量 slot 转换）和 `_gather_qkv`（融合 Q/K/V slot 转换）。
+相反方向复用这些 kernel。只有 block 输入满足 `tokens == blocks * 64`、
+没有不完整/dummy block 时，`slots_are_input` 才跳过 slot 转换；
+raster 输入始终经过 raster-to-slot 路径。
+
+`layout.ring` 保存进程组/选项、rank/size、全局 token 数、block 归属、
+peer 大小和 all-gather 排列。容量为 C 时，
+`p = layout.ring.global_to_gather[b]` 给出 `owner = p // C` 和
+`local_block = p % C`。`layout.ring.block_ids` 列出本地 block 的全局 ID，
+dummy block 用 `-1` 表示。所有 rank 根据几何形状生成这些映射，无需通信。
+Coarse Q 边界是本地的，KV 边界覆盖全局样本；
+完整 layout 共享 Q/KV 边界和 block-ID 张量。
+
+</details>
+
 ## 安装
 
 安装支持 CUDA 的 PyTorch 后，在仓库根目录运行：
@@ -62,7 +159,7 @@ out.backward(torch.randn_like(out))
 | `input_order` | 输入 token | Slot 转换 |
 | --- | --- | --- |
 | `"raster"`（默认） | 原始样本/segment 顺序，视频按 FHW 顺序排列 | 重排为 block 并添加 padding |
-| `"block"` | 按下述 block 顺序排列的有效 token，不含 padding | 仅添加 padding；本地所有 slot 都有效时跳过转换 |
+| `"block"` | 按 layout 的 block 顺序排列的有效 token，不含 padding | 仅添加 padding；本地所有 slot 都有效时跳过转换 |
 
 ### Raster 输入
 
@@ -501,12 +598,12 @@ attention 内部的 Ring 结果合并已由 VSA 完成。
 
 MFU 统计有效注意力 GEMM FLOPs；反向 FLOPs 是前向的两倍。
 Padding、路由和非 GEMM 操作不计入 FLOP 分子。
-单 GPU TFLOP/s 用全局 FLOPs 除以延迟和 GPU 数量；
+TFLOPS 按单 GPU 统计，用全局 FLOPs 除以延迟和 GPU 数量；
 MFU 再将该值除以稠密 BF16 峰值（`--peak-tflops`）。各阶段的中位数独立计算。
 一次性输入分片/重排、graph capture 和 profiling 不计入计时；
 注意力内部的 slot 转换和 padding 计入计时。
 
-环境：GB200（2500 TFLOP/s BF16）、PyTorch 2.12.0a0/NV26.04、CUDA 13.2、cuDNN 9.22 / frontend 1.28.0、Triton 3.6、CuTe 4.6.2、FA4 4.0.0b35。
+环境：GB200（2500 TFLOPS BF16）、PyTorch 2.12.0a0/NV26.04、CUDA 13.2、cuDNN 9.22 / frontend 1.28.0、Triton 3.6、CuTe 4.6.2、FA4 4.0.0b35。
 
 `benchmark.perf_vsa` 支持普通和分布式工作负载（`--ring`）。
 两种模式共享输入生成、数值检查、graph capture 和计时逻辑。
@@ -542,7 +639,7 @@ VSA 的计时覆盖 slot 转换、pooling、路由、fine、coarse、恢复和�
 或使用 `--no-profile` 不采集 trace。输入生成/重排不计入计时。
 对比结果写入 `benchmark/results/compare.json`。
 
-| 方法 | H | 前向 ms | 前向 MFU | 反向 ms | 反向 MFU | 前向+反向 ms | 前向+反向 TFLOP/s | 前向+反向 MFU |
+| 方法 | H | 前向 ms | 前向 MFU | 反向 ms | 反向 MFU | 前向+反向 ms | 前向+反向 TFLOPS | 前向+反向 MFU |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | FA4 完整注意力 | 2 | 9.357 | 56.82% | 25.409 | 41.85% | 34.772 | 1146.72 | 45.87% |
 | cuDNN VSA（raster） | 2 | 2.366 | 24.81% | 6.746 | 17.40% | 9.114 | 482.91 | 19.32% |
@@ -581,7 +678,7 @@ for vsa_run in single_0 cyclic_0 contiguous_0 contiguous_1 cyclic_1 single_1; do
 done
 ```
 
-| 模式 | 前向 ms | 前向 MFU | 反向 ms | 反向 MFU | 前向+反向 ms | 前向+反向 TFLOP/s/GPU | 前向+反向 MFU |
+| 模式 | 前向 ms | 前向 MFU | 反向 ms | 反向 MFU | 前向+反向 ms | 前向+反向 TFLOPS | 前向+反向 MFU |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | 无 Ring（单卡） | 67.460 | 25.17% | 185.257 | 18.33% | 252.572 | 504.15 | 20.17% |
 | Ring4（连续） | 18.077 | 23.48% | 48.780 | 17.40% | 66.356 | 479.74 | 19.19% |
@@ -646,103 +743,6 @@ JSON 记录数值/graph 检查和源码 hash；计时与 MFU 遵循**性能**一
 严格的 BF16 `fine_only_peer` case 仍有未解决的数值失败：
 六 token、仅使用 fine 分支的样本，其 dQ 和 dK 相对原生参考实现的相似度
 可能低于 0.99999 阈值。上面的命令会报告此失败；case 和阈值保持不变。
-
-## 代码结构
-
-| 文件 | 职责 |
-| --- | --- |
-| `vsa.py` | 公共注意力入口，以及显式的 block/raster 重排辅助函数 |
-| `vsa_core.py` | 路由、cuDNN BSA/FA4 调用、单设备执行，以及 Ring 通信和 autograd |
-| `vsa_layout.py` | 静态样本/block 几何信息、行映射、路由模板和 coarse 边界 |
-| `vsa_kernels.py` | 融合 token 重排、slot gather、Q/K/V padding、FP32 pooling 和门控合并 kernel |
-
-两种输入顺序共享 core 中的注意力数学计算、各 region 的预算，以及先 fine 后 coarse 的调度。
-Core 不导入公共入口。
-
-<details>
-<summary>精确的 block 顺序与小例子</summary>
-
-1. 保持样本顺序。每个样本内先放 `sparsity=None` 的 segment，再放数值稀疏度的视频，
-   每类内部保持 segment 的声明顺序。
-2. None 稀疏度的 segment 按连续最多 64 个 token 分块；数值稀疏度的视频按
-   4×4×4 tile 分块。Tile 起点和 tile 内有效 token 均按 F/H/W 顺序遍历
-   （W 最快变化），边缘 tile 直接截断，不补 padding。
-3. Block 不跨 segment 或样本边界。数值 `sparsity=0` 仍使用 tile；
-   `sparsity=None` 使用稠密连续块。Ring 按全局 block ID 递增顺序保留拥有的 block，
-   每个 block 内部顺序不变。
-
-对于 `video=(1, 2, 5), sparsity=0.9` 后接三个文本 token，raster 行
-`0..9` 是视频，`10..12` 是文本。Block 序列为：
-
-| Block | 按输入顺序排列的原始 raster 行 | 有效 token 数 |
-| --- | --- | ---: |
-| b0：文本 | `10, 11, 12` | 3 |
-| b1：第一个视频 tile | `0, 1, 2, 3, 5, 6, 7, 8` | 8 |
-| b2：边缘视频 tile | `4, 9` | 2 |
-
-输入只有 13 行，attention 内部分配 3×64 个 slot。将这个视频的稀疏度改成
-`None` 后，保留视频在文本之前的顺序，产生大小为 10 和 3 的两个 block。
-`layout.input_rows` 将每个输入行映射回全局 raster 行；
-`raster_to_block_wo_padding(x, vsa_layout=layout)` 的值等于 `x[layout.input_rows]`。
-
-</details>
-
-<details>
-<summary>重排算子与 layout 映射</summary>
-
-| 转换 | 执行位置 | 前向 / 输出恢复 |
-| --- | --- | --- |
-| Raster → 带 padding 的 block | 每次使用 raster 输入的 VSA 调用内部 | Q/K/V 分别调用 `raster_to_block_w_padding`；`block_w_padding_to_raster` 恢复 raster 输出 |
-| Raster → 紧凑 block | 层堆栈之前执行一次 | `raster_to_block_wo_padding`，Ring 时同时选择拥有的 block；`block_wo_padding_to_raster` 恢复完整 layout |
-| 紧凑 block → 带 padding 的 block | 每次使用 block 输入的 VSA 调用内部 | `block_wo_padding_to_block_w_padding`；`block_w_padding_to_block_wo_padding` 去掉输出 padding |
-
-名称注明源顺序、目标顺序和 padding：`w_padding` 表示带 block padding，
-`wo_padding` 表示不带。带 `_qkv` 后缀的
-`block_wo_padding_to_block_w_padding_qkv` 融合三个张量，供 `vsa_attention` 使用；
-无后缀的版本转换单个张量。融合版让 Q/K/V 共用一次映射读取和 kernel 调用，
-反向也如此；分别处理则需要三次调用。融合范围是 padding/恢复，不包含 QKV 线性投影。
-Slot 辅助函数位于 `vsa_kernels.py`，
-两个 raster/紧凑 block 边界转换函数位于 `vsa.py`。
-
-边界转换 `raster_to_block_wo_padding` 接受一个内存连续的 CUDA
-`[T_global, ...]` 张量，返回 `[layout.tokens, ...]`，保持 dtype 和后续维度。
-它不添加 padding，Ring 时同时选择拥有的行。两个边界转换函数都要求
-`input_order="block"`：layout 描述 VSA 的输入顺序。
-仅对完整 layout，可在层堆栈结束后调用
-`block_wo_padding_to_raster(out_block, vsa_layout=layout)` 恢复 raster 输出。
-
-逐层转换在 `vsa_attention` 内部执行，位于 Ulysses head 交换之后（若使用 Ulysses）。
-转换由输入顺序决定，Ulysses 本身不要求其中某种顺序。Ring 要求紧凑 block 输入。
-这里的 padding 是 VSA 内部每块 64 个 slot 的 padding，与调用方的 Ulysses 尾部
-padding 分开处理。
-
-三类转换均支持 autograd。Slot 转换的反向使用逆行映射，紧凑 Q/K/V 的梯度融合恢复。
-层堆栈边界重排的反向将梯度 scatter 到原始 raster 形状。
-Ring 未拥有的行梯度为零，不执行跨 rank 归约。这个输入重排的伴随操作不会收集
-输出 token 分片。层堆栈结束后，可选的完整全局输出重建由调用方负责；
-Ring 内部的 attention 结果合并已由 VSA 完成。
-
-`layout.input_rows` 将输入行映射到全局 raster 行（完整 raster layout 为恒等映射）。
-`tokens`、`blocks` 和 row/slot 映射描述本地输入；
-`groups`、`sample_slices` 和 `sample_lengths` 描述全局样本。
-`slot_row` 将每块 64 个 slot 映射到输入行（`-1` 表示 padding），
-`row_slot` 是有效行上的逆映射。Padding 填零，不参与均值和 attention。
-
-底层有三套 kernel：`_reorder_tokens_kernel`（边界 gather/scatter）、
-`_gather`（单张量 slot 转换）和 `_gather_qkv`（融合 Q/K/V slot 转换）。
-相反方向复用这些 kernel。只有 block 输入满足 `tokens == blocks * 64`、
-没有不完整/dummy block 时，`slots_are_input` 才跳过 slot 转换；
-raster 输入始终经过 raster-to-slot 路径。
-
-`layout.ring` 保存进程组/选项、rank/size、全局 token 数、block 归属、
-peer 大小和 all-gather 排列。容量为 C 时，
-`p = layout.ring.global_to_gather[b]` 给出 `owner = p // C` 和
-`local_block = p % C`。`layout.ring.block_ids` 列出本地 block 的全局 ID，
-dummy block 用 `-1` 表示。所有 rank 根据几何形状生成这些映射，无需通信。
-Coarse Q 边界是本地的，KV 边界覆盖全局样本；
-完整 layout 共享 Q/KV 边界和 block-ID 张量。
-
-</details>
 
 ## 致谢
 

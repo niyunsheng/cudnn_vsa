@@ -401,7 +401,7 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
     Rank/size come from that group; layout only borrows it and never creates or
     destroys groups. Different micro-batch layouts can share the same group.
     Forward/backward P2P and pooled collectives all use ring_cp_group. The caller
-    chooses its NCCL stream priority once during parallel initialization.
+    creates an ordinary-priority NCCL group during parallel initialization.
     Ring shards require input_order="block" and contain only valid owned-block
     rows without padding. ring_partition="cyclic" (default) assigns global
     block b to rank b % ring_size. "contiguous" assigns at most one interval

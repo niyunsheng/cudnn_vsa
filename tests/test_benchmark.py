@@ -135,15 +135,13 @@ def test_unified_cli_defaults_and_layouts():
     assert parse_args(["--ring", "--seed", "0"]).seed == 0
     assert parse_args(["--ring", "--heads", "1", "8"]).heads == [1, 8]
     assert parse_args(["--input-order", "block", "--no-profile"]).input_order == "block"
-    assert parse_args(["--ring", "--high-priority-group"]).high_priority_group
-    assert not ring.high_priority_group
     args = parse_args(["--ring", "--heads", "2", "4", "--bwd-bucket-size", "backend", "--output", "run.json"])
     assert args.bwd_bucket_size is None and args.heads == [2, 4] and args.output.name == "run.json"
 
 
 @pytest.mark.parametrize("argv", [
     ["--ring-partition", "contiguous"], ["--ring", "--ring-partition", "unknown"],
-    ["--high-priority-group"],
+    ["--ring", "--high-priority-group"],
     ["--ring", "--input-order", "raster"], ["--ring-size", "2"], ["--batch-p2p"],
     ["--ring", "--ring-size", "0"], ["--ring", "--bwd-bucket-size", "0"],
     ["--heads", "0"], ["--heads", "-1"],
@@ -154,6 +152,45 @@ def test_unified_cli_rejects_invalid_options_before_cuda(argv):
     with pytest.raises(SystemExit) as error:
         parse_args(argv)
     assert error.value.code == 2
+
+
+@pytest.mark.parametrize("ring_size", [None, 4])
+@pytest.mark.parametrize("eager", [False, True])
+def test_ring_groups_use_ordinary_priority(ring_size, eager, monkeypatch):
+    from types import SimpleNamespace
+    from benchmark import perf_vsa
+
+    argv = ["--ring"]
+    if ring_size is not None:
+        argv += ["--ring-size", str(ring_size)]
+    if eager:
+        argv += ["--eager-group"]
+    args = perf_vsa.parse_args(argv)
+    world, created, options = object(), [], []
+    def check(backend, **kwargs):
+        assert backend == "nccl"
+        assert kwargs["pg_options"].is_high_priority_stream is False
+        assert kwargs.get("device_id") == (torch.device("cuda:3") if eager else None)
+        options.append(kwargs["pg_options"])
+    def new_group(*, ranks, backend, **kwargs):
+        check(backend, **kwargs)
+        group = object()
+        created.append((ranks, group))
+        return group
+    monkeypatch.setenv("LOCAL_RANK", "3")
+    monkeypatch.setattr(perf_vsa.dist, "init_process_group", check)
+    monkeypatch.setattr(perf_vsa.dist, "new_group", new_group)
+    monkeypatch.setattr(perf_vsa.dist, "group", SimpleNamespace(WORLD=world))
+    monkeypatch.setattr(perf_vsa.dist, "get_rank", lambda: 3)
+    monkeypatch.setattr(perf_vsa.dist, "get_world_size", lambda: 8)
+    group = perf_vsa.init_ring(args)
+    if ring_size is None:
+        assert group is world and not created
+        assert len(options) == 1
+    else:
+        assert [ranks for ranks, _ in created] == [[0, 2, 4, 6], [1, 3, 5, 7]]
+        assert group is created[1][1] and args.output.name == "perf-group1.json"
+        assert len(options) == 3
 
 
 def test_shared_validation_handles_empty_unused_and_retained_gradients():

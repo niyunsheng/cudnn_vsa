@@ -54,15 +54,13 @@ def parse_args(argv=None):
     transport.add_argument("--batch-p2p", action="store_true", default=None)
     transport.add_argument("--unbatched-p2p", dest="batch_p2p", action="store_false")
     parser.add_argument("--eager-group", action="store_true", help="Bind device_id when creating WORLD")
-    parser.add_argument("--high-priority-group", action="store_true",
-                        help="High-priority NCCL for both forward and backward")
     parser.add_argument("--bwd-bucket-size", type=_bucket_argument, default="auto",
                         help="auto (default), backend, or a positive number of query blocks")
     parser.add_argument("--ring-size", type=int, help="Interleaved subgroup size; must divide world size")
     parser.add_argument("--ring-partition", choices=("cyclic", "contiguous"), default="cyclic",
                         help="Ring block ownership; default cyclic")
     args = parser.parse_args(argv)
-    if not args.ring and (args.ring_size is not None or args.eager_group or args.high_priority_group
+    if not args.ring and (args.ring_size is not None or args.eager_group
                          or args.batch_p2p is not None or args.bwd_bucket_size != "auto"
                          or args.ring_partition != "cyclic"):
         parser.error("Ring transport options require --ring")
@@ -88,15 +86,12 @@ def parse_args(argv=None):
 
 
 def init_ring(args):
-    """Create Ring groups shared by forward and backward, once on every worker."""
+    """Create ordinary-priority Ring groups shared by forward and backward."""
     device_options = ({"device_id": torch.device("cuda", int(os.environ["LOCAL_RANK"]))}
                       if args.eager_group else {})
-    def options():
-        value = dist.ProcessGroupNCCL.Options()
-        value.is_high_priority_stream = args.high_priority_group
-        return value
     dist.init_process_group("nccl", timeout=timedelta(minutes=15),
-                            pg_options=options(), **device_options)
+                            pg_options=dist.ProcessGroupNCCL.Options(is_high_priority_stream=False),
+                            **device_options)
     group = dist.group.WORLD
     world_rank, world_size = dist.get_rank(), dist.get_world_size()
     if args.ring_size is not None:
@@ -106,7 +101,8 @@ def init_ring(args):
         for index in range(group_count):
             ranks = list(range(index, world_size, group_count))
             candidate = dist.new_group(ranks=ranks, backend="nccl",
-                                       pg_options=options(), **device_options)
+                                       pg_options=dist.ProcessGroupNCCL.Options(is_high_priority_stream=False),
+                                       **device_options)
             if world_rank in ranks:
                 group = candidate
                 args.output = args.output.with_stem(f"{args.output.stem}-group{index}")

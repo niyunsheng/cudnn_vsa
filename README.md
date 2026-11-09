@@ -250,19 +250,16 @@ selects `b2, b4`, adding text block `b0` gives `[b0, b2, b4]`.
 order. See [`build_vsa_layout`](vsa_layout.py) for P2P call mode
 (`ring_cp_batch_p2p`) and backward compute bucket size (`ring_cp_bwd_bucket_size`).
 
-### Forward communication overlap
+### Ring communication
 
-To give Ring P2P communication a high-priority NCCL stream, create the group
-once during parallel initialization. Reuse it across layouts and layers:
+Create an ordinary-priority NCCL group once during parallel initialization,
+then reuse it across layouts and layers:
 
 ```python
 import torch.distributed as dist
 
 # Call on all WORLD ranks in the same group-creation order, before building layouts.
-options = dist.ProcessGroupNCCL.Options()
-options.is_high_priority_stream = True
-group = dist.new_group(ranks=ring_ranks, backend="nccl", pg_options=options)
-# Member ranks reuse this group for every micro-batch's layout.
+group = dist.new_group(ranks=ring_ranks, backend="nccl")
 layout = build_vsa_layout(
     samples, head_num=H, input_order="block", device="cuda",
     ring_cp_group=group,
@@ -270,29 +267,9 @@ layout = build_vsa_layout(
 out = vsa_attention(q, k, v, gate, layout)
 ```
 
-`ring_cp_group` carries forward pooled all-gather and fine P2P, and backward
-P2P and pooled-gradient reduce-scatter. Its priority applies to both directions.
-
-Enqueuing P2P before BSA does not guarantee that its GPU kernel starts first.
-BSA and NCCL can compete for SM resources, including shared memory. With
-ordinary-priority streams, a pending NCCL kernel can wait until BSA's last
-thread blocks. High priority lets pending NCCL work acquire freed resources
-earlier; it does not preempt already running thread blocks. CUDA Graph replay
-must honor captured node priorities (`cudaGraphInstantiateFlagUseNodePriority`);
-check this in the PyTorch build used for training.
-
-Priority belongs to the process group's internal NCCL stream. Changing only
-the stream around `isend`/`irecv` is insufficient. VSA borrows the supplied
-groups and does not replace them or modify global scheduling settings. The
-benchmark's `--high-priority-group` uses the configuration above.
-Omitting `--high-priority-group` uses an ordinary-priority group. High priority
-also affects backward, even if backward P2P was already overlapped.
-The pooled collectives use synchronous APIs. Some PyTorch versions run them
-on the current CUDA stream, so their kernel priorities can differ from the
-group's asynchronous P2P stream. Inspect the captured nodes in the target build.
-Compare full forward/backward latency as well as trace overlap: communication
-still consumes SM and memory bandwidth, and pooled-mean collectives have their
-own data dependencies.
+The same group carries forward/backward P2P and pooled collectives.
+VSA enqueues P2P before fine attention to overlap communication and computation;
+actual overlap depends on kernel resource usage and must be measured.
 
 ### Why this design
 
@@ -618,7 +595,7 @@ python -m benchmark.perf_vsa --heads 1 --cases thd720p44s --seed 937 \
 for partition in cyclic contiguous; do
   torchrun --standalone --nproc-per-node=4 --module benchmark.perf_vsa --ring \
     --ring-size 4 --ring-partition "$partition" --heads 1 --cases thd720p44s \
-    --seed 937 --batch-p2p --high-priority-group --bwd-bucket-size backend \
+    --seed 937 --batch-p2p --bwd-bucket-size backend \
     --warmup 10 --repeats 50 --profile --peak-tflops 2500 \
     --output "benchmark/results/ring4_720p44s/$partition/perf.json"
 done
@@ -632,6 +609,10 @@ Each trace captures one additional full forward/backward replay after the
 timed samples. JSON records `ring_partition`, phase latency, TFLOP/s/GPU and MFU.
 Inputs are seeded random tensors; matching geometry does not reproduce a
 particular model layer's routing decisions.
+
+The Ring results below are **historical measurements with high-priority NCCL streams**.
+The commands above now use ordinary-priority streams; their performance has not
+been remeasured.
 
 #### Cyclic versus contiguous
 
@@ -654,8 +635,8 @@ ordinary/Ring comparison below is a separate measurement.
 
 Measured in one four-GB200 allocation with the software environment above.
 Ordinary VSA runs the full sequence on one GPU without a process group;
-Ring4 in the table uses **contiguous ownership**, all four GPUs, the high-priority group and
-backend-default backward buckets above. Both use **961,696 global tokens,
+Ring4 in the table uses **contiguous ownership**, all four GPUs and
+backend-default backward buckets. Both use **961,696 global tokens,
 H=1, D=128, compact block input and seed 937**. Global input hashes and useful
 FLOP counts match.
 
@@ -719,7 +700,7 @@ torchrun --standalone --nproc-per-node=4 --module benchmark.perf_vsa --ring \
   --eager-group --cases ragged dense
 # Single/packed 64k workloads, plus timing after numerical checks.
 torchrun --standalone --nproc-per-node=8 --module benchmark.perf_vsa --ring \
-  --high-priority-group --cases single64k thd64k --warmup 30 --repeats 500
+  --cases single64k thd64k --warmup 30 --repeats 500
 # Strict reproduction of the known fine-only-sample numerical failure.
 torchrun --standalone --nproc-per-node=8 --module benchmark.perf_vsa --ring \
   --ring-size 2 --cases fine_only_peer --check-only

@@ -240,19 +240,15 @@ B 从分得较少的 rank 2 开始，依次给 rank 2、0 各一个 block；下�
 P2P 调用方式（`ring_cp_batch_p2p`）和反向计算分桶大小（`ring_cp_bwd_bucket_size`）
 的定义见 [`build_vsa_layout`](vsa_layout.py)。
 
-### 前向通信重叠
+### Ring 通信
 
-要为 Ring P2P 通信使用高优先级 NCCL 流，在并行初始化时创建一次进程组，
-然后在不同 layout 和层之间复用：
+在并行初始化时创建一次普通优先级 NCCL 进程组，然后在不同 layout 和层之间复用：
 
 ```python
 import torch.distributed as dist
 
 # Call on all WORLD ranks in the same group-creation order, before building layouts.
-options = dist.ProcessGroupNCCL.Options()
-options.is_high_priority_stream = True
-group = dist.new_group(ranks=ring_ranks, backend="nccl", pg_options=options)
-# Member ranks reuse this group for every micro-batch's layout.
+group = dist.new_group(ranks=ring_ranks, backend="nccl")
 layout = build_vsa_layout(
     samples, head_num=H, input_order="block", device="cuda",
     ring_cp_group=group,
@@ -260,26 +256,9 @@ layout = build_vsa_layout(
 out = vsa_attention(q, k, v, gate, layout)
 ```
 
-`ring_cp_group` 承担前向池化 all-gather 和 fine P2P，以及反向 P2P 和池化梯度
-reduce-scatter。它的优先级同时作用于前反向。
-
-在 BSA 之前将 P2P 入队，并不保证它的 GPU kernel 先开始执行。
-BSA 和 NCCL 可能竞争 SM 资源，包括共享内存。
-使用普通优先级流时，等待中的 NCCL kernel 可能要等到 BSA 的最后一批线程块才开始执行。
-高优先级让等待中的 NCCL 工作更早获得释放的资源；它不会抢占已经运行的线程块。
-CUDA Graph replay 必须遵守捕获的节点优先级
-（`cudaGraphInstantiateFlagUseNodePriority`）；应在训练使用的 PyTorch 构建中确认这一点。
-
-优先级属于进程组内部的 NCCL 流。仅改变 `isend`/`irecv` 外围的流并不足够。
-VSA 借用传入的进程组，不会替换它们，也不会修改全局调度设置。
-Benchmark 的 `--high-priority-group` 使用上述配置。
-不设置 `--high-priority-group` 时使用普通优先级进程组。
-即使反向 P2P 已经实现重叠，也仍会受到高优先级的影响。
-池化 collective 使用同步 API。一些 PyTorch 版本会在当前 CUDA 流上运行这些操作，
-因此它们的 kernel 优先级可能与进程组的异步 P2P 流不同。
-应检查目标构建中捕获的节点。
-除了 trace 中的重叠情况，还要比较完整前向/反向延迟：
-通信仍会消耗 SM 和内存带宽，池化均值 collective 也有自己的数据依赖。
+同一个进程组承担前反向 P2P 和池化 collective。
+VSA 在 fine attention 之前将 P2P 入队，以重叠通信和计算；
+实际重叠程度取决于 kernel 的资源占用，需要通过测量确认。
 
 ### 设计原因
 
@@ -596,7 +575,7 @@ python -m benchmark.perf_vsa --heads 1 --cases thd720p44s --seed 937 \
 for partition in cyclic contiguous; do
   torchrun --standalone --nproc-per-node=4 --module benchmark.perf_vsa --ring \
     --ring-size 4 --ring-partition "$partition" --heads 1 --cases thd720p44s \
-    --seed 937 --batch-p2p --high-priority-group --bwd-bucket-size backend \
+    --seed 937 --batch-p2p --bwd-bucket-size backend \
     --warmup 10 --repeats 50 --profile --peak-tflops 2500 \
     --output "benchmark/results/ring4_720p44s/$partition/perf.json"
 done
@@ -609,6 +588,9 @@ Ring 命令写出 `perf-group0.json` 和
 每个 trace 在计时样本之后额外采集一次完整前向/反向 replay。
 JSON 记录 `ring_partition`、阶段延迟、TFLOP/s/GPU 和 MFU。
 输入是使用指定 seed 生成的随机张量；几何形状一致并不代表复现了某个模型层的路由决策。
+
+以下 Ring 数据为**使用高优先级 NCCL 流的历史测量结果**。
+上述命令现使用普通优先级流，尚未重测其性能。
 
 #### 循环分配与连续分配
 
@@ -630,7 +612,7 @@ JSON 记录 `ring_partition`、阶段延迟、TFLOP/s/GPU 和 MFU。
 
 以下结果在一次分配的四张 GB200 上测得，使用上述软件环境。
 普通 VSA 在一张 GPU 上运行完整序列，不使用进程组；
-表中的 Ring4 使用**连续分配**、全部四张 GPU，以及上述高优先级进程组和后端默认反向 bucket。
+表中的 Ring4 使用**连续分配**、全部四张 GPU 和后端默认反向 bucket。
 两者都使用 **961,696 个全局 token、H=1、D=128、紧凑 block 输入和 seed 937**。
 全局输入 hash 和有效 FLOP 数一致。
 
@@ -690,7 +672,7 @@ torchrun --standalone --nproc-per-node=4 --module benchmark.perf_vsa --ring \
   --eager-group --cases ragged dense
 # Single/packed 64k workloads, plus timing after numerical checks.
 torchrun --standalone --nproc-per-node=8 --module benchmark.perf_vsa --ring \
-  --high-priority-group --cases single64k thd64k --warmup 30 --repeats 500
+  --cases single64k thd64k --warmup 30 --repeats 500
 # Strict reproduction of the known fine-only-sample numerical failure.
 torchrun --standalone --nproc-per-node=8 --module benchmark.perf_vsa --ring \
   --ring-size 2 --cases fine_only_peer --check-only

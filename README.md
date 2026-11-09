@@ -206,7 +206,8 @@ blocks of 64 slots; partial and dummy slots are excluded from the math.
 ### Worked example: two samples on three ranks
 
 With `R=3`, sample A contains text block `b0` and video blocks `b1..b4`
-(`sparsity=0.5`); sample B contains dense-image block `b5` and text block `b6`.
+(`sparsity=0.5`). Sample B has two blocks: `b5` contains dense image tokens,
+and `b6` contains text tokens.
 Global block IDs continue across samples.
 
 | Policy | Sample / count | Rank 0 | Rank 1 | Rank 2 |

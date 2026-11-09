@@ -198,8 +198,9 @@ rank 开始。`extra=0` 时起点不变。
 
 ### 示例：三个 rank 上的两个样本
 
-`R=3`，样本 A 包含文本 block `b0` 和视频 block `b1..b4`（`sparsity=0.5`）；
-样本 B 包含稠密图像 block `b5` 和文本 block `b6`。全局 block ID 跨样本连续编号。
+`R=3`，样本 A 包含文本 block `b0` 和视频 block `b1..b4`（`sparsity=0.5`）。
+样本 B 有两个 block：`b5` 存放稠密图像 token，`b6` 存放文本 token。
+全局 block ID 跨样本连续编号。
 
 | 策略 | 样本 / 数量 | Rank 0 | Rank 1 | Rank 2 |
 | --- | --- | --- | --- | --- |

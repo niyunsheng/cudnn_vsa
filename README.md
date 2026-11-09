@@ -1,5 +1,9 @@
 # cudnn_vsa
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
+<!-- Keep README.md and README.zh-CN.md synchronized, including examples and benchmark data. -->
+
 Packed multimodal attention for DiT/MMDiT training:
 **cuDNN block-sparse fine attention + FA4 varlen coarse attention**.
 

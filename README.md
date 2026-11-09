@@ -505,7 +505,7 @@ Environment: GB200 (2500 TFLOP/s BF16), PyTorch 2.12.0a0/NV26.04, CUDA 13.2, cuD
 Both modes share input generation, numerical checks, graph capture and timing.
 `--cases` selects workloads, `--heads` selects head counts, `--check-only` runs
 reference and retained-backward checks, and `--output` accepts a JSON file or
-directory. The `vsa-perf/v4` JSON uses `<case>-h<heads>` keys; each case records
+directory. The `vsa-perf/v5` JSON uses `<case>-h<heads>` keys; each case records
 checks, global useful FLOPs and per-GPU throughput/MFU. Ring timing takes the
 maximum rank latency for each replay before summarizing. Ring defaults to H=2 and omits traces;
 add `--profile` to save a trace per rank.
@@ -599,30 +599,28 @@ timed samples. JSON records `ring_partition`, phase latency, TFLOP/s/GPU and MFU
 Inputs are seeded random tensors; matching geometry does not reproduce a
 particular model layer's routing decisions.
 
-The Ring results below are **historical measurements with high-priority NCCL streams**.
-The commands above now use ordinary-priority streams; their performance has not
-been remeasured.
-
 #### Cyclic versus contiguous
 
-The two supported ownership policies were compared in a separate four-GB200
-allocation, in cyclic / contiguous / contiguous / cyclic order. Each run uses
+The two supported ownership policies use ordinary-priority NCCL streams on
+four GB200 GPUs, in cyclic / contiguous / contiguous / cyclic order. Each run uses
 10 warmups and 50 timed graph replays; values are medians of two run medians,
 with maximum rank latency per replay. All reference and graph checks passed.
 
 | Ring4 ownership | Forward ms | Backward ms | F+B ms | F+B TFLOP/s/GPU | F+B MFU |
 |---|---:|---:|---:|---:|---:|
-| Contiguous | 16.090 | 51.370 | 66.661 | 477.54 | 19.10% |
-| Cyclic | 16.186 | 51.691 | 67.197 | 473.73 | 18.95% |
+| Contiguous | 18.297 | 49.992 | 67.617 | 470.79 | 18.83% |
+| Cyclic | 18.415 | 50.147 | 67.918 | 468.70 | 18.75% |
 
-The 0.8% total-time difference applies to these random inputs. Actual model
+The 0.4% total-time difference applies to these random inputs. Actual model
 routing can concentrate selected KV blocks by peer, so benchmark both policies
 in the model as well. This allocation did not repeat ordinary VSA; the matched
 ordinary/Ring comparison below is a separate measurement.
 
 #### Ordinary VSA versus Ring4
 
-Measured in one four-GB200 allocation with the software environment above.
+This historical comparison used **high-priority NCCL streams** for Ring4;
+it has not been repeated with ordinary-priority streams. Both modes were
+measured in one four-GB200 allocation with the software environment above.
 Ordinary VSA runs the full sequence on one GPU without a process group;
 Ring4 in the table uses **contiguous ownership**, all four GPUs and
 backend-default backward buckets. Both use **961,696 global tokens,

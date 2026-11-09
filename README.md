@@ -247,8 +247,8 @@ selects `b2, b4`, adding text block `b0` gives `[b0, b2, b4]`.
 | Backward | Traverse the Ring in reverse, accumulate dQ/dK/dV in FP32, and reduce-scatter pooled gradients with FP32 SUM. |
 
 `vsa_attention` handles the merging and returns valid tokens in local block
-order. Communication tuning options are documented in
-[`build_vsa_layout`](vsa_layout.py).
+order. See [`build_vsa_layout`](vsa_layout.py) for P2P call mode
+(`ring_cp_batch_p2p`) and backward compute bucket size (`ring_cp_bwd_bucket_size`).
 
 ### Forward communication overlap
 

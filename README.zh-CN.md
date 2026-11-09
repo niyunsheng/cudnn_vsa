@@ -237,7 +237,8 @@ B 从分得较少的 rank 2 开始，依次给 rank 2、0 各一个 block；下�
 | 反向 | 反向遍历 Ring，以 FP32 累加 dQ/dK/dV，并通过 FP32 SUM reduce-scatter 归约池化梯度。 |
 
 `vsa_attention` 内部完成结果合并，输出为按本地 block 顺序排列的有效 token。
-通信调优参数见 [`build_vsa_layout`](vsa_layout.py)。
+P2P 调用方式（`ring_cp_batch_p2p`）和反向计算分桶大小（`ring_cp_bwd_bucket_size`）
+的定义见 [`build_vsa_layout`](vsa_layout.py)。
 
 ### 前向通信重叠
 

@@ -8,9 +8,12 @@ from vsa_layout import VSALayout
 
 def _reorder_tokens(x, layout, inverse):
     if not isinstance(layout, VSALayout) or layout.input_order != "block":
-        raise ValueError('Token reordering requires a full VSALayout with input_order="block"')
-    if not isinstance(x, torch.Tensor) or x.ndim < 1 or x.shape[0] != layout.tokens:
-        raise ValueError("Expected one tensor with shape [layout.tokens, ...]")
+        raise ValueError('Token reordering requires a VSALayout with input_order="block"')
+    if inverse and layout.ring is not None:
+        raise ValueError("block_wo_padding_to_raster requires a full VSALayout; gather Ring outputs explicitly")
+    tokens = layout.tokens if layout.ring is None else layout.ring.global_tokens
+    if not isinstance(x, torch.Tensor) or x.ndim < 1 or x.shape[0] != tokens:
+        raise ValueError(f"Expected one tensor with shape [{tokens}, ...]")
     if any(size == 0 for size in x.shape[1:]) or not x.is_contiguous():
         raise ValueError("Token-reorder input must be contiguous with nonempty row dimensions")
     if x.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64,
@@ -21,22 +24,25 @@ def _reorder_tokens(x, layout, inverse):
     return vsa_kernels.reorder_tokens(x, layout.input_rows, inverse=inverse)
 
 
-def to_block_order(x, *, vsa_layout):
-    """Reorder one raster tensor into compact blocks, without padding.
+def raster_to_block_wo_padding(x, *, vsa_layout):
+    """Reorder and optionally shard one global raster tensor, without padding.
 
-    Accept and return one contiguous CUDA [T, ...] tensor, preserving its shape
-    and dtype. Use a full block layout and call once at the stack's input
-    boundary. Gradients apply the inverse permutation.
-    Already block-ordered inputs do not need this conversion.
+    Input is contiguous CUDA [T_global, ...]. A full block layout returns all
+    tokens; a Ring layout returns only its owned rows, [layout.tokens, ...].
+    One gather fuses selection with reordering, preserving dtype and trailing
+    dimensions. Call once before the VSA stack, separately for tokens/positions
+    or other aligned fields. The helper performs no communication.
+    Backward scatters gradients to the original rows, zeroing unowned rows.
+    Already local block-ordered inputs do not need this conversion.
     """
     return _reorder_tokens(x, vsa_layout, inverse=False)
 
 
-def to_raster_order(x, *, vsa_layout):
+def block_wo_padding_to_raster(x, *, vsa_layout):
     """Restore one compact block tensor to raster order, without padding.
 
     Return one tensor with the same shape and dtype. Use the same full block
-    layout as to_block_order at the stack's output boundary if needed.
+    layout as raster_to_block_wo_padding at the stack's output boundary if needed.
     """
     return _reorder_tokens(x, vsa_layout, inverse=True)
 
@@ -67,9 +73,18 @@ def vsa_attention(q, k, v, gate, vsa_layout, *, scale=None):
     Inputs follow layout.input_order: raster or compact block-major, without
     padding. Output uses the same order; Q/K/V/gate must share that order.
     The caller reorders tokens and positions once before the entire VSA stack.
+
+    layout.ring selects Ring execution using the group and transport options
+    bound by build_vsa_layout, including size-one groups. The caller owns the
+    group's lifetime and any external Ulysses transforms. raster_to_block_wo_padding
+    prepares the local compact shard from a full raster tensor before the stack.
+    Ordinary and Ring attention use the same call signature.
     """
-    _validate(q, k, v, gate)
     layout = vsa_layout
+    if not isinstance(layout, VSALayout):
+        raise ValueError("Expected a VSALayout from build_vsa_layout")
+    is_ring = layout.ring is not None
+    _validate(q, k, v, gate)
     if q.shape[0] != layout.tokens:
         raise ValueError("Expected [layout.tokens, heads, head_dim] inputs")
     if q.shape[1] != layout.head_num:
@@ -81,15 +96,26 @@ def vsa_attention(q, k, v, gate, vsa_layout, *, scale=None):
     if layout.slots_are_input:
         q_slots, k_slots, v_slots = q, k, v
     elif layout.input_order == "block":
-        q_slots, k_slots, v_slots = vsa_kernels.to_slots_qkv(
+        q_slots, k_slots, v_slots = vsa_kernels.block_wo_padding_to_block_w_padding_qkv(
             q, k, v, layout.slot_row, layout.row_slot)
     else:
         q_slots, k_slots, v_slots = (
-            vsa_kernels.to_slots(x, layout.slot_row, layout.row_slot) for x in (q, k, v))
-    fine, coarse = vsa_core.attention_slots(q_slots, k_slots, v_slots, layout, scale=scale)
-    out = fine if layout.slots_are_input else vsa_kernels.from_slots(
+            vsa_kernels.raster_to_block_w_padding(x, layout.slot_row, layout.row_slot)
+            for x in (q, k, v))
+    if is_ring:
+        scale = q.shape[-1]**-0.5 if scale is None else scale
+        fine, coarse = vsa_core.ring_attention_slots(
+            q_slots, k_slots, v_slots, layout, scale=scale)
+    else:
+        fine, coarse = vsa_core.attention_slots(q_slots, k_slots, v_slots, layout, scale=scale)
+    restore = (vsa_kernels.block_w_padding_to_block_wo_padding
+               if layout.input_order == "block" else vsa_kernels.block_w_padding_to_raster)
+    out = fine if layout.slots_are_input else restore(
         fine, layout.slot_row, layout.row_slot)
     if coarse is not None:
         out = vsa_kernels.fine_coarse_gate_add(
             out, gate, coarse, layout.row_coarse, layout.coarse_rows)
+    elif is_ring and not layout.dense_only:
+        # Fine-only peers still need a zero gate gradient, including NaN gates.
+        out = out + gate.masked_fill(torch.ones_like(gate, dtype=torch.bool), 0).sum() * 0
     return out.contiguous()

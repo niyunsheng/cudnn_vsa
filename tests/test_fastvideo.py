@@ -79,12 +79,11 @@ class FastVideoReference:
         torch.testing.assert_close(layout.block_sizes.long(), self.meta.variable_block_sizes.long(), rtol=0, atol=0)
         torch.testing.assert_close(layout.row_slot, self.meta.untile_combined_index, rtol=0, atol=0)
         q_slots, k_slots, v_slots = (
-            vsa_kernels.to_slots(x, layout.slot_row, layout.row_slot) for x in (q, k, v)
+            vsa_kernels.raster_to_block_w_padding(x, layout.slot_row, layout.row_slot) for x in (q, k, v)
         )
-        q_route, k_route, _, _, _ = vsa_kernels.block_means(
+        q_route, k_route, _, _, _ = vsa_kernels.routing_and_coarse_means(
             q_slots, k_slots, v_slots, layout.block_sizes, layout.coarse_blocks)
-        indices = route(q_route, k_route, layout.groups, layout.routing_indices,
-            dense_query_full=layout.dense_query_full)
+        indices = route(q_route, k_route, layout)
         actual = routing_mask(indices, layout.routing_counts)
         tq, tk = self.tiled((q, k))
         means = [self.h3._pool_tiles(x, self.meta.variable_block_sizes, 64) for x in (tq, tk)]

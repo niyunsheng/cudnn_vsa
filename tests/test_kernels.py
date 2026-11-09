@@ -14,6 +14,33 @@ SAMPLES = (
 )
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("selected", [None, [3, 0], [2], []])
+def test_block_means_preserve_fp32_precision_selection_and_gradients(dtype, selected):
+    sizes = torch.tensor([3, 64, 0, 7], dtype=torch.int32)
+    xs = [torch.randn(4 * 64, 2, 8, dtype=dtype, requires_grad=True) for _ in range(3)]
+    valid = torch.arange(64)[None, :] < sizes[:, None]
+    masked = [x.view(4, 64, 2, 8).masked_fill(~valid[:, :, None, None], 0).flatten(0, 1)
+              for x in xs]
+    blocks = None if selected is None else torch.tensor(selected, dtype=torch.int64)
+    got = vsa_kernels.block_means(*masked, sizes, blocks)
+    refs = [x.detach().float().requires_grad_() for x in xs]
+    expected = [torch.stack((x[:3].mean(0), x[64:128].mean(0),
+                            x[128:128].sum(0), x[192:199].mean(0))) for x in refs]
+    if blocks is not None:
+        expected = [x[blocks] for x in expected]
+    weights = [torch.randn_like(x) for x in expected]
+    for actual, target in zip(got, expected):
+        assert actual.dtype == torch.float32 and actual.requires_grad
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, target)
+    grad = torch.autograd.grad(got, xs, weights)
+    expected_grad = torch.autograd.grad(expected, refs, weights)
+    for actual, target in zip(grad, expected_grad):
+        torch.testing.assert_close(actual, target.to(dtype))
+        assert not actual.view(4, 64, 2, 8)[~valid].count_nonzero()
+
+
 def test_sample_major_tiling_maps_and_gather_adjoint():
     # Unequal samples, an image with no text, and a second ragged video.
     samples = [[Segment("video", (4, 4, 8), .9), Segment("text", 3)],
@@ -34,10 +61,11 @@ def test_sample_major_tiling_maps_and_gather_adjoint():
     expected_map = torch.tensor([row for block in blocks for row in block + [-1]*(64-len(block))])
     torch.testing.assert_close(layout.slot_row, expected_map, atol=0, rtol=0)
     x = torch.arange(143, dtype=torch.float64).view(-1, 1, 1).requires_grad_()
-    slots = vsa_kernels.to_slots(x, layout.slot_row, layout.row_slot)
+    slots = vsa_kernels.raster_to_block_w_padding(x, layout.slot_row, layout.row_slot)
     expected = torch.where(expected_map >= 0, expected_map, 0).to(x.dtype)
     torch.testing.assert_close(slots.flatten(), expected, atol=0, rtol=0)
-    torch.testing.assert_close(vsa_kernels.from_slots(slots, layout.slot_row, layout.row_slot), x, atol=0, rtol=0)
+    restored = vsa_kernels.block_w_padding_to_raster(slots, layout.slot_row, layout.row_slot)
+    torch.testing.assert_close(restored, x, atol=0, rtol=0)
     weights = torch.randn_like(slots)
     grad, = torch.autograd.grad(slots, (x,), weights)
     expected_grad = torch.empty_like(x)
@@ -46,6 +74,7 @@ def test_sample_major_tiling_maps_and_gather_adjoint():
     torch.testing.assert_close(grad, expected_grad, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("input_order", ["raster", "block"])
 @pytest.mark.parametrize("samples", [
     [[Segment("video", (4, 4, 16), .5), Segment("text", 7)]],
     [[Segment("video", (1, 1, 3))]],  # Original rows still need a trailing padded block.
@@ -53,13 +82,17 @@ def test_sample_major_tiling_maps_and_gather_adjoint():
     [[Segment("text", 3), Segment("video", (5, 4, 8), .5), Segment("audio", 0)],
      [Segment("video", (1, 1, 3)), Segment("text", 0)]],
 ])
-def test_public_layout_slot_round_trip(samples):
-    layout = build_vsa_layout(samples, head_num=2)
+def test_public_layout_slot_round_trip(samples, input_order):
+    layout = build_vsa_layout(samples, head_num=2, input_order=input_order)
+    pad = (vsa_kernels.block_wo_padding_to_block_w_padding
+           if input_order == "block" else vsa_kernels.raster_to_block_w_padding)
+    restore = (vsa_kernels.block_w_padding_to_block_wo_padding
+               if input_order == "block" else vsa_kernels.block_w_padding_to_raster)
     x = torch.randn(layout.tokens, 2, 8, requires_grad=True)
-    slots = vsa_kernels.to_slots(x, layout.slot_row, layout.row_slot)
+    slots = pad(x, layout.slot_row, layout.row_slot)
     assert slots.shape[0] == layout.padded_tokens
     assert not slots[layout.slot_row < 0].count_nonzero()
-    restored = vsa_kernels.from_slots(slots, layout.slot_row, layout.row_slot)
+    restored = restore(slots, layout.slot_row, layout.row_slot)
     torch.testing.assert_close(restored, x, atol=0, rtol=0)
     dy = torch.randn_like(x)
     grad, = torch.autograd.grad(restored, x, dy)
@@ -71,11 +104,11 @@ def test_segment_pure_layout_and_adjoint():
     assert layout.block_sizes[:4].tolist() == [64, 1, 64, 3]
     assert layout.block_sizes.sum().item() == 342
     x = torch.randn(layout.tokens, 2, 8, requires_grad=True)
-    slots = vsa_kernels.to_slots(x, layout.slot_row, layout.row_slot)
-    assert torch.equal(vsa_kernels.from_slots(slots, layout.slot_row, layout.row_slot), x)
+    slots = vsa_kernels.raster_to_block_w_padding(x, layout.slot_row, layout.row_slot)
+    assert torch.equal(vsa_kernels.block_w_padding_to_raster(slots, layout.slot_row, layout.row_slot), x)
     assert torch.count_nonzero(slots[layout.slot_row < 0]) == 0
     weights = torch.randn_like(x)
-    (vsa_kernels.from_slots(slots, layout.slot_row, layout.row_slot) * weights).sum().backward()
+    (vsa_kernels.block_w_padding_to_raster(slots, layout.slot_row, layout.row_slot) * weights).sum().backward()
     torch.testing.assert_close(x.grad, weights, rtol=0, atol=0)
 
 
@@ -85,9 +118,9 @@ def test_full_blocks_still_require_reordering():
     assert full.all_blocks_full
     assert not ragged.all_blocks_full
     x = torch.randn(full.tokens, 2, 8)
-    slots = vsa_kernels.to_slots(x, full.slot_row, full.row_slot)
+    slots = vsa_kernels.raster_to_block_w_padding(x, full.slot_row, full.row_slot)
     assert not torch.equal(slots, x)
-    restored = vsa_kernels.from_slots(slots, full.slot_row, full.row_slot)
+    restored = vsa_kernels.block_w_padding_to_raster(slots, full.slot_row, full.row_slot)
     torch.testing.assert_close(restored, x, atol=0, rtol=0)
 
 

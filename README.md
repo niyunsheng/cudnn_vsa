@@ -576,108 +576,45 @@ measurements; raster-to-slot reordering and padding are included in VSA time.
 
 ### Single-head 720p44s: ordinary VSA and Ring4
 
-The `thd720p44s` case matches the attention geometry inside the 128-GPU
-DiT U32/R4 configuration, after the Ulysses exchange. It runs only VSA:
-pooling, routing, fine/coarse attention, gated merge and their backward,
-with Ring communication. QKV/output projections, Ulysses, MoE and optimizer
-work are outside this benchmark.
+`thd720p44s` packs a `265 x 45 x 80` video (sparsity 0.9) and an independent
+`1 x 45 x 80` image, each with 2048 text tokens: **961696 tokens total**.
+All modes use BF16, H=1, D=128, compact block input, seed 937 and
+`dense_query_full=False`. Timing covers VSA forward/backward and Ring communication.
 
-| Setting | Value |
-|---|---|
-| Video token grid | `265 x 45 x 80`, sparsity `0.9` |
-| Independent image token grid | `1 x 45 x 80`, dense attention |
-| Text | 2048 tokens per sample |
-| Global packed tokens | 961696: video/text 956048, image/text 5648 |
-| Ring size / heads / head dimension | `4 / 1 / 128` |
-| Compact tokens, cyclic ranks 0/1/2/3 | `240436 / 240420 / 240420 / 240420` |
-| Compact tokens, contiguous ranks 0/1/2/3 | `243904 / 242880 / 242832 / 232080` |
-| Input order / precision | Compact block order / BF16 |
-
-One head is correct here: the model's 32 heads have already been divided by
-U32. Contiguous Ring ranks receive 232k–244k valid tokens for that head, averaging
-240,424. The ranks own `4051 / 4050 / 4050 / 4050` blocks; partial blocks
-account for the unequal valid token counts. These are token counts after the
-Ulysses exchange; input tensors have no padding, and VSA manages its internal
-64-token attention slots.
+The same four-GB200 allocation runs the full sequence on one GPU without Ring,
+then compares both Ring4 policies using ordinary-priority NCCL streams:
 
 ```bash
-# Full sequence on one GPU, with the same global inputs and block order.
-python -m benchmark.perf_vsa --heads 1 --cases thd720p44s --seed 937 \
-  --input-order block --warmup 10 --repeats 50 --profile \
-  --peak-tflops 2500 --output benchmark/results/single_720p44s/perf.json
-
-# Compare both ownership policies on the same four GPUs and global inputs.
-for partition in cyclic contiguous; do
-  torchrun --standalone --nproc-per-node=4 --module benchmark.perf_vsa --ring \
-    --ring-size 4 --ring-partition "$partition" --heads 1 --cases thd720p44s \
-    --seed 937 --batch-p2p --bwd-bucket-size backend \
-    --warmup 10 --repeats 50 --profile --peak-tflops 2500 \
-    --output "benchmark/results/ring4_720p44s/$partition/perf.json"
+vsa_args=(--heads 1 --cases thd720p44s --input-order block --seed 937
+          --warmup 10 --repeats 50 --no-profile --peak-tflops 2500)
+for vsa_run in single_0 cyclic_0 contiguous_0 contiguous_1 cyclic_1 single_1; do
+  vsa_mode="${vsa_run%_*}"
+  if [ "$vsa_mode" = single ]; then
+    CUDA_VISIBLE_DEVICES=0 python -m benchmark.perf_vsa "${vsa_args[@]}" \
+      --output "benchmark/results/720p44s/$vsa_run.json"
+  else
+    torchrun --standalone --nproc-per-node=4 --module benchmark.perf_vsa \
+      --ring --ring-size 4 --ring-partition "$vsa_mode" --batch-p2p \
+      --bwd-bucket-size backend "${vsa_args[@]}" \
+      --output "benchmark/results/720p44s/$vsa_run.json"
+  fi
 done
 ```
 
-CUDA Graph is enabled by default. Both commands validate outputs and all
-input gradients against single-device VSA, retained backward, and graph
-replay with original/changed inputs before timing. The Ring command writes
-`perf-group0.json` and `perf-group0-thd720p44s-h1-rank{0,1,2,3}.trace.json`.
-Each trace captures one additional full forward/backward replay after the
-timed samples. JSON records `ring_partition`, phase latency, TFLOP/s/GPU and MFU.
-Inputs are seeded random tensors; matching geometry does not reproduce a
-particular model layer's routing decisions.
-
-#### Cyclic versus contiguous
-
-The two supported ownership policies use ordinary-priority NCCL streams on
-four GB200 GPUs, in cyclic / contiguous / contiguous / cyclic order. Each run uses
-10 warmups and 50 timed graph replays; values are medians of two run medians,
-with maximum rank latency per replay. All reference and graph checks passed.
-
-| Ring4 ownership | Forward ms | Backward ms | F+B ms | F+B TFLOP/s/GPU | F+B MFU |
-|---|---:|---:|---:|---:|---:|
-| Contiguous | 18.297 | 49.992 | 67.617 | 470.79 | 18.83% |
-| Cyclic | 18.415 | 50.147 | 67.918 | 468.70 | 18.75% |
-
-The 0.4% total-time difference applies to these random inputs. Actual model
-routing can concentrate selected KV blocks by peer, so benchmark both policies
-in the model as well. This allocation did not repeat ordinary VSA; the matched
-ordinary/Ring comparison below is a separate measurement.
-
-#### Ordinary VSA versus Ring4
-
-This historical comparison used **high-priority NCCL streams** for Ring4;
-it has not been repeated with ordinary-priority streams. Both modes were
-measured in one four-GB200 allocation with the software environment above.
-Ordinary VSA runs the full sequence on one GPU without a process group;
-Ring4 in the table uses **contiguous ownership**, all four GPUs and
-backend-default backward buckets. Both use **961,696 global tokens,
-H=1, D=128, compact block input and seed 937**. Global input hashes and useful
-FLOP counts match.
-
-| Phase | Ordinary ms | Ordinary TFLOP/s | Ordinary MFU | Ring4 ms | Ring4 TFLOP/s/GPU | Ring4 MFU | Parallel efficiency |
+| Mode | Forward ms | Forward MFU | Backward ms | Backward MFU | F+B ms | F+B TFLOP/s/GPU | F+B MFU |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Forward | 58.193 | 729.38 | 29.18% | 15.556 | 682.14 | 27.29% | 93.52% |
-| Backward | 179.412 | 473.15 | 18.93% | 50.403 | 421.05 | 16.84% | 88.99% |
-| Forward + backward | 237.707 | 535.68 | 21.43% | 65.210 | 488.17 | 19.53% | 91.13% |
+| No Ring (1 GPU) | 67.460 | 25.17% | 185.257 | 18.33% | 252.572 | 504.15 | 20.17% |
+| Ring4, contiguous | 18.077 | 23.48% | 48.780 | 17.40% | 66.356 | 479.74 | 19.19% |
+| Ring4, cyclic | 17.914 | 23.69% | 49.173 | 17.26% | 66.733 | 477.03 | 19.08% |
 
-Each mode has two runs of 10 warmups and 50 timed CUDA Graph replays. Ring
-timing takes the maximum rank latency for each replay; the table reports the
-median of each mode's two run medians.
+Each mode runs twice, with 10 warmups and 50 timed CUDA Graph replays per run,
+in the order above. Each column is the median of two run medians; Ring timing
+uses the maximum rank latency per replay. All reference and graph checks passed.
 
-With fixed global work, speedup is `T1 / T4` and parallel efficiency is
-`T1 / (4 * T4)`, equivalently `MFU4 / MFU1`. Here the full pass achieves
-**3.645x speedup and 91.13% efficiency**. This comparison includes
-communication, changes in kernel shape, extra accumulation and load imbalance;
-it does not isolate communication cost. P2P overlap alone does not establish
-zero communication overhead.
-
-The example uses four GPUs on one host. To measure a Ring spanning hosts,
-use one process per GPU and the normal torchrun rendezvous arguments,
-keeping the same benchmark flags. Record the actual fabric placement:
-single-host NVLink overlap is not representative of a Ring crossing NVLink
-domains, and a four-GPU run does not reproduce 32 concurrent Ring groups.
-Standalone useful-FLOP MFU counts valid attention pairs only; the DiT model
-ledger also includes projections/MoE and counts physical fine-attention
-block slots, so their MFU values have different numerators.
+Relative to one GPU, full-pass speedup is **3.806x contiguous / 3.785x cyclic**;
+parallel efficiency `T1 / (4 * T4)` is **95.16% / 94.62%**.
+These single-host, random-input results include communication and kernel-shape
+changes; actual model routing and multi-host placement can change efficiency.
 
 ## Tests
 

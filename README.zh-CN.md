@@ -556,99 +556,45 @@ FA4 完整注意力和 VSA 在同一 GPU 上交替执行。
 
 ### 单 head 720p44s：普通 VSA 与 Ring4
 
-`thd720p44s` case 的注意力几何形状，与 128 GPU DiT U32/R4 配置中
-Ulysses 交换后的形状一致。它仅运行 VSA：pooling、路由、fine/coarse attention、
-门控合并及其反向，并包含 Ring 通信。
-QKV/输出投影、Ulysses、MoE 和优化器工作不属于此 benchmark 的范围。
+`thd720p44s` 打包一个 `265 x 45 x 80` 视频（稀疏度 0.9）和一个独立的
+`1 x 45 x 80` 图像，每个样本带 2048 个文本 token：**共 961696 个 token**。
+三种模式均使用 BF16、H=1、D=128、紧凑 block 输入、seed 937 和
+`dense_query_full=False`。计时覆盖 VSA 前反向及 Ring 通信。
 
-| 设置 | 值 |
-|---|---|
-| 视频 token 网格 | `265 x 45 x 80`，稀疏度 `0.9` |
-| 独立图像 token 网格 | `1 x 45 x 80`，稠密注意力 |
-| 文本 | 每个样本 2048 个 token |
-| 全局打包 token 数 | 961696：视频/文本 956048，图像/文本 5648 |
-| Ring size / head 数 / head 维度 | `4 / 1 / 128` |
-| 循环分配时 rank 0/1/2/3 的紧凑 token 数 | `240436 / 240420 / 240420 / 240420` |
-| 连续分配时 rank 0/1/2/3 的紧凑 token 数 | `243904 / 242880 / 242832 / 232080` |
-| 输入顺序 / 精度 | 紧凑 block 顺序 / BF16 |
-
-这里使用一个 head 是正确的：模型的 32 个 head 已经被 U32 划分。
-连续分配时，各 Ring rank 接收该 head 的 232k–244k 个有效 token，平均为 240,424。
-各 rank 拥有 `4051 / 4050 / 4050 / 4050` 个 block；
-有效 token 数不相等是由不完整 block 引起的。
-这些是 Ulysses 交换后的 token 数；输入张量没有 padding，
-VSA 管理其内部的 64-token 注意力 slot。
+在同一次分配的四张 GB200 上，先用单卡无 Ring 运行完整序列，
+再比较使用普通优先级 NCCL 流的两种 Ring4 策略：
 
 ```bash
-# Full sequence on one GPU, with the same global inputs and block order.
-python -m benchmark.perf_vsa --heads 1 --cases thd720p44s --seed 937 \
-  --input-order block --warmup 10 --repeats 50 --profile \
-  --peak-tflops 2500 --output benchmark/results/single_720p44s/perf.json
-
-# Compare both ownership policies on the same four GPUs and global inputs.
-for partition in cyclic contiguous; do
-  torchrun --standalone --nproc-per-node=4 --module benchmark.perf_vsa --ring \
-    --ring-size 4 --ring-partition "$partition" --heads 1 --cases thd720p44s \
-    --seed 937 --batch-p2p --bwd-bucket-size backend \
-    --warmup 10 --repeats 50 --profile --peak-tflops 2500 \
-    --output "benchmark/results/ring4_720p44s/$partition/perf.json"
+vsa_args=(--heads 1 --cases thd720p44s --input-order block --seed 937
+          --warmup 10 --repeats 50 --no-profile --peak-tflops 2500)
+for vsa_run in single_0 cyclic_0 contiguous_0 contiguous_1 cyclic_1 single_1; do
+  vsa_mode="${vsa_run%_*}"
+  if [ "$vsa_mode" = single ]; then
+    CUDA_VISIBLE_DEVICES=0 python -m benchmark.perf_vsa "${vsa_args[@]}" \
+      --output "benchmark/results/720p44s/$vsa_run.json"
+  else
+    torchrun --standalone --nproc-per-node=4 --module benchmark.perf_vsa \
+      --ring --ring-size 4 --ring-partition "$vsa_mode" --batch-p2p \
+      --bwd-bucket-size backend "${vsa_args[@]}" \
+      --output "benchmark/results/720p44s/$vsa_run.json"
+  fi
 done
 ```
 
-默认启用 CUDA Graph。两个命令都会在计时之前，将输出和所有输入梯度与单设备 VSA 对比，
-并检查保留计算图后的再次反向，以及使用原始/修改后输入的 graph replay。
-Ring 命令写出 `perf-group0.json` 和
-`perf-group0-thd720p44s-h1-rank{0,1,2,3}.trace.json`。
-每个 trace 在计时样本之后额外采集一次完整前向/反向 replay。
-JSON 记录 `ring_partition`、阶段延迟、TFLOP/s/GPU 和 MFU。
-输入是使用指定 seed 生成的随机张量；几何形状一致并不代表复现了某个模型层的路由决策。
+| 模式 | 前向 ms | 前向 MFU | 反向 ms | 反向 MFU | 前向+反向 ms | 前向+反向 TFLOP/s/GPU | 前向+反向 MFU |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 无 Ring（单卡） | 67.460 | 25.17% | 185.257 | 18.33% | 252.572 | 504.15 | 20.17% |
+| Ring4（连续） | 18.077 | 23.48% | 48.780 | 17.40% | 66.356 | 479.74 | 19.19% |
+| Ring4（循环） | 17.914 | 23.69% | 49.173 | 17.26% | 66.733 | 477.03 | 19.08% |
 
-#### 循环分配与连续分配
-
-两种支持的归属策略在四张 GB200 上使用普通优先级 NCCL 流比较，执行顺序为
-循环 / 连续 / 连续 / 循环。每次运行预热 10 次，计时 graph replay 50 次；
-每次 replay 使用各 rank 的最大延迟，表中值为两次运行中位数的中位数。
+按上述顺序，每种模式运行两次，每次预热 10 次、计时 CUDA Graph replay 50 次。
+每列独立取两次运行中位数的中位数；Ring 每次 replay 使用各 rank 的最大延迟。
 所有参考实现对比和 graph 检查均通过。
 
-| Ring4 归属策略 | 前向 ms | 反向 ms | 前向+反向 ms | 前向+反向 TFLOP/s/GPU | 前向+反向 MFU |
-|---|---:|---:|---:|---:|---:|
-| 连续 | 18.297 | 49.992 | 67.617 | 470.79 | 18.83% |
-| 循环 | 18.415 | 50.147 | 67.918 | 468.70 | 18.75% |
-
-总时间 0.4% 的差异适用于这些随机输入。
-实际模型的路由可能将选中的 KV block 集中到某个 peer，因此也应在模型中测试两种策略。
-此次节点分配没有重测普通 VSA；下面相同条件下的普通/Ring 对比是另一次独立测量。
-
-#### 普通 VSA 与 Ring4
-
-这组历史对比中，Ring4 使用**高优先级 NCCL 流**，尚未使用普通优先级流重测。
-两种模式在同一次分配的四张 GB200 上测得，使用上述软件环境。
-普通 VSA 在一张 GPU 上运行完整序列，不使用进程组；
-表中的 Ring4 使用**连续分配**、全部四张 GPU 和后端默认反向 bucket。
-两者都使用 **961,696 个全局 token、H=1、D=128、紧凑 block 输入和 seed 937**。
-全局输入 hash 和有效 FLOP 数一致。
-
-| 阶段 | 普通 VSA ms | 普通 VSA TFLOP/s | 普通 VSA MFU | Ring4 ms | Ring4 TFLOP/s/GPU | Ring4 MFU | 并行效率 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| 前向 | 58.193 | 729.38 | 29.18% | 15.556 | 682.14 | 27.29% | 93.52% |
-| 反向 | 179.412 | 473.15 | 18.93% | 50.403 | 421.05 | 16.84% | 88.99% |
-| 前向 + 反向 | 237.707 | 535.68 | 21.43% | 65.210 | 488.17 | 19.53% | 91.13% |
-
-每种模式运行两次，每次预热 10 次，计时 CUDA Graph replay 50 次。
-Ring 计时取每次 replay 中各 rank 的最大延迟；
-表中报告每种模式两次运行中位数的中位数。
-
-全局工作量固定时，加速比为 `T1 / T4`，并行效率为 `T1 / (4 * T4)`，
-等价于 `MFU4 / MFU1`。这里完整前反向达到 **3.645x 加速和 91.13% 并行效率**。
-该对比包含通信、kernel 形状变化、额外累加和负载不均衡的影响，
-没有单独分离通信成本。仅有 P2P 重叠并不能证明通信开销为零。
-
-示例使用同一主机上的四张 GPU。要测量跨主机 Ring，
-使用每张 GPU 一个进程及常规 torchrun rendezvous 参数，并保持相同的 benchmark 标志。
-应记录实际互连拓扑和节点分布：单主机 NVLink 的重叠表现不能代表跨 NVLink 域的 Ring，
-四张 GPU 的运行也无法复现 32 个并发 Ring 组。
-独立算子的有效 FLOP MFU 仅统计有效注意力对；DiT 模型的统计还包括投影/MoE，
-并计算物理 fine-attention block slot，因此两者的 MFU 分子不同。
+相对单卡，完整前反向加速比为**连续 3.806x / 循环 3.785x**；
+并行效率 `T1 / (4 * T4)` 为 **95.16% / 94.62%**。
+这些单机随机输入结果包含通信和 kernel 形状变化的影响；
+实际模型路由及跨主机部署可能改变效率。
 
 ## 测试
 

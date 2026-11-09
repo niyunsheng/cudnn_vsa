@@ -152,13 +152,12 @@ by the Ulysses size `U`, and the world size must equal `U * R`.
 
 | Mode | Input preparation before the layers | Q/K/V/gate passed to VSA |
 | --- | --- | --- |
-| No CP (`U=1, R=1`) | Keep raster order, or reorder once to block order | All tokens and all heads |
-| Ulysses only (`U>1, R=1`) | Choose raster or block order, then split the stream into U token slices | All tokens and H/U heads after All-to-All |
+| No CP (`U=1, R=1`) | Keep raster order | All tokens and all heads |
+| Ulysses only (`U>1, R=1`) | Split the raster stream into U token slices | All tokens and H/U heads after All-to-All |
 | Ring + Ulysses (`U>1, R>1`) | Select whole Ring-owned blocks and reorder once; then split each compact Ring stream into U token slices | This Ring owner's valid tokens and H/U heads after All-to-All |
 
-Ulysses token boundaries may split a block: All-to-All reconstructs the stream
-before VSA runs. Its communication supports either input order, but the
-reconstructed stream must match `layout.input_order`. Ring requires block order.
+Ulysses All-to-All reconstructs the token stream before VSA runs: raster order
+without Ring, compact block order with Ring.
 Only trailing **transport padding** is added to equalize Ulysses message sizes;
 it is removed before attention and excluded from the loss. This is separate
 from VSA's internal 64-slot block padding.
@@ -169,17 +168,15 @@ Save the shared Python example below as `demo_cp.py` in this repository, then ru
 
 ```bash
 python demo_cp.py
-python demo_cp.py --input-order block
 ```
 
 ### Ulysses CP only
 
-Four GPUs split tokens before the layers and exchange tokens for heads inside
-each layer. Both raster and block inputs are supported:
+Use raster input as in the no-CP example. Four GPUs split tokens before the
+layers and exchange tokens for heads inside each layer; no input reorder is needed:
 
 ```bash
 torchrun --standalone --nproc-per-node=4 demo_cp.py --ulysses-size 4
-torchrun --standalone --nproc-per-node=4 demo_cp.py --ulysses-size 4 --input-order block
 ```
 
 ### Ring + Ulysses CP
@@ -191,9 +188,9 @@ Both ownership policies use the same preparation and attention calls:
 
 ```bash
 torchrun --standalone --nproc-per-node=8 demo_cp.py \
-  --ulysses-size 4 --ring-size 2 --input-order block --ring-partition cyclic
+  --ulysses-size 4 --ring-size 2 --ring-partition cyclic
 torchrun --standalone --nproc-per-node=8 demo_cp.py \
-  --ulysses-size 4 --ring-size 2 --input-order block --ring-partition contiguous
+  --ulysses-size 4 --ring-size 2 --ring-partition contiguous
 ```
 
 ### Shared example
@@ -245,16 +242,14 @@ def exchange_tokens(out, group):
 parser = argparse.ArgumentParser()
 parser.add_argument("--ulysses-size", type=int, default=1)
 parser.add_argument("--ring-size", type=int, default=1)
-parser.add_argument("--input-order", choices=("raster", "block"), default="raster")
 parser.add_argument("--ring-partition", choices=("cyclic", "contiguous"), default="cyclic")
 args = parser.parse_args()
 U, R, H, D = args.ulysses_size, args.ring_size, 8, 128
+input_order = "block" if R > 1 else "raster"
 C = H * D
 world = int(os.environ.get("WORLD_SIZE", "1"))
 if U < 1 or R < 1 or H % U or world != U * R:
     parser.error("Require U >= 1, R >= 1, H % U == 0 and WORLD_SIZE == U * R")
-if R > 1 and args.input_order != "block":
-    parser.error("Ring requires --input-order block")
 device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
 torch.cuda.set_device(device)
 rank = 0
@@ -281,7 +276,7 @@ samples = [
 ]
 T = sum(segment.tokens for sample in samples for segment in sample)  # 584
 layout = build_vsa_layout(
-    samples, head_num=H // U, input_order=args.input_order, device=device,
+    samples, head_num=H // U, input_order=input_order, device=device,
     ring_cp_group=ring_group, ring_partition=args.ring_partition,
 )
 torch.manual_seed(1234)  # Identical mock input and replicated weights on all ranks.
@@ -289,10 +284,10 @@ tokens_global = torch.randn(T, C, device=device, dtype=torch.bfloat16)
 # Row IDs illustrate the mapping; use the model's original coordinates for RoPE.
 position_ids_global = torch.arange(T, device=device)
 
-# One reorder/whole-block Ring selection, before any layer's Q/K/V projection.
+# Ring only: reorder and select whole blocks before the layers.
 tokens_attention = tokens_global
 position_ids_attention = position_ids_global
-if args.input_order == "block":
+if R > 1:
     tokens_attention = raster_to_block_wo_padding(tokens_global, vsa_layout=layout)
     position_ids_attention = raster_to_block_wo_padding(position_ids_global, vsa_layout=layout)
 
@@ -337,7 +332,7 @@ reported_loss = loss.detach()
 if world > 1:
     dist.all_reduce(reported_loss, op=dist.ReduceOp.SUM)
 if rank == 0:
-    print(f"U={U}, R={R}, order={args.input_order}, loss={reported_loss.item():.6f}")
+    print(f"U={U}, R={R}, order={input_order}, loss={reported_loss.item():.6f}")
 if world > 1:
     dist.destroy_process_group()
 ```

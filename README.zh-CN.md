@@ -149,13 +149,12 @@ VSA 样本内部的稠密图像仍会参与 coarse。
 
 | 模式 | 层堆栈之前的输入准备 | 传入 VSA 的 Q/K/V/gate |
 | --- | --- | --- |
-| 无 CP（`U=1, R=1`） | 保持 raster 顺序，或一次性重排为 block 顺序 | 全部 token 和全部 head |
-| 仅 Ulysses（`U>1, R=1`） | 选择 raster 或 block 顺序，再将序列切成 U 个 token 分片 | All-to-All 后的全部 token 和 H/U 个 head |
+| 无 CP（`U=1, R=1`） | 保持 raster 顺序 | 全部 token 和全部 head |
+| 仅 Ulysses（`U>1, R=1`） | 将 raster 序列切成 U 个 token 分片 | All-to-All 后的全部 token 和 H/U 个 head |
 | Ring + Ulysses（`U>1, R>1`） | 一次性选择并重排 Ring 拥有的完整 block，再将每个紧凑 Ring 序列切成 U 个 token 分片 | All-to-All 后本 Ring 分片的有效 token 和 H/U 个 head |
 
-Ulysses 的 token 切分边界可以位于 block 内部：All-to-All 会在 VSA 执行前
-恢复序列。它的通信支持两种输入顺序，但恢复的序列必须与
-`layout.input_order` 一致。Ring 要求 block 顺序。
+Ulysses All-to-All 在 VSA 执行前恢复 token 序列：无 Ring 时为 raster 顺序，
+有 Ring 时为紧凑 block 顺序。
 为使 Ulysses 消息大小一致，只在序列尾部添加**传输 padding**；
 进入 attention 前将其移除，计算 loss 时也排除这些行。
 这与 VSA 内部每个 block 的 64-slot padding 不同。
@@ -166,17 +165,15 @@ Ulysses 的 token 切分边界可以位于 block 内部：All-to-All 会在 VSA 
 
 ```bash
 python demo_cp.py
-python demo_cp.py --input-order block
 ```
 
 ### 仅 Ulysses CP
 
-四张 GPU 在层堆栈前切分 token，每层内部通过交换将 token 分片转换为 head 分片。
-raster 和 block 输入均支持：
+与无 CP 示例一样，直接使用 raster 输入。四张 GPU 在层堆栈前切分 token，
+每层内部通过交换将 token 分片转换为 head 分片，无需预先重排输入：
 
 ```bash
 torchrun --standalone --nproc-per-node=4 demo_cp.py --ulysses-size 4
-torchrun --standalone --nproc-per-node=4 demo_cp.py --ulysses-size 4 --input-order block
 ```
 
 ### Ring + Ulysses CP
@@ -188,9 +185,9 @@ torchrun --standalone --nproc-per-node=4 demo_cp.py --ulysses-size 4 --input-ord
 
 ```bash
 torchrun --standalone --nproc-per-node=8 demo_cp.py \
-  --ulysses-size 4 --ring-size 2 --input-order block --ring-partition cyclic
+  --ulysses-size 4 --ring-size 2 --ring-partition cyclic
 torchrun --standalone --nproc-per-node=8 demo_cp.py \
-  --ulysses-size 4 --ring-size 2 --input-order block --ring-partition contiguous
+  --ulysses-size 4 --ring-size 2 --ring-partition contiguous
 ```
 
 ### 共用示例
@@ -241,16 +238,14 @@ def exchange_tokens(out, group):
 parser = argparse.ArgumentParser()
 parser.add_argument("--ulysses-size", type=int, default=1)
 parser.add_argument("--ring-size", type=int, default=1)
-parser.add_argument("--input-order", choices=("raster", "block"), default="raster")
 parser.add_argument("--ring-partition", choices=("cyclic", "contiguous"), default="cyclic")
 args = parser.parse_args()
 U, R, H, D = args.ulysses_size, args.ring_size, 8, 128
+input_order = "block" if R > 1 else "raster"
 C = H * D
 world = int(os.environ.get("WORLD_SIZE", "1"))
 if U < 1 or R < 1 or H % U or world != U * R:
     parser.error("Require U >= 1, R >= 1, H % U == 0 and WORLD_SIZE == U * R")
-if R > 1 and args.input_order != "block":
-    parser.error("Ring requires --input-order block")
 device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
 torch.cuda.set_device(device)
 rank = 0
@@ -277,7 +272,7 @@ samples = [
 ]
 T = sum(segment.tokens for sample in samples for segment in sample)  # 584
 layout = build_vsa_layout(
-    samples, head_num=H // U, input_order=args.input_order, device=device,
+    samples, head_num=H // U, input_order=input_order, device=device,
     ring_cp_group=ring_group, ring_partition=args.ring_partition,
 )
 torch.manual_seed(1234)  # Identical mock input and replicated weights on all ranks.
@@ -285,10 +280,10 @@ tokens_global = torch.randn(T, C, device=device, dtype=torch.bfloat16)
 # Row IDs illustrate the mapping; use the model's original coordinates for RoPE.
 position_ids_global = torch.arange(T, device=device)
 
-# One reorder/whole-block Ring selection, before any layer's Q/K/V projection.
+# Ring only: reorder and select whole blocks before the layers.
 tokens_attention = tokens_global
 position_ids_attention = position_ids_global
-if args.input_order == "block":
+if R > 1:
     tokens_attention = raster_to_block_wo_padding(tokens_global, vsa_layout=layout)
     position_ids_attention = raster_to_block_wo_padding(position_ids_global, vsa_layout=layout)
 
@@ -333,7 +328,7 @@ reported_loss = loss.detach()
 if world > 1:
     dist.all_reduce(reported_loss, op=dist.ReduceOp.SUM)
 if rank == 0:
-    print(f"U={U}, R={R}, order={args.input_order}, loss={reported_loss.item():.6f}")
+    print(f"U={U}, R={R}, order={input_order}, loss={reported_loss.item():.6f}")
 if world > 1:
     dist.destroy_process_group()
 ```

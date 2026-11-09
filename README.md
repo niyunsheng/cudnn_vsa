@@ -917,7 +917,24 @@ Both input orders share the core's attention math, per-region budgets and
 fine-before-coarse schedule. The core does not import the public entry.
 
 <details>
-<summary>Layout maps and reorder gradients</summary>
+<summary>Reorder operators and layout maps</summary>
+
+| Conversion | Where | Forward / output restoration |
+| --- | --- | --- |
+| Raster → padded blocks | Inside each VSA call with raster input | `to_slots` for each of Q/K/V; `from_slots` restores raster output |
+| Raster → compact blocks | Once before the layer stack | `to_block_order`, also selecting Ring-owned blocks; `to_raster_order` restores a full layout |
+| Compact → padded blocks | Inside each VSA call with block input | `to_slots_qkv` pads Q/K/V together; `from_slots` removes output padding |
+
+The per-layer conversions run inside `vsa_attention`, after any Ulysses head
+exchange. Input order selects the conversion; Ulysses itself requires neither
+order. Ring requires compact block input. The padding here is VSA's 64-slot
+block padding, separate from the caller's Ulysses tail padding.
+
+All three conversions support autograd. Slot-conversion backward uses inverse
+row maps; compact Q/K/V gradients are restored together. Boundary-reorder
+backward scatters into the original raster shape. For Ring, unowned rows get
+zero gradients, without cross-rank reduction. This adjoint is not a global
+output gather: Ring output communication and reassembly remain caller-owned.
 
 `layout.input_rows` maps supplied rows to global raster rows (identity for a
 full raster layout). `tokens`, `blocks` and row/slot maps are local;
@@ -925,12 +942,11 @@ full raster layout). `tokens`, `blocks` and row/slot maps are local;
 `slot_row` maps 64-token slots to input rows (`-1` for padding), and `row_slot`
 is the inverse on valid rows. Padding is zero and excluded from means and attention.
 
-Block input uses fused Q/K/V padding and gradient restoration. `slots_are_input`
-skips conversion only when `tokens == blocks * 64`, with no partial/dummy blocks.
-Raster input always uses the raster-to-slot path. Reorder backward scatters to
-the original raster shape; Ring leaves unowned rows zero and performs no
-cross-rank gradient reduction. A full layout's inverse helper restores raster
-order; Ring output gathering and reassembly are caller-owned.
+The three kernel implementations are `_reorder_tokens_kernel` (boundary
+gather/scatter), `_gather` (single-tensor slots), and `_gather_qkv` (fused Q/K/V
+slots). Opposite directions reuse these kernels. `slots_are_input` skips slot
+conversion only for block input with `tokens == blocks * 64` and no
+partial/dummy blocks; raster input always takes the raster-to-slot path.
 
 `layout.ring` stores groups/options, rank/size, global token count, block
 ownership, peer sizes and the all-gather permutation. With capacity C,

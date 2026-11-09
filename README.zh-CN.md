@@ -882,7 +882,23 @@ JSON 记录数值/graph 检查和源码 hash；计时与 MFU 遵循**性能**一
 Core 不导入公共入口。
 
 <details>
-<summary>Layout 映射与重排梯度</summary>
+<summary>重排算子与 layout 映射</summary>
+
+| 转换 | 执行位置 | 前向 / 输出恢复 |
+| --- | --- | --- |
+| Raster → 带 padding 的 block | 每次使用 raster 输入的 VSA 调用内部 | Q/K/V 分别调用 `to_slots`；`from_slots` 恢复 raster 输出 |
+| Raster → 紧凑 block | 层堆栈之前执行一次 | `to_block_order`，Ring 时同时选择拥有的 block；`to_raster_order` 恢复完整 layout |
+| 紧凑 block → 带 padding 的 block | 每次使用 block 输入的 VSA 调用内部 | `to_slots_qkv` 融合 Q/K/V padding；`from_slots` 去掉输出 padding |
+
+逐层转换在 `vsa_attention` 内部执行，位于 Ulysses head 交换之后（若使用 Ulysses）。
+转换由输入顺序决定，Ulysses 本身不要求其中某种顺序。Ring 要求紧凑 block 输入。
+这里的 padding 是 VSA 内部每块 64 个 slot 的 padding，与调用方的 Ulysses 尾部
+padding 分开处理。
+
+三类转换均支持 autograd。Slot 转换的反向使用逆行映射，紧凑 Q/K/V 的梯度融合恢复。
+层堆栈边界重排的反向将梯度 scatter 到原始 raster 形状。
+Ring 未拥有的行梯度为零，不执行跨 rank 归约。这个伴随操作不等于全局输出聚合：
+Ring 输出的通信与重建仍由调用方负责。
 
 `layout.input_rows` 将输入行映射到全局 raster 行（完整 raster layout 为恒等映射）。
 `tokens`、`blocks` 和 row/slot 映射描述本地输入；
@@ -890,11 +906,11 @@ Core 不导入公共入口。
 `slot_row` 将每块 64 个 slot 映射到输入行（`-1` 表示 padding），
 `row_slot` 是有效行上的逆映射。Padding 填零，不参与均值和 attention。
 
-Block 输入使用融合 Q/K/V padding 和梯度恢复。只有在 `tokens == blocks * 64`、
-没有不完整/dummy block 时，`slots_are_input` 才跳过转换。
-Raster 输入始终经过 raster-to-slot 路径。重排的反向将梯度 scatter 到原始 raster 形状；
-Ring 未拥有的行梯度为零，不执行跨 rank 梯度归约。
-完整 layout 的逆变换恢复 raster 顺序；Ring 输出的聚合与重建由调用方负责。
+底层有三套 kernel：`_reorder_tokens_kernel`（边界 gather/scatter）、
+`_gather`（单张量 slot 转换）和 `_gather_qkv`（融合 Q/K/V slot 转换）。
+相反方向复用这些 kernel。只有 block 输入满足 `tokens == blocks * 64`、
+没有不完整/dummy block 时，`slots_are_input` 才跳过 slot 转换；
+raster 输入始终经过 raster-to-slot 路径。
 
 `layout.ring` 保存进程组/选项、rank/size、全局 token 数、block 归属、
 peer 大小和 all-gather 排列。容量为 C 时，

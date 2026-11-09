@@ -77,23 +77,23 @@ out.backward(torch.randn_like(out))
 给定全局 raster token 及其原始 position IDs：
 
 ```python
-from vsa import to_block_order, to_raster_order
+from vsa import raster_to_block_wo_padding, block_wo_padding_to_raster
 
 layout = build_vsa_layout(samples, head_num=H, input_order="block", device="cuda")
-tokens_block = to_block_order(tokens_global, vsa_layout=layout)
-position_ids_block = to_block_order(position_ids_global, vsa_layout=layout)
+tokens_block = raster_to_block_wo_padding(tokens_global, vsa_layout=layout)
+position_ids_block = raster_to_block_wo_padding(position_ids_global, vsa_layout=layout)
 # Run the layers in block order, then restore once if raster output is needed:
-# out_raster = to_raster_order(out_block, vsa_layout=layout)
+# out_raster = block_wo_padding_to_raster(out_block, vsa_layout=layout)
 ```
 
-`to_block_order` 接受一个内存连续的 CUDA `[T_global, ...]` 张量，
+`raster_to_block_wo_padding` 接受一个内存连续的 CUDA `[T_global, ...]` 张量，
 返回 `[layout.tokens, ...]`，保持 dtype 和后续维度不变。
 融合 gather **不添加 padding**。位置、target 和 mask 使用相同映射；
 Q/K/V/gate 及梯度遵循重排后的 token 顺序。输入已经是 block 顺序时跳过转换。
 
 完整 layout 重排全部 token；Ring layout 同时选择本 rank 拥有的 block。
 两个辅助函数都要求 layout 的 `input_order="block"`，即使
-`to_block_order` 读取的是 raster 输入。`to_raster_order` 仅接受完整 layout；
+`raster_to_block_wo_padding` 读取的是 raster 输入。`block_wo_padding_to_raster` 仅接受完整 layout；
 Ring 输出的聚合由调用方负责。
 
 <details>
@@ -120,7 +120,7 @@ Ring 输出的聚合由调用方负责。
 输入只有 13 行，attention 内部分配 3×64 个 slot。将这个视频的稀疏度改成
 `None` 后，保留视频在文本之前的顺序，产生大小为 10 和 3 的两个 block。
 `layout.input_rows` 将每个输入行映射回全局 raster 行；
-`to_block_order(x, vsa_layout=layout)` 的值等于 `x[layout.input_rows]`。
+`raster_to_block_wo_padding(x, vsa_layout=layout)` 的值等于 `x[layout.input_rows]`。
 
 </details>
 
@@ -250,7 +250,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.distributed.nn.functional import all_to_all_single
 
-from vsa import to_block_order, vsa_attention
+from vsa import raster_to_block_wo_padding, vsa_attention
 from vsa_layout import Segment, build_vsa_layout
 
 
@@ -327,8 +327,8 @@ position_ids_global = torch.arange(T, device=device)
 tokens_attention = tokens_global
 position_ids_attention = position_ids_global
 if args.input_order == "block":
-    tokens_attention = to_block_order(tokens_global, vsa_layout=layout)
-    position_ids_attention = to_block_order(position_ids_global, vsa_layout=layout)
+    tokens_attention = raster_to_block_wo_padding(tokens_global, vsa_layout=layout)
+    position_ids_attention = raster_to_block_wo_padding(position_ids_global, vsa_layout=layout)
 
 # Equal Ulysses capacity across Ring owners, including partial edge blocks.
 max_tokens = layout.tokens
@@ -397,8 +397,8 @@ layout = build_vsa_layout(
     ring_cp_group=group, ring_partition="cyclic",  # Or "contiguous".
 )
 # Global raster inputs -> this Ring rank's compact block stream, once per pack.
-tokens_local = to_block_order(tokens_global, vsa_layout=layout)
-position_ids_local = to_block_order(position_ids_global, vsa_layout=layout)
+tokens_local = raster_to_block_wo_padding(tokens_global, vsa_layout=layout)
+position_ids_local = raster_to_block_wo_padding(position_ids_global, vsa_layout=layout)
 # After token-wise projection and any caller-owned Ulysses exchange:
 out = vsa_attention(q, k, v, gate, layout)
 ```
@@ -417,7 +417,7 @@ rank 顺序完全相同的另一组。
 ### Block 归属
 
 Ring 输入仅包含拥有的 block 的有效 token，按全局 block ID 递增排列。
-`to_block_order` 融合分片选择与重排，不物化完整的全局 block 中间张量，也不通信。
+`raster_to_block_wo_padding` 融合分片选择与重排，不物化完整的全局 block 中间张量，也不通信。
 已有本地 block 输入时跳过转换。全局数据已经按 block 排列时，直接分发拥有的 block，
 不要再次执行 raster 转换。
 
@@ -886,9 +886,17 @@ Core 不导入公共入口。
 
 | 转换 | 执行位置 | 前向 / 输出恢复 |
 | --- | --- | --- |
-| Raster → 带 padding 的 block | 每次使用 raster 输入的 VSA 调用内部 | Q/K/V 分别调用 `to_slots`；`from_slots` 恢复 raster 输出 |
-| Raster → 紧凑 block | 层堆栈之前执行一次 | `to_block_order`，Ring 时同时选择拥有的 block；`to_raster_order` 恢复完整 layout |
-| 紧凑 block → 带 padding 的 block | 每次使用 block 输入的 VSA 调用内部 | `to_slots_qkv` 融合 Q/K/V padding；`from_slots` 去掉输出 padding |
+| Raster → 带 padding 的 block | 每次使用 raster 输入的 VSA 调用内部 | Q/K/V 分别调用 `raster_to_block_w_padding`；`block_w_padding_to_raster` 恢复 raster 输出 |
+| Raster → 紧凑 block | 层堆栈之前执行一次 | `raster_to_block_wo_padding`，Ring 时同时选择拥有的 block；`block_wo_padding_to_raster` 恢复完整 layout |
+| 紧凑 block → 带 padding 的 block | 每次使用 block 输入的 VSA 调用内部 | `block_wo_padding_to_block_w_padding`；`block_w_padding_to_block_wo_padding` 去掉输出 padding |
+
+名称注明源顺序、目标顺序和 padding：`w_padding` 表示带 block padding，
+`wo_padding` 表示不带。带 `_qkv` 后缀的
+`block_wo_padding_to_block_w_padding_qkv` 融合三个张量，供 `vsa_attention` 使用；
+无后缀的版本转换单个张量。融合版让 Q/K/V 共用一次映射读取和 kernel 调用，
+反向也如此；分别处理则需要三次调用。融合范围是 padding/恢复，不包含 QKV 线性投影。
+Slot 辅助函数位于 `vsa_kernels.py`，
+两个 raster/紧凑 block 边界转换函数位于 `vsa.py`。
 
 逐层转换在 `vsa_attention` 内部执行，位于 Ulysses head 交换之后（若使用 Ulysses）。
 转换由输入顺序决定，Ulysses 本身不要求其中某种顺序。Ring 要求紧凑 block 输入。

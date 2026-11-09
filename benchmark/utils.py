@@ -35,8 +35,10 @@ def packed_geometry_and_flops(layout, xs, dim):
     heads = layout.head_num
     indices = layout.routing_indices
     if not layout.dense_only:
+        pad = (vsa_kernels.block_wo_padding_to_block_w_padding
+               if layout.input_order == "block" else vsa_kernels.raster_to_block_w_padding)
         q_slots, k_slots, v_slots = (
-            vsa_kernels.to_slots(x, layout.slot_row, layout.row_slot) for x in xs[:3]
+            pad(x, layout.slot_row, layout.row_slot) for x in xs[:3]
         )
         q_route, k_route, _, _, _ = vsa_kernels.routing_and_coarse_means(
             q_slots, k_slots, v_slots, layout.block_sizes, layout.coarse_blocks)

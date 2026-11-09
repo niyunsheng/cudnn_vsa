@@ -417,8 +417,8 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
     Individual samples may have fewer blocks; no divisibility is required.
     Reorder/distribute whole blocks at the dataset/model boundary. All attention
     calls use vsa_attention(q, k, v, gate, layout), with no Ring arguments.
-    to_block_order can reorder and select a Ring shard from a full raster tensor
-    in one gather. to_raster_order requires a full block VSALayout.
+    raster_to_block_wo_padding selects and reorders a Ring shard from global
+    raster rows in one gather. block_wo_padding_to_raster requires a full layout.
     ring_cp_batch_p2p=None chooses batched P2P for device-bound groups and
     individual P2P for lazy groups, independently in each direction.
     ring_cp_bwd_bucket_size="auto" selects the

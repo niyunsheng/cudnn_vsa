@@ -191,7 +191,7 @@ def test_exempt_routing_and_all_modality_coarse():
     torch.manual_seed(42)
     q, k, v = [torch.randn(layout.tokens, 2, 8, requires_grad=True) for _ in range(3)]
     gate = torch.randn_like(q).requires_grad_()
-    slots = [vsa_kernels.to_slots(t, layout.slot_row, layout.row_slot) for t in (q, k, v)]
+    slots = [vsa_kernels.raster_to_block_w_padding(t, layout.slot_row, layout.row_slot) for t in (q, k, v)]
     means = [pool(t, layout) for t in slots]
     scores = means[0] @ means[1].transpose(-2, -1) / 8**0.5
     q_route, k_route, _, _, _ = vsa_kernels.routing_and_coarse_means(*slots, layout.block_sizes, layout.coarse_blocks)
@@ -345,7 +345,7 @@ def test_none_sparsity_only_pads_and_uses_full_fine(monkeypatch, frames, sizes):
     monkeypatch.setattr(core, "route", forbidden)
     monkeypatch.setattr(reference, "dense_coarse", forbidden)
     leaves = [torch.randn(layout.tokens, 2, 8, dtype=torch.float64, requires_grad=True) for _ in range(4)]
-    slots = vsa_kernels.to_slots(leaves[0], layout.slot_row, layout.row_slot)
+    slots = vsa_kernels.raster_to_block_w_padding(leaves[0], layout.slot_row, layout.row_slot)
     torch.testing.assert_close(slots[layout.slot_row >= 0], leaves[0], rtol=0, atol=0)
     assert not slots[layout.slot_row < 0].count_nonzero()
     copies = [x.detach().clone().requires_grad_() for x in leaves[:3]]
@@ -484,7 +484,7 @@ def test_packed_calls_and_metadata_exclude_whole_dense_samples(monkeypatch):
     monkeypatch.setattr(reference, "dense_coarse", counted_coarse)
     out = fn(*xs)
     assert calls == ["fine", "coarse"]
-    slots = tuple(vsa_kernels.to_slots(x, layout.slot_row, layout.row_slot)
+    slots = tuple(vsa_kernels.raster_to_block_w_padding(x, layout.slot_row, layout.row_slot)
                   for x in xs[:3])
     q_route, k_route, q_coarse, k_coarse, v_coarse = vsa_kernels.routing_and_coarse_means(
         *slots, layout.block_sizes, layout.coarse_blocks)
@@ -534,7 +534,7 @@ def test_all_dense_pack_never_pools_routes_or_calls_coarse(monkeypatch, dense_qu
 def test_fp32_routing_survives_autocast_and_templates_are_immutable():
     layout = build_vsa_layout([SAMPLES[1]], head_num=2)
     xs = [torch.randn(layout.tokens, 2, 8) for _ in range(3)]
-    slots = tuple(vsa_kernels.to_slots(x, layout.slot_row, layout.row_slot)
+    slots = tuple(vsa_kernels.raster_to_block_w_padding(x, layout.slot_row, layout.row_slot)
                   for x in xs)
     q_route, k_route, _, _, _ = vsa_kernels.routing_and_coarse_means(*slots, layout.block_sizes, layout.coarse_blocks)
     template = layout.routing_indices

@@ -3,7 +3,7 @@ import pytest
 import torch
 
 import vsa_kernels
-from vsa import to_block_order, to_raster_order, vsa_attention
+from vsa import raster_to_block_wo_padding, block_wo_padding_to_raster, vsa_attention
 from vsa_layout import Segment, build_vsa_layout
 from tests.reference import cpu_attention, reference_pack
 
@@ -31,8 +31,8 @@ def test_compact_mapping(samples, cpu_kernels):
     assert block.slots_are_input == (block.tokens == block.padded_tokens)
     x = torch.randn(raster.tokens, 2, 8, requires_grad=True)
     reordered = x[rows].detach().requires_grad_()
-    first = vsa_kernels.to_slots(x, raster.slot_row, raster.row_slot)
-    second = vsa_kernels.to_slots(reordered, block.slot_row, block.row_slot)
+    first = vsa_kernels.raster_to_block_w_padding(x, raster.slot_row, raster.row_slot)
+    second = vsa_kernels.block_wo_padding_to_block_w_padding(reordered, block.slot_row, block.row_slot)
     torch.testing.assert_close(first, second, rtol=0, atol=0)
     assert not second[block.slot_row < 0].count_nonzero()
     dy = torch.randn_like(first)
@@ -115,9 +115,9 @@ def test_boundary_reorder_and_graph(samples):
         return tuple(t.contiguous() for t in projected.unbind(1))
 
     def fn(tokens):
-        tokens = to_block_order(tokens, vsa_layout=layout)
+        tokens = raster_to_block_wo_padding(tokens, vsa_layout=layout)
         out = vsa_attention(*project(tokens), vsa_layout=layout)
-        return to_raster_order(out, vsa_layout=layout)
+        return block_wo_padding_to_raster(out, vsa_layout=layout)
 
     expected = reference_pack(samples, layout.sample_slices)(*project(x))
     actual = fn(x)
@@ -130,7 +130,7 @@ def test_boundary_reorder_and_graph(samples):
     capture_graph(fn, [x.detach().clone().requires_grad_()], dy, 3, 1e-5)
 
 
-@pytest.mark.parametrize("convert", [to_block_order, to_raster_order])
+@pytest.mark.parametrize("convert", [raster_to_block_wo_padding, block_wo_padding_to_raster])
 @pytest.mark.parametrize("invalid", ["raster", "tuple", "length", "scalar", "empty_rows",
                                      "stride", "dtype", "cpu"])
 def test_reorder_contract(convert, invalid):
@@ -164,8 +164,8 @@ def test_reorder_contract(convert, invalid):
 def test_fused_reorder_round_trip_and_adjoint(samples, dtype, row_shape):
     layout = build_vsa_layout(samples, head_num=2, input_order="block", device="cuda")
     x = torch.randn(layout.tokens, *row_shape, device="cuda", dtype=dtype, requires_grad=True)
-    ordered = to_block_order(x, vsa_layout=layout)
-    restored = to_raster_order(ordered, vsa_layout=layout)
+    ordered = raster_to_block_wo_padding(x, vsa_layout=layout)
+    restored = block_wo_padding_to_raster(ordered, vsa_layout=layout)
     assert isinstance(ordered, torch.Tensor) and isinstance(restored, torch.Tensor)
     assert ordered.shape == x.shape and ordered.dtype == x.dtype
     torch.testing.assert_close(ordered, x[layout.input_rows], rtol=0, atol=0)
@@ -189,10 +189,10 @@ def test_reorder_discrete_tensor(samples, dtype):
         x = torch.arange(layout.tokens * 3, device="cuda").view(-1, 3) + 2**60
     else:
         x = torch.arange(layout.tokens, device="cuda") % 2 == 0
-    ordered = to_block_order(x, vsa_layout=layout)
+    ordered = raster_to_block_wo_padding(x, vsa_layout=layout)
     assert ordered.shape == x.shape and ordered.dtype == x.dtype
     torch.testing.assert_close(ordered, x[layout.input_rows], rtol=0, atol=0)
-    torch.testing.assert_close(to_raster_order(ordered, vsa_layout=layout), x, rtol=0, atol=0)
+    torch.testing.assert_close(block_wo_padding_to_raster(ordered, vsa_layout=layout), x, rtol=0, atol=0)
 
 
 @pytest.mark.cuda
@@ -212,7 +212,7 @@ def test_ring_boundary_gather_and_scatter_adjoint(size, dtype, row_shape, partit
         layout = build_vsa_layout(samples, head_num=2, input_order="block", device="cuda",
                                   ring_cp_group=metadata_group(size, rank), ring_partition=partition)
         rows = layout.input_rows
-        actual = to_block_order(x, vsa_layout=layout)
+        actual = raster_to_block_wo_padding(x, vsa_layout=layout)
         expected = x[rows]
         assert actual.is_contiguous() and actual.shape == (layout.tokens, *row_shape)
         assert actual.dtype == dtype
@@ -240,7 +240,7 @@ def test_ring_boundary_large_offsets(size, metadata_group):
                               ring_cp_group=metadata_group(size, size - 1))
     x = torch.arange(128, device="cuda", dtype=torch.uint8)[:, None]
     x = x.expand(128, 2**24 + 1).contiguous()
-    actual = to_block_order(x, vsa_layout=layout)
+    actual = raster_to_block_wo_padding(x, vsa_layout=layout)
     assert torch.equal(actual, x[layout.input_rows])
 
 
@@ -260,10 +260,10 @@ def test_ring_boundary_positions_masks_and_graph(metadata_group, monkeypatch):
     positions = torch.arange(total * 3, device="cuda").view(total, 3) + 2**60
     mask = torch.arange(total, device="cuda") % 3 == 0
     for field in (positions, mask):
-        torch.testing.assert_close(to_block_order(field, vsa_layout=layout),
+        torch.testing.assert_close(raster_to_block_wo_padding(field, vsa_layout=layout),
                                    field[layout.input_rows], rtol=0, atol=0)
     x = torch.randn(total, 32, device="cuda", requires_grad=True)
-    fn = lambda value: to_block_order(value, vsa_layout=layout)
+    fn = lambda value: raster_to_block_wo_padding(value, vsa_layout=layout)
     dy = torch.randn(layout.tokens, 32, device="cuda")
     capture_graph(fn, [x], dy, 3, 1e-5)
 
@@ -275,7 +275,7 @@ def test_ring_boundary_second_derivative(metadata_group):
                               ring_cp_group=metadata_group(3, 2))
     x = torch.randn(layout.ring.global_tokens, device="cuda", dtype=torch.float64,
                     requires_grad=True)
-    y = to_block_order(x, vsa_layout=layout)
+    y = raster_to_block_wo_padding(x, vsa_layout=layout)
     dx, = torch.autograd.grad(y.square().sum(), x, create_graph=True)
     ddx, = torch.autograd.grad(dx.sum(), x)
     expected = torch.zeros_like(x)
@@ -291,7 +291,7 @@ def test_fused_padding_and_adjoint(samples, heads):
     layout = build_vsa_layout(samples, head_num=heads, input_order="block", device="cuda")
     xs = [torch.randn(layout.tokens, heads, 128, device="cuda", dtype=torch.bfloat16,
                       requires_grad=True) for _ in range(3)]
-    actual = vsa_kernels.to_slots_qkv(*xs, layout.slot_row, layout.row_slot)
+    actual = vsa_kernels.block_wo_padding_to_block_w_padding_qkv(*xs, layout.slot_row, layout.row_slot)
     # A final constant row implements padding independently in native PyTorch.
     expected = tuple(torch.cat((x, torch.zeros_like(x[:1])))[layout.slot_row] for x in xs)
     dy = [torch.randn(heads, layout.padded_tokens, 128, device="cuda",

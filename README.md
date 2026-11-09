@@ -78,16 +78,16 @@ layers. Setting `input_order="block"` declares the expected order; it does not
 reorder data. Given global raster tokens and their original position IDs:
 
 ```python
-from vsa import to_block_order, to_raster_order
+from vsa import raster_to_block_wo_padding, block_wo_padding_to_raster
 
 layout = build_vsa_layout(samples, head_num=H, input_order="block", device="cuda")
-tokens_block = to_block_order(tokens_global, vsa_layout=layout)
-position_ids_block = to_block_order(position_ids_global, vsa_layout=layout)
+tokens_block = raster_to_block_wo_padding(tokens_global, vsa_layout=layout)
+position_ids_block = raster_to_block_wo_padding(position_ids_global, vsa_layout=layout)
 # Run the layers in block order, then restore once if raster output is needed:
-# out_raster = to_raster_order(out_block, vsa_layout=layout)
+# out_raster = block_wo_padding_to_raster(out_block, vsa_layout=layout)
 ```
 
-`to_block_order` accepts one contiguous CUDA `[T_global, ...]` tensor and
+`raster_to_block_wo_padding` accepts one contiguous CUDA `[T_global, ...]` tensor and
 returns `[layout.tokens, ...]`, preserving dtype and trailing dimensions.
 Its fused gather adds **no padding**. Use the same mapping for positions,
 targets and masks; Q/K/V/gate and gradients follow the resulting token order.
@@ -95,7 +95,7 @@ Already block-ordered inputs skip this conversion.
 
 A full layout reorders all tokens; a Ring layout also selects the owned blocks.
 Both helpers require a layout with `input_order="block"`, even though
-`to_block_order` reads raster input. `to_raster_order` accepts only full layouts;
+`raster_to_block_wo_padding` reads raster input. `block_wo_padding_to_raster` accepts only full layouts;
 Ring output gathering belongs to the caller.
 
 <details>
@@ -122,7 +122,7 @@ For `video=(1, 2, 5), sparsity=0.9` followed by three text tokens, raster rows
 The input has 13 rows; attention internally allocates 3×64 slots. Changing
 this video's sparsity to `None` preserves video-before-text order and creates
 blocks of 10 and 3 tokens. `layout.input_rows` maps each supplied row back to
-its global raster row; `to_block_order(x, vsa_layout=layout)` equals
+its global raster row; `raster_to_block_wo_padding(x, vsa_layout=layout)` equals
 `x[layout.input_rows]` by value.
 
 </details>
@@ -256,7 +256,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.distributed.nn.functional import all_to_all_single
 
-from vsa import to_block_order, vsa_attention
+from vsa import raster_to_block_wo_padding, vsa_attention
 from vsa_layout import Segment, build_vsa_layout
 
 
@@ -333,8 +333,8 @@ position_ids_global = torch.arange(T, device=device)
 tokens_attention = tokens_global
 position_ids_attention = position_ids_global
 if args.input_order == "block":
-    tokens_attention = to_block_order(tokens_global, vsa_layout=layout)
-    position_ids_attention = to_block_order(position_ids_global, vsa_layout=layout)
+    tokens_attention = raster_to_block_wo_padding(tokens_global, vsa_layout=layout)
+    position_ids_attention = raster_to_block_wo_padding(position_ids_global, vsa_layout=layout)
 
 # Equal Ulysses capacity across Ring owners, including partial edge blocks.
 max_tokens = layout.tokens
@@ -404,8 +404,8 @@ layout = build_vsa_layout(
     ring_cp_group=group, ring_partition="cyclic",  # Or "contiguous".
 )
 # Global raster inputs -> this Ring rank's compact block stream, once per pack.
-tokens_local = to_block_order(tokens_global, vsa_layout=layout)
-position_ids_local = to_block_order(position_ids_global, vsa_layout=layout)
+tokens_local = raster_to_block_wo_padding(tokens_global, vsa_layout=layout)
+position_ids_local = raster_to_block_wo_padding(position_ids_global, vsa_layout=layout)
 # After token-wise projection and any caller-owned Ulysses exchange:
 out = vsa_attention(q, k, v, gate, layout)
 ```
@@ -426,7 +426,7 @@ members and rank order.
 ### Block ownership
 
 Ring input contains only valid tokens from owned blocks, in increasing global
-block-ID order. `to_block_order` fuses selection and reordering without a full
+block-ID order. `raster_to_block_wo_padding` fuses selection and reordering without a full
 block-ordered intermediate or communication. Already-local block input skips
 it. For globally block-ordered data, distribute owned blocks directly instead
 of applying the raster conversion again.
@@ -921,9 +921,17 @@ fine-before-coarse schedule. The core does not import the public entry.
 
 | Conversion | Where | Forward / output restoration |
 | --- | --- | --- |
-| Raster → padded blocks | Inside each VSA call with raster input | `to_slots` for each of Q/K/V; `from_slots` restores raster output |
-| Raster → compact blocks | Once before the layer stack | `to_block_order`, also selecting Ring-owned blocks; `to_raster_order` restores a full layout |
-| Compact → padded blocks | Inside each VSA call with block input | `to_slots_qkv` pads Q/K/V together; `from_slots` removes output padding |
+| Raster → padded blocks | Inside each VSA call with raster input | `raster_to_block_w_padding` for each of Q/K/V; `block_w_padding_to_raster` restores raster output |
+| Raster → compact blocks | Once before the layer stack | `raster_to_block_wo_padding`, also selecting Ring-owned blocks; `block_wo_padding_to_raster` restores a full layout |
+| Compact → padded blocks | Inside each VSA call with block input | `block_wo_padding_to_block_w_padding`; `block_w_padding_to_block_wo_padding` removes output padding |
+
+Names state source order, destination order and padding: `w_padding` means
+with block padding, and `wo_padding` means without it. The `_qkv` variant,
+`block_wo_padding_to_block_w_padding_qkv`, fuses three tensors and is used by
+`vsa_attention`; the unsuffixed version converts one tensor. Fusion shares one
+map and kernel launch for Q/K/V, also in backward, instead of three separate
+launches. It covers padding/restoration, not the QKV linear projection. These slot helpers
+live in `vsa_kernels.py`; the two raster/compact boundary helpers live in `vsa.py`.
 
 The per-layer conversions run inside `vsa_attention`, after any Ulysses head
 exchange. Input order selects the conversion; Ulysses itself requires neither

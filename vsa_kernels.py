@@ -96,13 +96,23 @@ class SlotGather(torch.autograd.Function):
         return gather(grad, inverse_map), None, None
 
 
-def to_slots(x, slot_row, row_slot):
-    """Gather original rows into padded slots; row_slot is the backward map."""
+def raster_to_block_w_padding(x, slot_row, row_slot):
+    """Reorder raster rows into padded block slots; use raster-layout maps."""
     return SlotGather.apply(x, slot_row, row_slot)
 
 
-def from_slots(x, slot_row, row_slot):
-    """Restore original rows; slot_row is the backward map."""
+def block_w_padding_to_raster(x, slot_row, row_slot):
+    """Remove block padding and restore raster order; use raster-layout maps."""
+    return SlotGather.apply(x, row_slot, slot_row)
+
+
+def block_wo_padding_to_block_w_padding(x, slot_row, row_slot):
+    """Pad one compact block tensor; use block-layout maps."""
+    return SlotGather.apply(x, slot_row, row_slot)
+
+
+def block_w_padding_to_block_wo_padding(x, slot_row, row_slot):
+    """Remove block padding, keeping compact block order; use block-layout maps."""
     return SlotGather.apply(x, row_slot, slot_row)
 
 
@@ -143,8 +153,8 @@ class _QKVSlotGather(torch.autograd.Function):
         return (*gather_qkv(dq, dk, dv, row_slot), None, None)
 
 
-def to_slots_qkv(q, k, v, slot_row, row_slot):
-    """Pad compact Q/K/V together, sharing the map and launch in both directions."""
+def block_wo_padding_to_block_w_padding_qkv(q, k, v, slot_row, row_slot):
+    """Fused compact Q/K/V padding and gradient restoration; use block-layout maps."""
     return _QKVSlotGather.apply(q, k, v, slot_row, row_slot)
 
 

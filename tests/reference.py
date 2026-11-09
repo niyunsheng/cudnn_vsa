@@ -86,12 +86,15 @@ def cpu_attention(q, k, v, gate, vsa_layout, *, scale=None):
     """
     _validate(q, k, v, gate)
     layout = vsa_layout
-    slots = tuple(vsa_kernels.to_slots(x, layout.slot_row, layout.row_slot)
-                  for x in (q, k, v))
+    pad = (vsa_kernels.block_wo_padding_to_block_w_padding
+           if layout.input_order == "block" else vsa_kernels.raster_to_block_w_padding)
+    restore = (vsa_kernels.block_w_padding_to_block_wo_padding
+               if layout.input_order == "block" else vsa_kernels.block_w_padding_to_raster)
+    slots = tuple(pad(x, layout.slot_row, layout.row_slot) for x in (q, k, v))
     with patch.object(core.BlockSparseAttention, "apply", dense_fine), \
          patch.object(core, "coarse_attention", dense_coarse):
         fine, coarse = core.attention_slots(*slots, layout, scale=scale)
-    out = vsa_kernels.from_slots(fine, layout.slot_row, layout.row_slot)
+    out = restore(fine, layout.slot_row, layout.row_slot)
     if coarse is not None:
         out = vsa_kernels.fine_coarse_gate_add(
             out, gate, coarse, layout.row_coarse, layout.coarse_rows)

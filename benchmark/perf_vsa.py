@@ -13,7 +13,7 @@ from .utils import (backward, barrier, capture_graph, check_tensors, environment
                     forward_backward, measure_eager, measure_graph,
                     packed_geometry_and_flops, profile_step, summarize)
 from tests.reference import reference_pack
-from vsa import to_block_order, vsa_attention
+from vsa import raster_to_block_wo_padding, vsa_attention
 from vsa_layout import build_vsa_layout
 
 
@@ -144,7 +144,7 @@ def run_case(name, heads, args, group, bwd_group=None):
         with torch.no_grad():
             global_xs[3][full.sample_slices[1][0]] = float("nan")
     # Exercise the public one-time boundary conversion outside attention timing.
-    convert = (functools.partial(to_block_order, vsa_layout=local)
+    convert = (functools.partial(raster_to_block_wo_padding, vsa_layout=local)
                if local.input_order == "block" else lambda x: x)
     xs = tuple(convert(x.detach()).requires_grad_() for x in global_xs)
     dy = convert(global_dy)

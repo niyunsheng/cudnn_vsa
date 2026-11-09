@@ -9,7 +9,7 @@ import torch.distributed as dist
 from vsa_core import route
 from vsa_layout import VSALayout, SampleBlocks, Segment, _plan_ring_blocks, build_vsa_layout
 from vsa_kernels import partition_indices
-from vsa import to_block_order, to_raster_order, vsa_attention
+from vsa import raster_to_block_wo_padding, block_wo_padding_to_raster, vsa_attention
 
 
 PACK = (
@@ -233,15 +233,15 @@ def test_size_one_ring_is_still_compact_block_order(metadata_group):
 def test_inverse_boundary_reorder_requires_full_layout(size, metadata_group):
     shard = build_vsa_layout(PACK, head_num=2, ring_cp_group=metadata_group(size, 0), input_order="block")
     with pytest.raises(ValueError, match="full VSALayout"):
-        to_raster_order(torch.empty(shard.tokens, 32), vsa_layout=shard)
+        block_wo_padding_to_raster(torch.empty(shard.tokens, 32), vsa_layout=shard)
 
 
 def test_ring_boundary_requires_global_raster_rows(metadata_group):
     shard = build_vsa_layout(PACK, head_num=2, ring_cp_group=metadata_group(2, 0), input_order="block")
     with pytest.raises(ValueError, match="shape"):
-        to_block_order(torch.empty(shard.tokens, 32), vsa_layout=shard)
+        raster_to_block_wo_padding(torch.empty(shard.tokens, 32), vsa_layout=shard)
     with pytest.raises(ValueError, match="CUDA"):
-        to_block_order(torch.empty(shard.ring.global_tokens, 32), vsa_layout=shard)
+        raster_to_block_wo_padding(torch.empty(shard.ring.global_tokens, 32), vsa_layout=shard)
 
 
 @pytest.mark.parametrize("size", [1, 2])

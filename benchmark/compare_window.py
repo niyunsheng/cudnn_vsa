@@ -68,20 +68,27 @@ def main():
                     str(path), "--ulysses-size", "1", "--ring-size", "4", "--ring-partition", partition])
 
     launcher = ["torchrun", "--standalone", "--nproc-per-node=4", "--module", "benchmark.perf_vsa",
-                "--ring", "--ring-size", "4", "--seed", "937", "--batch-p2p", "--no-profile"]
+                "--ring", "--seed", "937", "--batch-p2p", "--no-profile"]
     for partition in ("cyclic", "contiguous"):
         for transport, impl in (("ring", "cudnn"), ("window", "local")):
             name = f"small_{partition}_{transport}"
-            run(name, [*launcher, "--ring-partition", partition, "--transport", transport,
-                       "--heads", "2", "--cases", "ragged", "partial_blocks", "dense",
+            run(name, [*launcher, "--ring-size", "4", "--ring-partition", partition, "--transport", transport,
+                       "--heads", "2", "--cases", "ragged", "dense",
                        "single64k", "thd64k", "--warmup", "3", "--repeats", "10",
+                       "--output", str(output / f"{name}.json")], impl=impl)
+            # This fixture has three global blocks; every participating rank
+            # must own a block. Four workers form two interleaved Ring2 groups.
+            name = f"partial_{partition}_{transport}"
+            run(name, [*launcher, "--ring-size", "2", "--ring-partition", partition,
+                       "--transport", transport, "--heads", "2", "--cases", "partial_blocks",
+                       "--warmup", "3", "--repeats", "10",
                        "--output", str(output / f"{name}.json")], impl=impl)
         # Compare fixed global work, on the same allocation, with reversed order.
         for variant, round_id in (("main", 0), ("ring", 0), ("window", 0),
                                   ("window", 1), ("ring", 1), ("main", 1)):
             name = f"long_{partition}_{variant}_{round_id}"
             transport_args = [] if variant == "main" else ["--transport", variant]
-            run(name, [*launcher, "--ring-partition", partition, *transport_args,
+            run(name, [*launcher, "--ring-size", "4", "--ring-partition", partition, *transport_args,
                        "--heads", "1", "--cases", "thd720p44s", "--input-order", "block",
                        "--bwd-bucket-size", "backend", "--warmup", "10", "--repeats", "50",
                        "--output", str(output / f"{name}.json")],

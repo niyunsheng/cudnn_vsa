@@ -181,6 +181,9 @@ def test_ring_groups_use_ordinary_priority(ring_size, eager, monkeypatch):
         created.append((ranks, group))
         return group
     monkeypatch.setenv("LOCAL_RANK", "3")
+    # This test inspects group-construction arguments without a CUDA/NCCL backend.
+    monkeypatch.setattr(perf_vsa.dist, "ProcessGroupNCCL",
+                        SimpleNamespace(Options=lambda **kw: SimpleNamespace(**kw)), raising=False)
     monkeypatch.setattr(perf_vsa.dist, "init_process_group", check)
     monkeypatch.setattr(perf_vsa.dist, "new_group", new_group)
     monkeypatch.setattr(perf_vsa.dist, "group", SimpleNamespace(WORLD=world))

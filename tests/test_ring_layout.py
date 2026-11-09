@@ -322,7 +322,7 @@ def test_runtime_resolves_shared_transport(batch, bound, monkeypatch):
     import vsa_core as core
 
     group = SimpleNamespace(bound_device_id=torch.device("cuda:0") if bound else None)
-    ring = SimpleNamespace(group=group, batch_p2p=batch,
+    ring = SimpleNamespace(group=group, batch_p2p=batch, transport="ring",
                            bwd_bucket_size=None, size=2, rank=0, _runtime={})
     monkeypatch.setattr(dist, "get_process_group_ranks", lambda group: [1, 3])
     monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: object())
@@ -402,19 +402,19 @@ def test_default_transport_is_the_step_ring(metadata_group):
 
 
 @pytest.mark.parametrize("size", [1, 2, 3, 8])
-def test_window_block_sizes_follow_gather_order(size, metadata_group):
+@pytest.mark.parametrize("partition", ["cyclic", "contiguous"])
+def test_window_block_sizes_follow_gather_order(size, partition, metadata_group):
     """The all-gathered KV window is indexed exactly like the pooled-mean gather."""
     full = build_vsa_layout(PACK, head_num=2)
-    ids = torch.arange(full.blocks)
     for rank in range(size):
         local = build_vsa_layout(PACK, head_num=2, input_order="block",
+                                 ring_partition=partition,
                                  ring_cp_group=metadata_group(size, rank), ring_cp_transport="window")
         ring, capacity = local.ring, local.blocks
         assert capacity == -(-full.blocks // size)
         assert ring.window_block_sizes.shape == (size * capacity,)
         assert ring.window_block_sizes.dtype == torch.int32
-        slots = (ids % size) * capacity + ids // size
-        assert torch.equal(slots, ring.global_to_gather)
+        slots = ring.global_to_gather
         # Every real block keeps its valid length; the remaining slots are dummies.
         assert torch.equal(ring.window_block_sizes[slots], full.block_sizes)
         dummy = torch.ones(size * capacity, dtype=torch.bool)

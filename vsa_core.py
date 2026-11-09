@@ -312,8 +312,8 @@ class _WindowFine(torch.autograd.Function):
     """One block-sparse launch per direction over an all-gathered KV window.
 
     The window stacks every peer's slot-padded K/V shard in group-rank order,
-    so global block b occupies window block (b % R) * capacity + b // R, the
-    position recorded in layout.ring.global_to_gather. Forward all-gathers the
+    so layout.ring.global_to_gather maps global block IDs to window blocks
+    for either cyclic or contiguous ownership. Forward all-gathers the
     local slot-padded K and V shards once and runs a single BSA call with the
     global routing lists, so no partial-output merge is needed. Backward
     re-gathers the windows, runs one BSA backward and reduce-scatters the FP32
@@ -339,7 +339,7 @@ class _WindowFine(torch.autograd.Function):
     def forward(ctx, q, k, v, indices, counts, layout, runtime, scale):
         k_window, v_window = (_WindowFine._gather(x.contiguous(), runtime) for x in (k, v))
         # Routing lists hold global block ids; rows past each count are ignored.
-        window_indices = (indices % runtime.size) * layout.blocks + indices // runtime.size
+        window_indices = layout.ring.global_to_gather[indices.long()].to(torch.int32)
         sizes = layout.ring.window_block_sizes
         result = bsa_forward(q, k_window, v_window, window_indices, counts, sizes,
                              scale, allow_empty=True)

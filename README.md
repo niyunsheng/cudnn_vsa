@@ -292,8 +292,25 @@ compute the same attention with the same precision policy (BF16 kernel
 partials, FP32 cross-rank accumulation). The window holds `ring_size` shards
 per direction, and its collectives (two all-gathers forward, two all-gathers
 and one reduce-scatter backward) are not overlapped with the kernel.
-It is the host-side shape of a fused Ring kernel: one KV tensor and one index
-table per launch.
+Both cyclic and contiguous ownership use the layout's explicit block map.
+This is a launch-consolidation prototype: one K/V window and one routing table
+per BSA call. Communication remains outside the kernels; persistent scheduling,
+arrival flags and device-side transport are not implemented in this draft.
+
+To compare an archived main checkout and this branch on the same four GPUs:
+
+```bash
+python -m benchmark.compare_window --baseline-root /path/to/main \
+  --output /path/to/evidence
+```
+
+The runner checks the unit suite and runnable README programs, then compares
+Ring and window on small/64k packs and on `thd720p44s` for both ownership
+policies. Long runs use seed 937, H1/D128, ordinary-priority NCCL, backend
+backward buckets, and 10 warmups / 50 timed CUDA Graph replays, with reversed
+run order in the second round. It preserves every exit status, log, native
+benchmark JSON and before/after source hashes; any failure makes the runner
+exit nonzero. Window runs use `VSA_BSA_IMPL=local`; Ring uses the installed BSA.
 
 ### Local kernel copy
 

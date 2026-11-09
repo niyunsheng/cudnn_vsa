@@ -15,9 +15,9 @@ from vsa_layout import Segment, build_vsa_layout
 
 pytestmark = pytest.mark.usefixtures("cpu_kernels")
 
-# Four blocks with partial lengths 15, 7, 3 and 30: R in {1, 2, 4} needs no dummy block.
-PACK = ((Segment("video", (1, 3, 5)), Segment("text", 7)),
-        (Segment("text", 3), Segment("video", (2, 3, 5))))
+# Seven blocks: uneven samples, partial blocks, and dummy slots for R > 1.
+PACK = ((Segment("video", (4, 8, 8)), Segment("text", 7)),
+        (Segment("text", 3), Segment("video", (1, 3, 5))))
 HEADS, DIM = 2, 16
 
 
@@ -31,7 +31,9 @@ def masked_attention(q, k, v, indices, counts, sizes, scale):
     mask = (blocks > 0).repeat_interleave(64, -2).repeat_interleave(64, -1)
     mask &= (torch.arange(k.shape[0]) % 64 < sizes.repeat_interleave(64))[None, None, :]
     scores = torch.einsum("qhd,khd->hqk", q, k) * scale
-    probs = scores.masked_fill(~mask, -torch.inf).softmax(-1)
+    scores = scores.masked_fill(~mask, -torch.inf)
+    scores = torch.where(mask.any(-1, keepdim=True), scores, 0)
+    probs = scores.softmax(-1).masked_fill(~mask, 0)
     return torch.einsum("hqk,khd->qhd", probs, v)
 
 
@@ -51,29 +53,30 @@ def _fake_backward(grad, q, k, v, out, lse, indices, counts, sizes, scale, *, bu
     return tuple(x.grad for x in leaves)
 
 
-@pytest.mark.parametrize("size", [1, 2, 4])
-def test_window_matches_global_block_sparse_attention(monkeypatch, size, metadata_group):
+@pytest.mark.parametrize("size", [1, 2, 3, 4])
+@pytest.mark.parametrize("partition", ["cyclic", "contiguous"])
+def test_window_matches_global_block_sparse_attention(monkeypatch, size, partition, metadata_group):
     torch.manual_seed(size)
     full = build_vsa_layout(PACK, head_num=HEADS, input_order="block")
-    assert full.blocks % size == 0
     scale = DIM ** -0.5
     q, k, v, dy = (torch.randn(full.tokens, HEADS, DIM) for _ in range(4))
     # Reference: the whole pack in canonical block order through the same masked kernel.
     leaves = [x.clone().requires_grad_() for x in (q, k, v)]
-    slots = [vsa_kernels.to_slots(x, full.slot_row, full.row_slot) for x in leaves]
-    dy_slots = vsa_kernels.to_slots(dy, full.slot_row, full.row_slot)
+    slots = [vsa_kernels.block_wo_padding_to_block_w_padding(x, full.slot_row, full.row_slot) for x in leaves]
+    dy_slots = vsa_kernels.block_wo_padding_to_block_w_padding(dy, full.slot_row, full.row_slot)
     expected = masked_attention(*slots, full.routing_indices, full.routing_counts, full.block_sizes, scale)
     expected.backward(dy_slots)
     expected_grads = [x.grad for x in leaves]
 
     layouts = [build_vsa_layout(PACK, head_num=HEADS, input_order="block", ring_cp_transport="window",
+                                ring_partition=partition,
                                 ring_cp_group=metadata_group(size, rank)) for rank in range(size)]
     capacity = layouts[0].blocks
     local_inputs, shards = [], []
     for local in layouts:
         xs = [x[local.input_rows].clone().requires_grad_() for x in (q, k, v)]
         local_inputs.append(xs)
-        shards.append([vsa_kernels.to_slots(x, local.slot_row, local.row_slot).detach()
+        shards.append([vsa_kernels.block_wo_padding_to_block_w_padding(x, local.slot_row, local.row_slot).detach()
                        for x in xs[1:]])
     gathered, partials = [], []
 
@@ -96,14 +99,14 @@ def test_window_matches_global_block_sparse_attention(monkeypatch, size, metadat
     for rank, (local, xs) in enumerate(zip(layouts, local_inputs)):
         runtime = SimpleNamespace(size=size, rank=rank, group=object(), transport="window",
                                   bwd_bucket_size=None)
-        q_s, k_s, v_s = (vsa_kernels.to_slots(x, local.slot_row, local.row_slot) for x in xs)
+        q_s, k_s, v_s = (vsa_kernels.block_wo_padding_to_block_w_padding(x, local.slot_row, local.row_slot) for x in xs)
         out = core._WindowFine.apply(q_s, k_s, v_s, local.routing_indices, local.routing_counts,
                                      local, runtime, scale)
-        owned = torch.arange(rank, full.blocks, size)
+        owned = local.ring.block_ids.clamp_min(0)
         rows = local.slot_row >= 0
         expected_rows = expected.view(full.blocks, 64, HEADS, DIM)[owned].reshape(-1, HEADS, DIM)[rows]
         torch.testing.assert_close(out[rows], expected_rows)
-        dy_local = vsa_kernels.to_slots(dy[local.input_rows], local.slot_row, local.row_slot)
+        dy_local = vsa_kernels.block_wo_padding_to_block_w_padding(dy[local.input_rows], local.slot_row, local.row_slot)
         dq = torch.autograd.grad(out, xs[0], dy_local)[0]
         torch.testing.assert_close(dq, expected_grads[0][local.input_rows])
     expected_gathers = [(q.dtype, (capacity * 64, HEADS, DIM), which)
@@ -114,10 +117,10 @@ def test_window_matches_global_block_sparse_attention(monkeypatch, size, metadat
     # Summing every rank's FP32 window partial reproduces dK/dV in gather order.
     reduced = torch.stack(partials).sum(0).view(size, capacity, 64, 2, HEADS, DIM)
     for rank, local in enumerate(layouts):
-        owned = torch.arange(rank, full.blocks, size)
+        owned = local.ring.block_ids.clamp_min(0)
         rows = local.slot_row >= 0
         for which, expected_grad in enumerate(expected_grads[1:]):
             got = reduced[rank, :, :, which].reshape(-1, HEADS, DIM)[rows]
-            want = vsa_kernels.to_slots(expected_grad, full.slot_row, full.row_slot)
+            want = vsa_kernels.block_wo_padding_to_block_w_padding(expected_grad, full.slot_row, full.row_slot)
             want = want.view(full.blocks, 64, HEADS, DIM)[owned].reshape(-1, HEADS, DIM)[rows]
             torch.testing.assert_close(got, want)

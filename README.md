@@ -156,10 +156,10 @@ layout = build_vsa_layout(
     samples, head_num=H, input_order="block", device="cuda",
     ring_cp_group=group, ring_partition="cyclic",  # Or "contiguous".
 )
-# T_ring = layout.tokens: valid tokens owned by this Ring rank; C is hidden size.
-# [T_global, C] -> [T_ring, C]: select owned blocks and reorder, without padding.
+# T_ring = layout.tokens: Ring-local valid token count; C is hidden size.
+# Global [T_global, C] -> Ring-local [T_ring, C], reordered without padding.
 tokens_local = raster_to_block_wo_padding(tokens_global, vsa_layout=layout)
-# [T_global, 3] -> [T_ring, 3], with the same row mapping.
+# Global [T_global, 3] -> Ring-local [T_ring, 3], with the same row mapping.
 position_ids_local = raster_to_block_wo_padding(position_ids_global, vsa_layout=layout)
 # Project tokens_local into Q/K/V/gate, each [T_ring, H, D].
 out = vsa_attention(q, k, v, gate, layout)  # [T_ring, H, D]
@@ -427,7 +427,7 @@ layout = build_vsa_layout(
     samples, head_num=H // U, input_order=input_order, device=device,
     ring_cp_group=ring_group, ring_partition=args.ring_partition,
 )
-# Shape notation: T_ring = layout.tokens (T if R=1); H is the total head count.
+# T_ring = layout.tokens: Ring-local valid token count (T if R=1); H is total heads.
 # T_ring can differ across Ring ranks; it need not equal T/R.
 torch.manual_seed(1234)  # Identical mock input and replicated weights on all ranks.
 tokens_global = torch.randn(T, C, device=device, dtype=torch.bfloat16)  # [T,C] = [584,1024]
@@ -446,9 +446,9 @@ position_ids_global = torch.cat(position_rows)  # [T,3] = [584,3]: original (f, 
 tokens_attention = tokens_global
 position_ids_attention = position_ids_global
 if R > 1:
-    # [T,C] -> [T_ring,C]: this Ring rank's valid tokens in compact block order.
+    # Global [T,C] -> Ring-local [T_ring,C]: valid tokens in compact block order.
     tokens_attention = raster_to_block_wo_padding(tokens_global, vsa_layout=layout)
-    # [T,3] -> [T_ring,3]: select/reorder the same token rows.
+    # Global [T,3] -> Ring-local [T_ring,3]: select/reorder the same token rows.
     position_ids_attention = raster_to_block_wo_padding(position_ids_global, vsa_layout=layout)
 
 # Ulysses preparation: equal message sizes, then U token slices of this Ring shard.
@@ -456,12 +456,12 @@ if R > 1:
 max_tokens = layout.tokens
 if layout.ring is not None:
     max_tokens = int(layout.ring.peer_block_sizes.sum(dim=1).max().item())
-A = (max_tokens + U - 1) // U  # Token rows per Ulysses rank, including transport padding.
+A = (max_tokens + U - 1) // U  # Per-GPU local rows after Ulysses slicing, including padding.
 tail = U * A - layout.tokens  # U*A - T_ring.
 start = (rank % U) * A
-# [T_ring,C] -> [U*A,C] -> [A,C].
+# Ring-local [T_ring,C] -> padded [U*A,C] -> per-GPU local [A,C].
 x = F.pad(tokens_attention, (0, 0, 0, tail))[start:start + A].contiguous()
-# [T_ring,3] -> [U*A,3] -> [A,3].
+# Ring-local [T_ring,3] -> padded [U*A,3] -> per-GPU local [A,3].
 position_ids_local = F.pad(position_ids_attention, (0, 0, 0, tail), value=-1)[start:start + A]
 valid = torch.arange(start, start + A, device=device) < layout.tokens  # [A]
 

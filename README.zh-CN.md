@@ -153,12 +153,11 @@ layout = build_vsa_layout(
 # Global raster inputs -> this Ring rank's compact block stream, once per pack.
 tokens_local = raster_to_block_wo_padding(tokens_global, vsa_layout=layout)
 position_ids_local = raster_to_block_wo_padding(position_ids_global, vsa_layout=layout)
-# After token-wise projection and any caller-owned Ulysses exchange:
+# Project tokens_local into local Q/K/V/gate before attention:
 out = vsa_attention(q, k, v, gate, layout)
 ```
 
-这里的 `U` 是 Ulysses 组大小，`H` 是 VSA 收到的 head 数
-（使用 Ulysses 时为 `H_total // U`）。
+这里的 `H` 是 VSA 收到的 head 数。
 `ring_cp_group=None` 创建完整的 `VSALayout`（`layout.ring is None`），
 无需初始化分布式环境，也支持 CPU。传入成员进程组会创建本地 Ring layout，
 rank 和 size 从进程组获取。非成员句柄会被拒绝；即使组大小为 1 也要求 block 输入。

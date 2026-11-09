@@ -155,12 +155,11 @@ layout = build_vsa_layout(
 # Global raster inputs -> this Ring rank's compact block stream, once per pack.
 tokens_local = raster_to_block_wo_padding(tokens_global, vsa_layout=layout)
 position_ids_local = raster_to_block_wo_padding(position_ids_global, vsa_layout=layout)
-# After token-wise projection and any caller-owned Ulysses exchange:
+# Project tokens_local into local Q/K/V/gate before attention:
 out = vsa_attention(q, k, v, gate, layout)
 ```
 
-Here `U` is the Ulysses group size, and `H` is the head count seen by VSA
-(`H_total // U` with Ulysses).
+Here `H` is the head count seen by VSA.
 `ring_cp_group=None` creates a full `VSALayout` (`layout.ring is None`),
 without distributed initialization, including on CPU. A member group creates
 a local Ring layout and supplies its rank and size. Nonmember handles are

@@ -73,62 +73,20 @@ restores the output to the same raster order. No preprocessing is required.
 
 ### Block input
 
-Reorder the input **once before the layer stack**, then keep block order across
-layers. Setting `input_order="block"` declares the expected order; it does not
-reorder data. Given global raster tokens and their original position IDs:
+Block input contains only valid tokens in block order, without padding.
+For raster data, reorder **once before the layer stack**, then keep this order:
 
 ```python
-from vsa import raster_to_block_wo_padding, block_wo_padding_to_raster
+from vsa import raster_to_block_wo_padding
 
 layout = build_vsa_layout(samples, head_num=H, input_order="block", device="cuda")
 tokens_block = raster_to_block_wo_padding(tokens_global, vsa_layout=layout)
 position_ids_block = raster_to_block_wo_padding(position_ids_global, vsa_layout=layout)
-# Run the layers in block order, then restore once if raster output is needed:
-# out_raster = block_wo_padding_to_raster(out_block, vsa_layout=layout)
 ```
 
-`raster_to_block_wo_padding` accepts one contiguous CUDA `[T_global, ...]` tensor and
-returns `[layout.tokens, ...]`, preserving dtype and trailing dimensions.
-Its fused gather adds **no padding**. Use the same mapping for positions,
-targets and masks; Q/K/V/gate and gradients follow the resulting token order.
-Already block-ordered inputs skip this conversion.
-
-A full layout reorders all tokens; a Ring layout also selects the owned blocks.
-Both helpers require a layout with `input_order="block"`, even though
-`raster_to_block_wo_padding` reads raster input. `block_wo_padding_to_raster`
-accepts only full layouts. Ring VSA already merges attention contributions from
-KV shards into complete outputs for local Q tokens. Only if a full global
-raster tensor is needed after the layer stack does the caller collect the
-output token shards and restore global row order; otherwise outputs stay sharded.
-
-<details>
-<summary>Exact block order and a small example</summary>
-
-1. Keep sample order. Within each sample, place `sparsity=None` segments first,
-   then numeric-sparsity videos, preserving segment order within each category.
-2. Split None-sparsity segments into consecutive chunks of at most 64 tokens.
-   Split numeric-sparsity videos into 4×4×4 tiles, visiting tile origins and
-   valid tokens in F/H/W order (W fastest). Clip edge tiles without padding.
-3. Blocks never cross segment or sample boundaries. Numeric `sparsity=0`
-   still uses tiles; `sparsity=None` uses dense chunks. Ring keeps owned blocks
-   in increasing global block-ID order, preserving order within each block.
-
-For `video=(1, 2, 5), sparsity=0.9` followed by three text tokens, raster rows
-`0..9` are video and `10..12` are text. The block stream is:
-
-| Block | Original raster rows, in supplied order | Valid tokens |
-| --- | --- | ---: |
-| b0: text | `10, 11, 12` | 3 |
-| b1: first video tile | `0, 1, 2, 3, 5, 6, 7, 8` | 8 |
-| b2: edge video tile | `4, 9` | 2 |
-
-The input has 13 rows; attention internally allocates 3×64 slots. Changing
-this video's sparsity to `None` preserves video-before-text order and creates
-blocks of 10 and 3 tokens. `layout.input_rows` maps each supplied row back to
-its global raster row; `raster_to_block_wo_padding(x, vsa_layout=layout)` equals
-`x[layout.input_rows]` by value.
-
-</details>
+`input_order="block"` declares the layout; it does not reorder data. Skip the
+conversion for existing block input. Positions, targets and masks must use
+the same row mapping.
 
 ## Attention semantics
 
@@ -922,6 +880,35 @@ Both input orders share the core's attention math, per-region budgets and
 fine-before-coarse schedule. The core does not import the public entry.
 
 <details>
+<summary>Exact block order and a small example</summary>
+
+1. Keep sample order. Within each sample, place `sparsity=None` segments first,
+   then numeric-sparsity videos, preserving segment order within each category.
+2. Split None-sparsity segments into consecutive chunks of at most 64 tokens.
+   Split numeric-sparsity videos into 4×4×4 tiles, visiting tile origins and
+   valid tokens in F/H/W order (W fastest). Clip edge tiles without padding.
+3. Blocks never cross segment or sample boundaries. Numeric `sparsity=0`
+   still uses tiles; `sparsity=None` uses dense chunks. Ring keeps owned blocks
+   in increasing global block-ID order, preserving order within each block.
+
+For `video=(1, 2, 5), sparsity=0.9` followed by three text tokens, raster rows
+`0..9` are video and `10..12` are text. The block stream is:
+
+| Block | Original raster rows, in supplied order | Valid tokens |
+| --- | --- | ---: |
+| b0: text | `10, 11, 12` | 3 |
+| b1: first video tile | `0, 1, 2, 3, 5, 6, 7, 8` | 8 |
+| b2: edge video tile | `4, 9` | 2 |
+
+The input has 13 rows; attention internally allocates 3×64 slots. Changing
+this video's sparsity to `None` preserves video-before-text order and creates
+blocks of 10 and 3 tokens. `layout.input_rows` maps each supplied row back to
+its global raster row; `raster_to_block_wo_padding(x, vsa_layout=layout)` equals
+`x[layout.input_rows]` by value.
+
+</details>
+
+<details>
 <summary>Reorder operators and layout maps</summary>
 
 | Conversion | Where | Forward / output restoration |
@@ -937,6 +924,14 @@ with block padding, and `wo_padding` means without it. The `_qkv` variant,
 map and kernel launch for Q/K/V, also in backward, instead of three separate
 launches. It covers padding/restoration, not the QKV linear projection. These slot helpers
 live in `vsa_kernels.py`; the two raster/compact boundary helpers live in `vsa.py`.
+
+The boundary helper `raster_to_block_wo_padding` accepts one contiguous CUDA
+`[T_global, ...]` tensor and returns `[layout.tokens, ...]`, preserving dtype
+and trailing dimensions. It adds no padding and selects owned rows for Ring.
+Both boundary helpers require `input_order="block"`; the layout describes VSA's
+input order. For full layouts only, restore
+raster output after the stack with
+`block_wo_padding_to_raster(out_block, vsa_layout=layout)`.
 
 The per-layer conversions run inside `vsa_attention`, after any Ulysses head
 exchange. Input order selects the conversion; Ulysses itself requires neither

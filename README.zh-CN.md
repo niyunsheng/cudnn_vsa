@@ -72,59 +72,19 @@ out.backward(torch.randn_like(out))
 
 ### Block 输入
 
-在**层堆栈之前重排一次**，之后各层保持 block 顺序。
-`input_order="block"` 声明预期的输入顺序，不会自动重排数据。
-给定全局 raster token 及其原始 position IDs：
+Block 输入只包含按 block 排列的有效 token，不含 padding。
+对于 raster 数据，在**整个层堆栈前重排一次**，后续各层保持此顺序：
 
 ```python
-from vsa import raster_to_block_wo_padding, block_wo_padding_to_raster
+from vsa import raster_to_block_wo_padding
 
 layout = build_vsa_layout(samples, head_num=H, input_order="block", device="cuda")
 tokens_block = raster_to_block_wo_padding(tokens_global, vsa_layout=layout)
 position_ids_block = raster_to_block_wo_padding(position_ids_global, vsa_layout=layout)
-# Run the layers in block order, then restore once if raster output is needed:
-# out_raster = block_wo_padding_to_raster(out_block, vsa_layout=layout)
 ```
 
-`raster_to_block_wo_padding` 接受一个内存连续的 CUDA `[T_global, ...]` 张量，
-返回 `[layout.tokens, ...]`，保持 dtype 和后续维度不变。
-融合 gather **不添加 padding**。位置、target 和 mask 使用相同映射；
-Q/K/V/gate 及梯度遵循重排后的 token 顺序。输入已经是 block 顺序时跳过转换。
-
-完整 layout 重排全部 token；Ring layout 同时选择本 rank 拥有的 block。
-两个辅助函数都要求 layout 的 `input_order="block"`，即使
-`raster_to_block_wo_padding` 读取的是 raster 输入。`block_wo_padding_to_raster`
-仅接受完整 layout。Ring VSA 已将各 KV 分片的 attention 贡献合并为本地 Q token
-的完整输出。只有在层堆栈结束后需要完整的全局 raster 张量时，调用方才需收集各 rank
-的输出 token 分片并恢复全局行顺序；否则输出继续保持分片。
-
-<details>
-<summary>精确的 block 顺序与小例子</summary>
-
-1. 保持样本顺序。每个样本内先放 `sparsity=None` 的 segment，再放数值稀疏度的视频，
-   每类内部保持 segment 的声明顺序。
-2. None 稀疏度的 segment 按连续最多 64 个 token 分块；数值稀疏度的视频按
-   4×4×4 tile 分块。Tile 起点和 tile 内有效 token 均按 F/H/W 顺序遍历
-   （W 最快变化），边缘 tile 直接截断，不补 padding。
-3. Block 不跨 segment 或样本边界。数值 `sparsity=0` 仍使用 tile；
-   `sparsity=None` 使用稠密连续块。Ring 按全局 block ID 递增顺序保留拥有的 block，
-   每个 block 内部顺序不变。
-
-对于 `video=(1, 2, 5), sparsity=0.9` 后接三个文本 token，raster 行
-`0..9` 是视频，`10..12` 是文本。Block 序列为：
-
-| Block | 按输入顺序排列的原始 raster 行 | 有效 token 数 |
-| --- | --- | ---: |
-| b0：文本 | `10, 11, 12` | 3 |
-| b1：第一个视频 tile | `0, 1, 2, 3, 5, 6, 7, 8` | 8 |
-| b2：边缘视频 tile | `4, 9` | 2 |
-
-输入只有 13 行，attention 内部分配 3×64 个 slot。将这个视频的稀疏度改成
-`None` 后，保留视频在文本之前的顺序，产生大小为 10 和 3 的两个 block。
-`layout.input_rows` 将每个输入行映射回全局 raster 行；
-`raster_to_block_wo_padding(x, vsa_layout=layout)` 的值等于 `x[layout.input_rows]`。
-
-</details>
+`input_order="block"` 仅声明布局，不会自动重排；输入已是 block 顺序时跳过转换。
+位置、target 和 mask 应使用相同的行映射。
 
 ## 注意力语义
 
@@ -885,6 +845,34 @@ JSON 记录数值/graph 检查和源码 hash；计时与 MFU 遵循**性能**一
 Core 不导入公共入口。
 
 <details>
+<summary>精确的 block 顺序与小例子</summary>
+
+1. 保持样本顺序。每个样本内先放 `sparsity=None` 的 segment，再放数值稀疏度的视频，
+   每类内部保持 segment 的声明顺序。
+2. None 稀疏度的 segment 按连续最多 64 个 token 分块；数值稀疏度的视频按
+   4×4×4 tile 分块。Tile 起点和 tile 内有效 token 均按 F/H/W 顺序遍历
+   （W 最快变化），边缘 tile 直接截断，不补 padding。
+3. Block 不跨 segment 或样本边界。数值 `sparsity=0` 仍使用 tile；
+   `sparsity=None` 使用稠密连续块。Ring 按全局 block ID 递增顺序保留拥有的 block，
+   每个 block 内部顺序不变。
+
+对于 `video=(1, 2, 5), sparsity=0.9` 后接三个文本 token，raster 行
+`0..9` 是视频，`10..12` 是文本。Block 序列为：
+
+| Block | 按输入顺序排列的原始 raster 行 | 有效 token 数 |
+| --- | --- | ---: |
+| b0：文本 | `10, 11, 12` | 3 |
+| b1：第一个视频 tile | `0, 1, 2, 3, 5, 6, 7, 8` | 8 |
+| b2：边缘视频 tile | `4, 9` | 2 |
+
+输入只有 13 行，attention 内部分配 3×64 个 slot。将这个视频的稀疏度改成
+`None` 后，保留视频在文本之前的顺序，产生大小为 10 和 3 的两个 block。
+`layout.input_rows` 将每个输入行映射回全局 raster 行；
+`raster_to_block_wo_padding(x, vsa_layout=layout)` 的值等于 `x[layout.input_rows]`。
+
+</details>
+
+<details>
 <summary>重排算子与 layout 映射</summary>
 
 | 转换 | 执行位置 | 前向 / 输出恢复 |
@@ -900,6 +888,13 @@ Core 不导入公共入口。
 反向也如此；分别处理则需要三次调用。融合范围是 padding/恢复，不包含 QKV 线性投影。
 Slot 辅助函数位于 `vsa_kernels.py`，
 两个 raster/紧凑 block 边界转换函数位于 `vsa.py`。
+
+边界转换 `raster_to_block_wo_padding` 接受一个内存连续的 CUDA
+`[T_global, ...]` 张量，返回 `[layout.tokens, ...]`，保持 dtype 和后续维度。
+它不添加 padding，Ring 时同时选择拥有的行。两个边界转换函数都要求
+`input_order="block"`：layout 描述 VSA 的输入顺序。
+仅对完整 layout，可在层堆栈结束后调用
+`block_wo_padding_to_raster(out_block, vsa_layout=layout)` 恢复 raster 输出。
 
 逐层转换在 `vsa_attention` 内部执行，位于 Ulysses head 交换之后（若使用 Ulysses）。
 转换由输入顺序决定，Ulysses 本身不要求其中某种顺序。Ring 要求紧凑 block 输入。

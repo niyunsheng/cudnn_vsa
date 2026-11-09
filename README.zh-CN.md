@@ -46,12 +46,11 @@ out = vsa_attention(q, k, v, gate, layout)
 out.backward(torch.randn_like(out))
 ```
 
-每个内层列表表示一个联合样本；不同样本之间不能互相进行注意力计算。
-使用默认的 raster 顺序时，输入按照 `samples` 中的样本和 segment 声明顺序排列。
-每个样本至少包含一个视频，也可以包含额外的视频/图像、文本、音频或关键帧 segment。
-视频尺寸为按 raster 顺序排列的 `(F, H, W)` token 网格；`F=1` 表示图像。
-其他 segment 类型使用 token 数量指定长度，并设置 `sparsity=None`。
-几何形状和设置相同的各层可以复用 layout。
+每个内层列表是独立样本，attention 不跨样本。输入按声明的样本/segment 顺序排列，
+视频内部使用 FHW raster 顺序。每个样本至少包含一个视频：`(F, H, W)` 表示
+其 token 网格，`F=1` 表示图像。文本、音频和关键帧 segment 使用 token 数，
+且 `sparsity=None`；也可添加更多视频/图像 segment。
+几何形状和设置相同时，各层复用 layout。
 
 将此目录加入 `PYTHONPATH`，或者把 `vsa.py`、`vsa_core.py`、
 `vsa_layout.py` 和 `vsa_kernels.py` 复制到项目中并调整 import。
@@ -73,97 +72,112 @@ out.backward(torch.randn_like(out))
 
 ### Block 输入
 
-`input_order="block"` 描述 `vsa_attention` 所期望的 token 顺序；
-设置此标志本身不会重排张量。全局 block 顺序如下：
+在**层堆栈之前重排一次**，之后各层保持 block 顺序。
+`input_order="block"` 声明预期的输入顺序，不会自动重排数据。
+给定全局 raster token 及其原始 position IDs：
 
-1. 保持样本的声明顺序。
-2. 在每个样本内，先放置 `sparsity=None` 的 segment，再放置 `sparsity` 为数值的视频
-   segment。每个类别内部保持 segment 的声明顺序。稠密图像/视频属于第一类；
-   数值 `sparsity=0` 仍属于第二类。
-3. 将每个 None-sparsity segment 切成每块最多 64 个 token 的连续片段。
-   对 `sparsity` 为数值的视频，按 F/H/W 顺序遍历 4×4×4 tile 的起点
-   （W 变化最快），再按相同顺序遍历每个 tile 内的有效 token。
-   边缘 tile 裁剪到实际尺寸，拼接有效 token 时不留空隙。
-   Block 不会跨越 segment 或样本边界。
+```python
+from vsa import to_block_order, to_raster_order
 
-Ring 输入仅保留本 rank 拥有的 block，按全局 block ID 递增排列。
-每个 block 内的 token 顺序不变。`layout.input_rows[i]` 将提供的第 `i` 行
-映射到原始**全局 raster** 行；完整的 raster layout 使用恒等映射。
-Q/K/V、gate、position IDs 和 dO 必须采用提供给注意力的相同顺序。
-输出和输入梯度保持该顺序。
+layout = build_vsa_layout(samples, head_num=H, input_order="block", device="cuda")
+tokens_block = to_block_order(tokens_global, vsa_layout=layout)
+position_ids_block = to_block_order(position_ids_global, vsa_layout=layout)
+# Run the layers in block order, then restore once if raster output is needed:
+# out_raster = to_raster_order(out_block, vsa_layout=layout)
+```
 
-例如，声明 `video=(1, 2, 5), sparsity=0.9`，后面跟随三个文本 token。
-将原始 raster 行编号为 `0..12`：视频行为 `0..9`，文本行为 `10..12`。
-紧凑的 block 序列为：
+`to_block_order` 接受一个内存连续的 CUDA `[T_global, ...]` 张量，
+返回 `[layout.tokens, ...]`，保持 dtype 和后续维度不变。
+融合 gather **不添加 padding**。位置、target 和 mask 使用相同映射；
+Q/K/V/gate 及梯度遵循重排后的 token 顺序。输入已经是 block 顺序时跳过转换。
 
-| Block | 按输入顺序列出的原始 raster 行 | 有效 token 数 |
+完整 layout 重排全部 token；Ring layout 同时选择本 rank 拥有的 block。
+两个辅助函数都要求 layout 的 `input_order="block"`，即使
+`to_block_order` 读取的是 raster 输入。`to_raster_order` 仅接受完整 layout；
+Ring 输出的聚合由调用方负责。
+
+<details>
+<summary>精确的 block 顺序与小例子</summary>
+
+1. 保持样本顺序。每个样本内先放 `sparsity=None` 的 segment，再放数值稀疏度的视频，
+   每类内部保持 segment 的声明顺序。
+2. None 稀疏度的 segment 按连续最多 64 个 token 分块；数值稀疏度的视频按
+   4×4×4 tile 分块。Tile 起点和 tile 内有效 token 均按 F/H/W 顺序遍历
+   （W 最快变化），边缘 tile 直接截断，不补 padding。
+3. Block 不跨 segment 或样本边界。数值 `sparsity=0` 仍使用 tile；
+   `sparsity=None` 使用稠密连续块。Ring 按全局 block ID 递增顺序保留拥有的 block，
+   每个 block 内部顺序不变。
+
+对于 `video=(1, 2, 5), sparsity=0.9` 后接三个文本 token，raster 行
+`0..9` 是视频，`10..12` 是文本。Block 序列为：
+
+| Block | 按输入顺序排列的原始 raster 行 | 有效 token 数 |
 | --- | --- | ---: |
 | b0：文本 | `10, 11, 12` | 3 |
 | b1：第一个视频 tile | `0, 1, 2, 3, 5, 6, 7, 8` | 8 |
 | b2：边缘视频 tile | `4, 9` | 2 |
 
-对于完整 layout，输入有 13 行，注意力分配 3×64 个 slot。
-如果该视频使用 `sparsity=None`，则两个 segment 都是稠密的：视频仍在文本之前，
-按原始 raster 顺序形成分别包含 10 和 3 个 token 的两个 block。
+输入只有 13 行，attention 内部分配 3×64 个 slot。将这个视频的稀疏度改成
+`None` 后，保留视频在文本之前的顺序，产生大小为 10 和 3 的两个 block。
+`layout.input_rows` 将每个输入行映射回全局 raster 行；
+`to_block_order(x, vsa_layout=layout)` 的值等于 `x[layout.input_rows]`。
 
-对于 raster 数据，在整个 VSA 层堆栈之前调用一次 `to_block_order`。
-本仓库提供独立于 `vsa_attention` 的融合重排 kernel：通过一次 kernel launch
-从一个 token 张量中 gather 所需行，保留 dtype 和后续维度，并且**不添加 padding**。
-已经按 block 排列的输入可以直接进入注意力。各层之间保持该顺序。
+</details>
 
-`to_block_order(x, vsa_layout=layout)` 接受一个内存连续的 CUDA
-`[T_global, ...]` raster 张量。完整 layout 返回按 block 顺序排列的所有行；
-Ring layout 仅选择并重排本 rank 的行，返回 `[layout.tokens, ...]`。
-完整 layout 保持第一维长度不变；Ring layout 使用本地有效 token 数。
-两种情况下，结果在数值上都等于 `x[layout.input_rows]`。
-逆操作 `to_raster_order(x, vsa_layout=layout)` 要求使用**完整** layout。
-两个辅助函数都要求 `input_order="block"`：即使 `x` 以 raster 顺序输入，
-layout 描述的也是目标 block 顺序。
-在层堆栈的输入边界调用正向重排函数；如果需要 raster 输出，则在输出边界调用逆操作。
-后续逐 token 的投影会直接生成按 block 排列的 Q/K/V/gate。
-位置坐标必须采用相同顺序；调用方可以按 block 顺序生成坐标，
-也可以单独转换坐标张量。
+## 注意力语义
 
-```python
-import torch
-from vsa import to_block_order, to_raster_order, vsa_attention
-from vsa_layout import Segment, build_vsa_layout
+`sparsity` 表示视频 segment 的 **KV block 丢弃比例**。
+默认情况下，每个 query block 和 head 都独立地从**每个**视频 KV region 选择 top-k block，
+包括跨视频注意力：
 
-H, D, C = 2, 128, 256
-layout = build_vsa_layout(
-    [[Segment("video", (5, 9, 11), sparsity=0.9), Segment("text", 67)]],
-    head_num=H, input_order="block", device="cuda",
-)
-tokens_raster = torch.randn(layout.tokens, C, device="cuda", dtype=torch.bfloat16,
-                            requires_grad=True)
-projection = torch.nn.Linear(C, 4 * H * D, device="cuda", dtype=torch.bfloat16)
-
-# One reorder at the input boundary, before the layers' projections.
-tokens_block = to_block_order(tokens_raster, vsa_layout=layout)
-assert tokens_block.shape == tokens_raster.shape  # Full layout: 562 valid tokens.
-
-# One example VSA layer; intermediate layers retain block order.
-projected = projection(tokens_block).view(layout.tokens, 4, H, D)
-q, k, v, gate = (x.contiguous() for x in projected.unbind(1))
-out = vsa_attention(q, k, v, gate, layout)
-
-# Restore once at the output boundary if raster output is required.
-out_raster = to_raster_order(out, vsa_layout=layout)
-out_raster.backward(torch.randn_like(out_raster))
+```text
+k = max(1, ceil((1 - sparsity) * video_region_blocks))
 ```
 
-对于这个完整 layout，反向执行逆置换；`to_raster_order` 在层堆栈之后
-恢复原始样本/segment/FHW 顺序。对于 Ring layout，反向将梯度 scatter 到
-全局 raster 形状，未归本 rank 所有的行填零；不会执行跨 rank 归约。
-恢复完整的 Ring 输出需要调用方负责通信；`to_raster_order` 仅接受完整 layout。
+预算由 KV segment 决定；选中的 block 由 Q/K 决定。
+`sparsity=None` 将 region 设为稠密：它的 KV block 始终可见，仅进行 padding。
+数值稀疏度使用 4×4×4 视频 tile；`0` 保留这些 tile 的全部 block。
 
-内部每个 block 占用 64 个 slot：`slot_row` 将 slot 映射到输入行，
-用 `-1` 表示 padding；`row_slot` 是有效行的逆映射。
-Block 输入使用融合的 Q/K/V padding 和融合的 dQ/dK/dV 恢复；
-padding 值为零，不参与均值和注意力计算。
-`slots_are_input` 仅在 block 输入满足 `tokens == blocks * 64`，
-且没有不完整 block 或占位 block（dummy block）时跳过转换。
-Raster 输入即使所有 block 都满，也仍使用 raster-to-slot 路径。
+[FastH3](https://github.com/hao-ai-lab/FastVideo/blob/d5253fd71055927f12aa6c4aa679b93a00238851/fastvideo/attention/backends/video_sparse_attn_h3.py#L27-L31)
+增加了 query 侧的例外规则：稠密 query 可以看到**全部** KV block。
+`dense_query_full=True` 启用该例外；默认值 `False` 对每个 query 都应用视频 KV 稀疏度。
+稠密 query 来自 `sparsity=None` 的 region。
+
+下面给出一个样本/head 在稀疏度为 0.5 时的 fine mask 示例。
+两个坐标轴都遵循内部 block 顺序：**先放 None-sparsity segment，再放数值稀疏度视频 segment**。
+`■` 表示可见，`□` 表示被 mask。Top-k 选择仅用于示意。
+
+**`dense_query_full=False`（默认）**
+
+```text
+           Dense KV    Video KV
+           0 1         2 3 4 5
+Dense Q0   ■ ■         □ ■ ■ □
+Dense Q1   ■ ■         ■ □ □ ■
+Video Q2   ■ ■         ■ □ ■ □
+Video Q3   ■ ■         □ ■ □ ■
+Video Q4   ■ ■         ■ ■ □ □
+Video Q5   ■ ■         □ □ ■ ■
+```
+
+**`dense_query_full=True`（FastH3 稠密 query 规则）**
+
+```text
+           Dense KV    Video KV
+           0 1         2 3 4 5
+Dense Q0   ■ ■         ■ ■ ■ ■
+Dense Q1   ■ ■         ■ ■ ■ ■
+Video Q2   ■ ■         ■ □ ■ □
+Video Q3   ■ ■         □ ■ □ ■
+Video Q4   ■ ■         ■ ■ □ □
+Video Q5   ■ ■         □ □ ■ ■
+```
+
+对于含数值稀疏度的样本，coarse attention 覆盖**所有 segment** 的 BF16 池化 block，
+为每个 token 生成 `fine + gate * coarse[its_block]`。
+如果样本的所有 segment 都是 `sparsity=None`，则通过 **BSA 执行完整注意力**，
+不使用 coarse 分支。前面独立图像的处理方式就是如此；
+VSA 样本内部的稠密图像仍会参与 coarse。
 
 ## 无 CP、Ulysses CP 和混合 CP 示例
 
@@ -219,12 +233,13 @@ torchrun --standalone --nproc-per-node=8 demo_cp.py \
 
 ### 共用示例
 
-示例使用 PyTorch 支持自动求导的 All-to-All。Ulysses、投影、loss 归一化
-以及参数梯度归约由调用方负责，并非新增的 `cudnn_vsa` API。
-这里每个 rank 从相同的完整 raster 数据和复制的模型权重开始。
-数据加载也可以直接提供最终的本地行。为了便于阅读，下面的显式重排在每个
-Ulysses rank 上物化一份 Ring 分片；调用方可以将重排的行映射与 Ulysses
-切片结合，只提取最终的本地行。
+示例使用 PyTorch 支持自动求导的 All-to-All、复制的模型权重，以及每个 rank 上
+相同的完整 raster 数据。Ulysses、投影、loss 归一化和梯度归约属于调用方代码。
+为便于阅读，示例先物化 Ring 分片再切 Ulysses；数据加载也可以合并两种映射，
+直接提取最终的本地行。
+
+<details>
+<summary>完整 Python 示例：demo_cp.py</summary>
 
 ```python
 import argparse
@@ -361,6 +376,8 @@ if world > 1:
     dist.destroy_process_group()
 ```
 
+</details>
+
 本例中，每层将 `[A, 1024]` 投影为形状为 `[A, 8, 128]` 的 Q/K/V/gate。
 Ulysses 交换并移除传输 padding 后，每个张量的形状是
 `[layout.tokens, 8/U, 128]`；逆向交换和输出投影将其恢复为 `[A, 1024]`。
@@ -370,126 +387,63 @@ Ulysses 交换并移除传输 padding 后，每个张量的形状是
 最终完整输出的聚合由调用方负责。
 使用训练框架的参数梯度归约时，应以其替代示例中的手动归约，避免重复归约梯度。
 
-## 代码结构
-
-| 文件 | 职责 |
-| --- | --- |
-| `vsa.py` | 公共注意力入口，以及显式的 block/raster 重排辅助函数 |
-| `vsa_core.py` | 路由、cuDNN BSA/FA4 调用、单设备执行，以及 Ring 通信和 autograd |
-| `vsa_layout.py` | 静态样本/block 几何信息、行映射、路由模板和 coarse 边界 |
-| `vsa_kernels.py` | 融合 token 重排、slot gather、Q/K/V padding、FP32 pooling 和门控合并 kernel |
-
-两种输入顺序共享 core 中的注意力数学计算、各 region 的预算，以及先 fine 后 coarse 的调度。
-Core 不导入公共入口。
-
 ## Ring 上下文并行
 
-普通 VSA 和 Ring 使用相同的 forward API：
+将已有的 Ring 进程组传给同一个 layout 构建函数和 attention API：
 
 ```python
 layout = build_vsa_layout(
-    samples, head_num=H, input_order="block", device=device,
-    ring_cp_group=group,  # Existing caller-owned group; None selects ordinary VSA.
-    ring_partition="cyclic",  # Default; "contiguous" is also supported.
+    samples, head_num=H, input_order="block", device="cuda",
+    ring_cp_group=group, ring_partition="cyclic",  # Or "contiguous".
 )
+# Global raster inputs -> this Ring rank's compact block stream, once per pack.
+tokens_local = to_block_order(tokens_global, vsa_layout=layout)
+position_ids_local = to_block_order(position_ids_global, vsa_layout=layout)
+# After token-wise projection and any caller-owned Ulysses exchange:
 out = vsa_attention(q, k, v, gate, layout)
 ```
 
-两种模式下 `build_vsa_layout` 都返回 `VSALayout`。
-`ring_cp_group=None` 构建完整 layout（`layout.ring is None`），
-不需要初始化分布式环境，也支持在 CPU 上构建。
-传入当前进程所属的进程组会构建本地 Ring 分片，包括大小为 1 的进程组，
-并且要求 `input_order="block"`。Rank 和 size 从传入的进程组获取；
-非成员进程的句柄会被拒绝。
+这里的 `H` 是 VSA 收到的 head 数（使用 Ulysses 时为 `H_total // U`）。
+`ring_cp_group=None` 创建完整的 `VSALayout`（`layout.ring is None`），
+无需初始化分布式环境，也支持 CPU。传入成员进程组会创建本地 Ring layout，
+rank 和 size 从进程组获取。非成员句柄会被拒绝；即使组大小为 1 也要求 block 输入。
 
-组内所有 rank 都需提供相同的全局样本几何信息和 head 数。
-在并行初始化阶段创建一次进程组，并在不同 micro-batch 的 layout 之间共享；
-各层复用各自的 layout。VSA 借用进程组句柄，从不创建或销毁进程组。
-默认情况下，前向和反向共享 `ring_cp_group`。
-可选的 `ring_cp_bwd_group` 必须具有相同的成员及 rank 顺序。
-进程组和传输选项在构建时绑定；在反向和 CUDA Graph replay 完成之前，
-必须保持进程组存活。流优先级的配置见**前向通信重叠**。
+进程组只创建一次，在不同 micro-batch 的 layout 之间共享；每个 layout 在层间复用。
+组内所有成员必须使用相同的全局样本形状、head 数和分配策略。
+VSA 借用进程组，调用方应使其存活到反向和 CUDA Graph replay 完成。
+前反向默认共享 `ring_cp_group`；也可通过 `ring_cp_bwd_group` 传入成员和
+rank 顺序完全相同的另一组。
 
-完整 layout 和 Ring 分片共享 slot 映射、路由模板及 coarse 元数据。
-`tokens`、`blocks` 和行/slot 映射描述本地输入；
-`groups`、`sample_slices` 和 `sample_lengths` 描述全局样本。
-`layout.ring` 保存绑定的进程组、本地 rank/size、全局 token 数、
-block 归属、各 peer 的长度和 all-gather 置换。
-Coarse Q 边界是本地的；KV 边界覆盖对应的全局样本。
-完整 layout 的 Q/KV 共享边界张量和 block ID 张量。
+### Block 归属
 
-### 紧凑输入与 block 归属
+Ring 输入仅包含拥有的 block 的有效 token，按全局 block ID 递增排列。
+`to_block_order` 融合分片选择与重排，不物化完整的全局 block 中间张量，也不通信。
+已有本地 block 输入时跳过转换。全局数据已经按 block 排列时，直接分发拥有的 block，
+不要再次执行 raster 转换。
 
-Ring layout 要求 `input_order="block"`，大小为 1 的进程组也一样。
-每个 rank 仅提供本地有效 token，按所拥有 block 的递增顺序排列，不含 padding。
-Q/K/V/gate、位置坐标和梯度都保持相同顺序；输出也保持该顺序。
-各层之间复用 layout。
-
-按照**输入顺序**一节描述的顺序规划 block，并在打包的各个样本之间连续编号。
-`ring_partition` 独立于 `input_order` 选择 block 的归属方式，
-并记录在 `layout.ring.partition` 中：
+`ring_partition` 独立于 `input_order` 选择归属方式，结果记录在
+`layout.ring.partition` 中：
 
 | `ring_partition` | 全局 block 归属 |
 | --- | --- |
-| `"cyclic"`（默认） | Block `b` 属于 rank `b % R`；全局编号跨样本连续递增 |
-| `"contiguous"` | 每个样本向每个 rank 分配至多一段连续的 block 区间 |
+| `"cyclic"`（默认） | Block `b` 属于 rank `b % R`，全局编号跨样本连续 |
+| `"contiguous"` | 每个样本给每个 rank 至多一个连续 block 区间 |
 
-轮转分配将相邻 Q/KV block 分散到不同 rank，可以减少稀疏计算集中在某个 peer 的情况。
-两种策略都不保证动态 top-k 工作量均衡。它们共享相同的路由、注意力和通信 kernel。
-组内所有 rank 必须选择相同策略。切换策略时需要重新构建 layout 并重新切分输入；
-不能将已有本地张量直接按另一种策略解释。
+连续分配从 rank 0 开始。对每个样本的 N 个 block，计算
+`base, extra = divmod(N, R)`：从当前起始 rank 循环访问各 rank，前 `extra` 个
+各获得 `base + 1` 个连续 block，其余各获得 `base` 个。
+随后起点前进 `extra` 并对 R 取模，使下一个样本从上一个样本分得较少的第一个
+rank 开始。`extra=0` 时起点不变。
 
-连续分配时，第一个样本从 rank 0 开始。
-对于 N 个 block，计算 `base, extra = divmod(N, R)`，从当前起始 rank 循环遍历。
-前 `extra` 个 rank 各获得 `base + 1` 个连续 block，其他 rank 各获得 `base` 个。
-然后将起始 rank 前移 `extra`，并对 R 取模：下一个样本从上一个样本中
-第一个分到较少 block 的 rank 开始。若 N 可被 R 整除，起始 rank 保持不变。
-某个 rank 可以不拥有某个样本的任何 block。
+两种策略均保证每个样本及累计的 block 数相差不超过一个，
+但不保证有效 token 数或动态 top-k 工作量均衡。循环分配将相邻 block 分散到不同 rank；
+连续分配让每个样本的本地区间便于切片。两者使用相同的 attention kernel。
+修改策略时必须重建 layout 并重新分片输入。
 
-这种轮转使各 rank 的单样本 block 数和累计 block 数都相差不超过一个，
-无需搜索全局负载最少的 rank。每个 rank 使用 `C = ceil(global_blocks / R)`
-个内部 block。有效 token 长度不影响归属；不完整 block 可能造成 token 负载不均。
-每个 block 都只属于一个 segment 和一个样本；路由和注意力计算始终保持样本隔离。
-样本的 token 数和 block 数都无需是 R 的倍数。
-总 block 数必须至少为 R；更小的 pack 会在所有 rank 上被拒绝。
-每个 rank 都会收到有效输入 token。内部缓冲区将不完整 block 和 dummy block
-补齐到 64 个 slot。
-
-归属通过显式映射表示：`p = layout.ring.global_to_gather[b]` 将全局 block
-`b` 映射到以 rank 为主序的存储位置，因此 `owner = p // C`，
-`local_block = p % C`。`layout.ring.block_ids` 列出本 rank 的全局 ID，
-dummy block 使用 `-1`。所有 rank 都根据样本几何信息生成相同的映射，无需通信。
-
-对于 Ring 分片，`layout.input_rows` 将本地紧凑行映射到原始全局
-样本/segment/FHW 序列。`to_block_order` 使用该映射融合**分片选择和重排**：
-只读取本 rank 拥有的行，不生成完整的 block 顺序中间张量。
-如果每个 rank 都持有完整的 raster pack，在层堆栈之前准备一次输入即可：
-
-```python
-from vsa import to_block_order
-
-layout = build_vsa_layout(
-    samples, head_num=H, input_order="block", device="cuda",
-    ring_cp_group=group,
-)
-# tokens_global: [layout.ring.global_tokens, hidden_size], in sample/segment/FHW order.
-# position_ids_global: [T_global] or [T_global, axes], aligned with those tokens.
-tokens_local = to_block_order(tokens_global, vsa_layout=layout)
-position_ids_local = to_block_order(position_ids_global, vsa_layout=layout)
-# Build local RoPE cos/sin from position_ids_local; reuse across layers with
-# the same RoPE configuration. Preserve each sample's original position values.
-# Use the same helper for aligned target/mask tensors when needed.
-assert tokens_local.shape == (layout.tokens, tokens_global.shape[1])
-# Token-wise projections and all VSA layers now consume the local block order.
-```
-
-该辅助函数不添加 padding，也不执行通信。
-反向将梯度 scatter 到原始全局形状，未归本 rank 所有的行梯度为零；
-不会执行跨 rank 梯度归约。数据加载和最终输出 gather 仍由调用方负责。
-已经按本地 block 顺序排列的张量无需经过该辅助函数。
-全局 block 顺序张量不属于 raster 输入：应使用归属映射分发完整 block，
-无需再次执行 FHW 转换。任何 Ulysses all-to-all 也由调用方负责，
-并且必须保持本地 block 顺序。
+整个 pack 至少需要 R 个 block，使每个 Ring rank 都有有效数据。
+单个样本的 token/block 数无需被 R 整除，也可以不出现在部分 rank 上。
+内部每个 rank 分配 `C = ceil(global_blocks / R)` 个 block，每个 block 有
+64 个 slot；不完整和 dummy slot 不参与数学计算。
 
 ### 示例：三个 rank 上的两个样本
 
@@ -559,38 +513,24 @@ Q/K/V/gate 和位置使用相同的本地顺序；输出及其梯度保持该顺
 
 ### 路由与 top-k
 
-路由代码按以下顺序执行：
-
-1. [vsa_layout.py](vsa_layout.py) 中的 `_build_sample_blocks` 为每个
-   `sparsity` 为数值的视频 region 记录独立预算：`keep = max(1, ceil((1 -
-   sparsity) * region_blocks))`。稠密 KV block 始终被包含。
-   这些预算和样本边界是静态的；选中的视频 block ID 会随每次前向的 Q/K 改变。
-2. [vsa_core.py](vsa_core.py) 中的 `ring_attention_slots` 使用 FP32 计算本地
-   Q/K/V 的 block 均值，除数为有效 token 数。Padding 为零，dummy block 的均值为零。
-   池化后的 K/V 按 rank 顺序执行 all-gather，然后由
-   `layout.ring.global_to_gather` 恢复全局 block 顺序并移除 dummy block。
-   路由使用本地 Q 均值和按全局顺序排列的 K 均值。
-3. 完整 layout 和 Ring layout 共享 `route`。
-   Layout 预先计算每个样本的本地路由行，以及它们在池化 Q/K 中的偏移；
-   `route` 对这些行调用 `_route_group`。对于每个视频 KV region 和 head，
-   在禁用 TF32 和 autocast 的情况下计算 FP32 分数 `Q_mean @ K_mean.T`，
-   然后为每个 Q block 独立选择该 region 中分数最大的 `keep` 个 block。
-   路由使用未缩放的点积；注意力随后再应用 softmax scale。
-   该 region 内所有 peer 的候选 block 都参与这一次选择。
-   每个 Q block 只有一个 owner，且 K 均值已是全局的，因此不需要对分数或 top-k
-   索引执行 collective。
-4. `topk(..., sorted=False)` 选出 region 内的相对 ID；`selected.sort(-1)`
-   对这些 ID 排序，再通过 `+ start` 转换成全局 block ID。
-   稠密 key 和完整保留的 region 来自 layout 的模板。
-   当 `dense_query_full=True` 时，稠密 Q 行保留覆盖整个样本的模板并跳过 top-k；
-   稀疏视频 Q 行仍使用各 region 的预算。不含动态选择的 layout 直接复用模板。
-   路由在 `no_grad` 下执行：梯度通过选中的 fine attention 和 coarse 分支传播，
-   不通过离散的 top-k 决策传播。
-5. [vsa_kernels.py](vsa_kernels.py) 中的 `partition_indices` 使用与池化 K/V
-   相同的 `global_to_gather` 映射对选中的 ID 分组。
-   容量为 C 时，映射位置 `p` 对应 `owner = p // C` 和 `local_block = p % C`。
-   该操作记录各 peer 的有效数量。某个 peer 可以没有任何被选中的 key。
-   随着 K/V 分片到达，这些按 peer 划分的列表用于驱动 fine attention。
+1. [vsa_layout.py](vsa_layout.py) 的 `_build_sample_blocks` 固定样本边界及每个视频的
+   `keep = max(1, ceil((1 - sparsity) * region_blocks))` 预算。
+   选中的 ID 随每次前向的 Q/K 改变；稠密 KV 始终保留。
+2. [vsa_core.py](vsa_core.py) 的 `ring_attention_slots` 按有效 token 数计算本地
+   Q/K/V 的 FP32 均值，dummy 均值为零。K/V 汇总按 rank 顺序 all-gather，
+   再由 `global_to_gather` 恢复全局 block 顺序并移除 dummy。
+   本地 Q 均值由此获得自己样本内的全部候选 K 均值。
+3. 共用的 `route` / `_route_group` 禁用 TF32/autocast，计算未缩放的 FP32
+   `Q_mean @ K_mean.T`。每个 Q block/head 在每个视频 region 内，跨所有 peer
+   独立选择 top-k。`topk(..., sorted=False)` 返回相对 ID，再通过
+   `selected.sort(-1)` 和 `+ start` 得到排序后的全局 ID。
+   稠密 KV 和完整保留的 region 使用静态模板；豁免的稠密 Q 行
+   （`dense_query_full=True`）跳过 top-k。没有动态选择时直接复用模板。
+   路由运行在 `no_grad` 下；梯度通过 fine/coarse attention，不经过离散选择。
+   全局 K 均值使额外的分数/索引 collective 不再需要。Softmax 缩放在 attention 中进行。
+4. [vsa_kernels.py](vsa_kernels.py) 的 `partition_indices` 使用 `global_to_gather`，
+   将选中的全局 ID 映射为各 owner 的本地 block ID 和有效数量。
+   某个 peer 可以没有选中的 key；K/V 到达时，fine attention 使用这些列表。
 
 对于上面的样本 A，四个视频 block、稀疏度 0.5 对应 `keep=2`。
 假设 query block `b3` 的某个 head 得到以下分数：
@@ -610,17 +550,13 @@ Final global IDs:   [b0, b2, b4]   (b0 is the always-visible text block)
 
 ### 执行流程
 
-单设备执行和 Ring 执行共享 `block_means`，该函数返回可微的 FP32 Q/K/V 均值。
-单设备执行会选择 coarse block，并在 `routing_and_coarse_means` 中融合
-路由所需的 detach 和 coarse 的 dtype 转换。
-Ring 执行对所有本地 slot 做 pooling，包括填零的 dummy block；
-`_GatherMeans` 以 FP32 传输用于路由的 K 均值，以 BF16 传输用于 coarse attention
-的 V 均值，将其原始字节打包为一次 all-gather。
-这种字节打包保留各字段的 bit，不会量化 K。
-V 的类型转换位于通信 autograd 边界内；反向将 dK/dV 合并为一次 FP32
-reduce-scatter SUM，并向 pooling 返回 FP32 梯度。
-相比 K/V 都以 FP32 发送，前向池化 K/V 的传输量减少 25%；
-前向和反向的 collective 次数仍各为一次。端到端延迟仍需实际测量。
+两种模式共用可微的 FP32 `block_means`。单设备执行选取 coarse block，
+通过 `routing_and_coarse_means` 融合路由 detach 和 coarse 类型转换。
+Ring 对全部本地 slot 做 pooling，包括零值 dummy。
+`_GatherMeans` 将 **FP32 K + BF16 V** 按原始字节打包为一次 all-gather，
+不量化 K。V 在通信 autograd 边界内转换；反向将 dK/dV 合并为一次
+**FP32 reduce-scatter SUM**，向 pooling 返回 FP32 梯度。
+前向汇总的传输量比 FP32 K/V 少 25%；collective 次数仍为前向一次、反向一次。
 
 对于上面的示例，令 `KV_r` 表示 rank r 的整个内部 K/V 分片，包含 slot padding。
 在整个 fine attention 过程中，Q 保持在原 rank，K/V 传给组内下一个 rank：
@@ -688,12 +624,9 @@ layout = build_vsa_layout(
 out = vsa_attention(q, k, v, gate, layout)
 ```
 
-默认情况下，前向和反向使用相同的进程组。
-要为反向选择不同的 NCCL 流优先级，可以创建成员和 rank 顺序相同的第二个进程组，
-并通过 `ring_cp_bwd_group` 传入。
-前向池化 all-gather 和 fine KV P2P 使用 `ring_cp_group`；
-反向 fine P2P 和池化梯度 reduce-scatter 使用 `ring_cp_bwd_group`。
-VSA 借用这些句柄；调用方负责创建和销毁，并保持它们存活到反向及 CUDA Graph replay 完成。
+`ring_cp_group` 承担前向池化 all-gather 和 fine P2P；
+`ring_cp_bwd_group` 承担反向 P2P 和池化梯度 reduce-scatter。
+默认使用同一个句柄。需要不同的反向优先级时，创建成员及 rank 顺序完全相同的第二个组。
 
 在 BSA 之前将 P2P 入队，并不保证它的 GPU kernel 先开始执行。
 BSA 和 NCCL 可能竞争 SM 资源，包括共享内存。
@@ -716,90 +649,22 @@ Benchmark 的 `--high-priority-group` 使用上述配置。
 
 ### 设计原因
 
-- **保持稀疏注意力计算单元完整。** Pooling、路由和 cuDNN BSA 都以完整 block 为单位。
-  连续 FHW 序列的分片可能将一个 4×4×4 tile 切到不同 rank 上。
-  在数据集/模型边界一次性排列并分发完整 block，可以让每个 block 只有一个 owner；
-  后续各层可直接对本地 token 做 pooling 和投影。
-  紧凑输入也让外围投影和 MLP 不必处理 slot padding。
-- **保持每个样本的本地 block 连续。** 为每个样本/rank 分配一个区间，
-  可以保持本地 block 顺序并简化数据集切片。
-  按 block 数划分，并在不同样本间轮转额外 block 的接收者，
-  只需保存一个起始 rank 就能均衡累计 block 数，无需依赖不完整 block 的长度。
-  Layout 构建时计算一次归属映射，供池化 gather、路由和每个 VSA 层复用。
-- **控制全局路由信息的大小。** 为保持各 region 的 top-k 预算，
-  本地 Q block 需要整个样本内所有候选 block 的池化 K。
-  Coarse attention 也需要池化 K/V。
-  Gather 每个 block 的一个汇总即可提供这些信息；fine attention 则通过两个
-  接收/计算缓冲区轮转 token 级 K/V，无需同时保存所有 peer 的完整 K/V。
-  Q、输出累加和 dQ 保持本地。
-- **使通信形状可预测。** 相同的内部 slot 容量保证 P2P 传输匹配，支持 CUDA Graph 复用。
-  有效大小和路由计数将不完整/dummy slot 排除在数学计算之外。
-  即使一个 rank 持有多个样本的 block，样本边界也仍通过显式元数据保留。
-  当其他样本使用 coarse attention 时，仅有 fine-attention query 的 rank
-  仍会参与池化梯度 collective。
+- **完整 block 归属**让 pooling、路由和 BSA 的每个计算单元留在一个 Ring rank 上。
+  紧凑输入避免投影和 MLP 处理 attention slot padding；重排在模型边界只做一次。
+- **两种归属策略**适配不同工作负载。循环分配将相邻 block 分散开；
+  连续分配为每个样本/rank 保留一个区间，并轮转余数 block 的接收者。
+  两者均只计算一次归属，所有层复用映射。
+- **全局 block 汇总**让本地 Q 在完整样本内选择 top-k 并计算 coarse attention。
+  Fine attention 通过两个接收/计算缓冲区轮转 token 级 K/V；Q、输出累加和 dQ 留在本地。
+- **相同的内部容量**保证 P2P 形状匹配，支持 CUDA Graph 复用。
+  有效大小和显式样本边界排除 padding、避免跨样本 attention，
+  同样适用于 fine-only 与 coarse 样本分布在多个 rank 的情况。
 
-代价是 fine attention 会轮转**整个带 padding 的 K/V 分片**，
-即使路由只选择了某个 peer 的少量 block。
-稀疏度减少了注意力计算量，但不会按比例减少这些传输字节。
-池化 K/V 仍需全局 gather，更多 rank 会增加通信步数。
-Block 数均衡不保证有效 token 总数或注意力工作量相等：不完整 block、样本长度、
-稀疏度和选中的 KV owner 都会影响计算和重叠。
-改变分配策略时，应对完整工作负载进行 benchmark。
-
-## 注意力语义
-
-`sparsity` 表示视频 segment 的 **KV block 丢弃比例**。
-默认情况下，每个 query block 和 head 都独立地从**每个**视频 KV region 选择 top-k block，
-包括跨视频注意力：
-
-```text
-k = max(1, ceil((1 - sparsity) * video_region_blocks))
-```
-
-预算由 KV segment 决定；选中的 block 由 Q/K 决定。
-`sparsity=None` 将 region 设为稠密：它的 KV block 始终可见，仅进行 padding。
-数值稀疏度使用 4×4×4 视频 tile；`0` 保留这些 tile 的全部 block。
-
-[FastH3](https://github.com/hao-ai-lab/FastVideo/blob/d5253fd71055927f12aa6c4aa679b93a00238851/fastvideo/attention/backends/video_sparse_attn_h3.py#L27-L31)
-增加了 query 侧的例外规则：稠密 query 可以看到**全部** KV block。
-`dense_query_full=True` 启用该例外；默认值 `False` 对每个 query 都应用视频 KV 稀疏度。
-稠密 query 来自 `sparsity=None` 的 region。
-
-下面给出一个样本/head 在稀疏度为 0.5 时的 fine mask 示例。
-两个坐标轴都遵循内部 block 顺序：**先放 None-sparsity segment，再放数值稀疏度视频 segment**。
-`■` 表示可见，`□` 表示被 mask。Top-k 选择仅用于示意。
-
-**`dense_query_full=False`（默认）**
-
-```text
-           Dense KV    Video KV
-           0 1         2 3 4 5
-Dense Q0   ■ ■         □ ■ ■ □
-Dense Q1   ■ ■         ■ □ □ ■
-Video Q2   ■ ■         ■ □ ■ □
-Video Q3   ■ ■         □ ■ □ ■
-Video Q4   ■ ■         ■ ■ □ □
-Video Q5   ■ ■         □ □ ■ ■
-```
-
-**`dense_query_full=True`（FastH3 稠密 query 规则）**
-
-```text
-           Dense KV    Video KV
-           0 1         2 3 4 5
-Dense Q0   ■ ■         ■ ■ ■ ■
-Dense Q1   ■ ■         ■ ■ ■ ■
-Video Q2   ■ ■         ■ □ ■ □
-Video Q3   ■ ■         □ ■ □ ■
-Video Q4   ■ ■         ■ ■ □ □
-Video Q5   ■ ■         □ □ ■ ■
-```
-
-对于含数值稀疏度的样本，coarse attention 覆盖**所有 segment** 的 BF16 池化 block，
-为每个 token 生成 `fine + gate * coarse[its_block]`。
-如果样本的所有 segment 都是 `sparsity=None`，则通过 **BSA 执行完整注意力**，
-不使用 coarse 分支。前面独立图像的处理方式就是如此；
-VSA 样本内部的稠密图像仍会参与 coarse。
+Fine attention 传输**整个带 padding 的 K/V 分片**，即使只选择了某个 peer 的少数 block。
+稀疏度减少计算量，不会减少这些字节；池化 K/V 仍需全局 gather，Ring 越大跳数越多。
+不完整 block、样本长度、稀疏度和选中的 owner 都会影响负载均衡与重叠。
+应对两种策略比较完整工作负载的延迟；block 数均衡或 trace 中可见 P2P 重叠，
+都不能单独保证吞吐提升。
 
 ## 性能
 
@@ -818,7 +683,7 @@ MFU 再将该值除以稠密 BF16 峰值（`--peak-tflops`）。各阶段的中�
 和保留计算图后的再次反向检查，`--output` 接受 JSON 文件或目录。
 `vsa-perf/v4` JSON 使用 `<case>-h<heads>` 作为 key；每个 case 记录检查结果、
 全局有效 FLOPs，以及单 GPU 吞吐/MFU。
-Ring 的计时样本先跨 rank 归约，再汇总。Ring 默认使用 H=2，且不生成 trace；
+Ring 计时先取每次 replay 的各 rank 最大延迟，再汇总。Ring 默认使用 H=2，且不生成 trace；
 添加 `--profile` 可为每个 rank 保存一份 trace。
 比较性能时，在两种模式中显式使用相同的 `--seed`：
 普通 VSA 的默认值为 2026，Ring 为 937。
@@ -872,7 +737,7 @@ QKV/输出投影、Ulysses、MoE 和优化器工作不属于此 benchmark 的范
 | 文本 | 每个样本 2048 个 token |
 | 全局打包 token 数 | 961696：视频/文本 956048，图像/文本 5648 |
 | Ring size / head 数 / head 维度 | `4 / 1 / 128` |
-| 轮转分配时 rank 0/1/2/3 的紧凑 token 数 | `240436 / 240420 / 240420 / 240420` |
+| 循环分配时 rank 0/1/2/3 的紧凑 token 数 | `240436 / 240420 / 240420 / 240420` |
 | 连续分配时 rank 0/1/2/3 的紧凑 token 数 | `243904 / 242880 / 242832 / 232080` |
 | 输入顺序 / 精度 | 紧凑 block 顺序 / BF16 |
 
@@ -907,19 +772,23 @@ Ring 命令写出 `perf-group0.json` 和
 JSON 记录 `ring_partition`、阶段延迟、TFLOP/s/GPU 和 MFU。
 输入是使用指定 seed 生成的随机张量；几何形状一致并不代表复现了某个模型层的路由决策。
 
+#### 循环分配与连续分配
+
 两种支持的归属策略在另一次分配的四张 GB200 上比较，执行顺序为
-轮转 / 连续 / 连续 / 轮转。每次运行预热 10 次，计时 graph replay 50 次；
+循环 / 连续 / 连续 / 循环。每次运行预热 10 次，计时 graph replay 50 次；
 每次 replay 使用各 rank 的最大延迟，表中值为两次运行中位数的中位数。
 所有参考实现对比和 graph 检查均通过。
 
 | Ring4 归属策略 | 前向 ms | 反向 ms | 前向+反向 ms | 前向+反向 TFLOP/s/GPU | 前向+反向 MFU |
 |---|---:|---:|---:|---:|---:|
 | 连续 | 16.090 | 51.370 | 66.661 | 477.54 | 19.10% |
-| 轮转 | 16.186 | 51.691 | 67.197 | 473.73 | 18.95% |
+| 循环 | 16.186 | 51.691 | 67.197 | 473.73 | 18.95% |
 
 总时间 0.8% 的差异适用于这些随机输入。
 实际模型的路由可能将选中的 KV block 集中到某个 peer，因此也应在模型中测试两种策略。
 此次节点分配没有重测普通 VSA；下面相同条件下的普通/Ring 对比是另一次独立测量。
+
+#### 普通 VSA 与 Ring4
 
 以下结果在一次分配的四张 GB200 上测得，使用上述软件环境。
 普通 VSA 在一张 GPU 上运行完整序列，不使用进程组；
@@ -989,21 +858,53 @@ torchrun --standalone --nproc-per-node=8 --module benchmark.perf_vsa --ring \
   --ring-size 2 --cases fine_only_peer --check-only
 ```
 
-Ring 输入默认为 block 顺序，不接受 raster 顺序。
-默认 Ring case 是 `ragged`、`single64k` 和 `thd64k`。
-每个选中的 case 至少需要 R 个全局 block；不足时会报错，不会创建空 rank。
-小规模 case `partial_blocks`、`fine_only_peer` 和 `dense` 分别包含三个、两个和六个 block。
-多节点运行时，将 `--standalone` 替换为常规 torchrun rendezvous 参数。
-每个 JSON 结果都记录数值/graph 检查和源码 hash。
-分布式计时取每次 replay 的各 rank 最大延迟；单 GPU MFU 用全局有效注意力 GEMM FLOPs
-除以该时间、R 及稠密 BF16 GPU 峰值的乘积。
-使用 `thd720p44s` 进行前述长序列 profile。
+Ring 测试使用 block 输入。默认 case 为 `ragged`、`single64k` 和 `thd64k`；
+每个 case 至少需要 R 个全局 block。小规模 case `partial_blocks`、
+`fine_only_peer` 和 `dense` 分别包含 3、2 和 6 个 block。
+多节点运行时，将 `--standalone` 替换为 torchrun rendezvous 参数。
+JSON 记录数值/graph 检查和源码 hash；计时与 MFU 遵循**性能**一节的定义。
+长序列 profile 使用 `thd720p44s`。
 
 严格的 BF16 `fine_only_peer` case 仍有未解决的数值失败：
 六 token、仅使用 fine 分支的样本，其 dQ 和 dK 相对原生参考实现的相似度
 可能低于 0.99999 阈值。上面的命令会报告此失败；case 和阈值保持不变。
 
-[MIT 许可证](LICENSE)。
+## 代码结构
+
+| 文件 | 职责 |
+| --- | --- |
+| `vsa.py` | 公共注意力入口，以及显式的 block/raster 重排辅助函数 |
+| `vsa_core.py` | 路由、cuDNN BSA/FA4 调用、单设备执行，以及 Ring 通信和 autograd |
+| `vsa_layout.py` | 静态样本/block 几何信息、行映射、路由模板和 coarse 边界 |
+| `vsa_kernels.py` | 融合 token 重排、slot gather、Q/K/V padding、FP32 pooling 和门控合并 kernel |
+
+两种输入顺序共享 core 中的注意力数学计算、各 region 的预算，以及先 fine 后 coarse 的调度。
+Core 不导入公共入口。
+
+<details>
+<summary>Layout 映射与重排梯度</summary>
+
+`layout.input_rows` 将输入行映射到全局 raster 行（完整 raster layout 为恒等映射）。
+`tokens`、`blocks` 和 row/slot 映射描述本地输入；
+`groups`、`sample_slices` 和 `sample_lengths` 描述全局样本。
+`slot_row` 将每块 64 个 slot 映射到输入行（`-1` 表示 padding），
+`row_slot` 是有效行上的逆映射。Padding 填零，不参与均值和 attention。
+
+Block 输入使用融合 Q/K/V padding 和梯度恢复。只有在 `tokens == blocks * 64`、
+没有不完整/dummy block 时，`slots_are_input` 才跳过转换。
+Raster 输入始终经过 raster-to-slot 路径。重排的反向将梯度 scatter 到原始 raster 形状；
+Ring 未拥有的行梯度为零，不执行跨 rank 梯度归约。
+完整 layout 的逆变换恢复 raster 顺序；Ring 输出的聚合与重建由调用方负责。
+
+`layout.ring` 保存进程组/选项、rank/size、全局 token 数、block 归属、
+peer 大小和 all-gather 排列。容量为 C 时，
+`p = layout.ring.global_to_gather[b]` 给出 `owner = p // C` 和
+`local_block = p % C`。`layout.ring.block_ids` 列出本地 block 的全局 ID，
+dummy block 用 `-1` 表示。所有 rank 根据几何形状生成这些映射，无需通信。
+Coarse Q 边界是本地的，KV 边界覆盖全局样本；
+完整 layout 共享 Q/KV 边界和 block-ID 张量。
+
+</details>
 
 ## 致谢
 
@@ -1011,3 +912,5 @@ Ring 输入默认为 block 顺序，不接受 raster 顺序。
 提供 VSA 参考实现和语义，以及
 [NVIDIA cuDNN BSA](https://github.com/NVIDIA/cudnn-frontend/blob/v1.28.0/python/cudnn/block_sparse_attention/_interface.py)
 提供本实现使用的核心块稀疏注意力 kernel。
+
+[MIT 许可证](LICENSE)。

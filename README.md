@@ -46,13 +46,12 @@ out = vsa_attention(q, k, v, gate, layout)
 out.backward(torch.randn_like(out))
 ```
 
-Each inner list is one joint sample; different samples cannot attend to each
-other. With the default raster order, inputs follow the sample and segment
-order in `samples`. Each sample contains at least one video, with optional
-additional video/image, text, audio
-or keyframe segments. Video sizes are `(F, H, W)` token grids in raster order;
-`F=1` is an image. Other segment kinds take token counts and use `sparsity=None`.
-Reuse the layout across layers with the same geometry and settings.
+Each inner list is an independent sample; attention never crosses samples.
+Inputs follow the declared sample/segment order, with video in FHW raster order.
+Each sample needs at least one video: `(F, H, W)` gives its token grid, and
+`F=1` denotes an image. Text, audio and keyframe segments use token counts and
+`sparsity=None`; additional video/image segments are allowed. Reuse layouts
+across layers with the same geometry and settings.
 
 Add this directory to `PYTHONPATH`, or copy `vsa.py`, `vsa_core.py`,
 `vsa_layout.py` and `vsa_kernels.py` into your project and adjust imports.
@@ -74,29 +73,45 @@ restores the output to the same raster order. No preprocessing is required.
 
 ### Block input
 
-`input_order="block"` describes the tokens that `vsa_attention` expects;
-setting the flag does not reorder a tensor. The global block order is:
+Reorder the input **once before the layer stack**, then keep block order across
+layers. Setting `input_order="block"` declares the expected order; it does not
+reorder data. Given global raster tokens and their original position IDs:
 
-1. Keep samples in their declared order.
-2. Within each sample, put `sparsity=None` segments first, then numeric-sparsity
-   video segments. Preserve declared segment order within each category.
-   A dense image/video belongs to the first category; numeric `sparsity=0`
-   still belongs to the second.
-3. Split each None-sparsity segment into consecutive chunks of at most 64
-   tokens. For numeric-sparsity video, visit 4×4×4 tile origins in F/H/W order
-   (W changes fastest), then valid tokens within each tile in the same order.
-   Clip edge tiles to the actual dimensions; concatenate their valid tokens
-   without gaps. Blocks never cross segment or sample boundaries.
+```python
+from vsa import to_block_order, to_raster_order
 
-A Ring input keeps only this rank's owned blocks, in increasing global block-ID
-order. Within each block, token order is unchanged. `layout.input_rows[i]`
-maps supplied row `i` to the original **global raster** row; a full raster
-layout has an identity map. Q/K/V, gate, position IDs and dO must all follow
-the supplied order. Outputs and input gradients preserve it.
+layout = build_vsa_layout(samples, head_num=H, input_order="block", device="cuda")
+tokens_block = to_block_order(tokens_global, vsa_layout=layout)
+position_ids_block = to_block_order(position_ids_global, vsa_layout=layout)
+# Run the layers in block order, then restore once if raster output is needed:
+# out_raster = to_raster_order(out_block, vsa_layout=layout)
+```
 
-For example, declare `video=(1, 2, 5), sparsity=0.9`, followed by three text
-tokens. Number the original raster rows `0..12`: video rows are `0..9`, and
-text rows are `10..12`. The compact block stream is:
+`to_block_order` accepts one contiguous CUDA `[T_global, ...]` tensor and
+returns `[layout.tokens, ...]`, preserving dtype and trailing dimensions.
+Its fused gather adds **no padding**. Use the same mapping for positions,
+targets and masks; Q/K/V/gate and gradients follow the resulting token order.
+Already block-ordered inputs skip this conversion.
+
+A full layout reorders all tokens; a Ring layout also selects the owned blocks.
+Both helpers require a layout with `input_order="block"`, even though
+`to_block_order` reads raster input. `to_raster_order` accepts only full layouts;
+Ring output gathering belongs to the caller.
+
+<details>
+<summary>Exact block order and a small example</summary>
+
+1. Keep sample order. Within each sample, place `sparsity=None` segments first,
+   then numeric-sparsity videos, preserving segment order within each category.
+2. Split None-sparsity segments into consecutive chunks of at most 64 tokens.
+   Split numeric-sparsity videos into 4×4×4 tiles, visiting tile origins and
+   valid tokens in F/H/W order (W fastest). Clip edge tiles without padding.
+3. Blocks never cross segment or sample boundaries. Numeric `sparsity=0`
+   still uses tiles; `sparsity=None` uses dense chunks. Ring keeps owned blocks
+   in increasing global block-ID order, preserving order within each block.
+
+For `video=(1, 2, 5), sparsity=0.9` followed by three text tokens, raster rows
+`0..9` are video and `10..12` are text. The block stream is:
 
 | Block | Original raster rows, in supplied order | Valid tokens |
 | --- | --- | ---: |
@@ -104,72 +119,69 @@ text rows are `10..12`. The compact block stream is:
 | b1: first video tile | `0, 1, 2, 3, 5, 6, 7, 8` | 8 |
 | b2: edge video tile | `4, 9` | 2 |
 
-For a full layout, the input has 13 rows and attention allocates 3×64 slots.
-With `sparsity=None` on that video, both segments are dense: video stays before
-text, giving blocks of 10 and 3 tokens in the original raster order.
-
-For raster data, call `to_block_order` once before the entire VSA stack.
-This repository provides the fused reorder kernel separately from
-`vsa_attention`: it gathers rows from one token tensor in one kernel launch,
-preserving dtype and trailing dimensions and adding **no padding**. Inputs
-already in block order go directly to attention. Keep that order across layers.
-
-`to_block_order(x, vsa_layout=layout)` accepts one contiguous CUDA
-`[T_global, ...]` raster tensor. A full layout returns all rows in block order;
-a Ring layout selects and reorders only this rank's rows, returning
-`[layout.tokens, ...]`. Full layouts preserve the first dimension; Ring layouts
-use the local valid-token count. In both cases the result equals
+The input has 13 rows; attention internally allocates 3×64 slots. Changing
+this video's sparsity to `None` preserves video-before-text order and creates
+blocks of 10 and 3 tokens. `layout.input_rows` maps each supplied row back to
+its global raster row; `to_block_order(x, vsa_layout=layout)` equals
 `x[layout.input_rows]` by value.
-The inverse `to_raster_order(x, vsa_layout=layout)` requires a **full** layout.
-Both helpers require `input_order="block"`: the layout describes the target
-block order even when `x` enters in raster order.
-Call the forward helper at the stack's input boundary and the inverse helper
-at its output boundary if raster output is needed. Subsequent token-wise
-projections produce Q/K/V/gate in block order directly. Positional coordinates
-must follow the same order; callers can generate them in block order or
-convert their coordinate tensor separately.
 
-```python
-import torch
-from vsa import to_block_order, to_raster_order, vsa_attention
-from vsa_layout import Segment, build_vsa_layout
+</details>
 
-H, D, C = 2, 128, 256
-layout = build_vsa_layout(
-    [[Segment("video", (5, 9, 11), sparsity=0.9), Segment("text", 67)]],
-    head_num=H, input_order="block", device="cuda",
-)
-tokens_raster = torch.randn(layout.tokens, C, device="cuda", dtype=torch.bfloat16,
-                            requires_grad=True)
-projection = torch.nn.Linear(C, 4 * H * D, device="cuda", dtype=torch.bfloat16)
+## Attention semantics
 
-# One reorder at the input boundary, before the layers' projections.
-tokens_block = to_block_order(tokens_raster, vsa_layout=layout)
-assert tokens_block.shape == tokens_raster.shape  # Full layout: 562 valid tokens.
+`sparsity` is a video segment's **KV-block drop fraction**. By default, every
+query block and head independently selects top-k blocks from **each** video KV
+region, including cross-video attention:
 
-# One example VSA layer; intermediate layers retain block order.
-projected = projection(tokens_block).view(layout.tokens, 4, H, D)
-q, k, v, gate = (x.contiguous() for x in projected.unbind(1))
-out = vsa_attention(q, k, v, gate, layout)
-
-# Restore once at the output boundary if raster output is required.
-out_raster = to_raster_order(out, vsa_layout=layout)
-out_raster.backward(torch.randn_like(out_raster))
+```text
+k = max(1, ceil((1 - sparsity) * video_region_blocks))
 ```
 
-For this full layout, backward applies the inverse permutation, and
-`to_raster_order` restores the original sample/segment/FHW order after the
-stack. For a Ring layout, backward scatters to the global raster shape with
-zeros at unowned rows; it performs no cross-rank reduction. Restoring a full
-Ring output requires caller-owned communication; `to_raster_order` accepts
-only full layouts.
+The KV segment sets the budget; Q/K determines the selected blocks.
+`sparsity=None` makes a region dense: its KV blocks are always visible, with
+padding only. Numeric sparsity uses 4×4×4 video tiles; `0` keeps all those blocks.
 
-Internally, blocks occupy 64 slots: `slot_row` maps slots to input rows, using
-`-1` for padding, and `row_slot` is the inverse map for valid rows. Block inputs
-use fused Q/K/V padding and fused dQ/dK/dV restoration; padding is zero and
-excluded from means and attention. `slots_are_input` skips conversion only
-for block inputs with `tokens == blocks * 64`, with no partial or dummy blocks.
-Raster inputs use the raster-to-slot path even when all blocks are full.
+[FastH3](https://github.com/hao-ai-lab/FastVideo/blob/d5253fd71055927f12aa6c4aa679b93a00238851/fastvideo/attention/backends/video_sparse_attn_h3.py#L27-L31)
+adds a query-side exception: dense queries see **all** KV blocks.
+`dense_query_full=True` enables that exception; the default `False` applies
+video KV sparsity to every query. Dense queries come from `sparsity=None` regions.
+
+Example fine masks for one sample/head at sparsity 0.5. Both axes follow the
+internal block order: **None-sparsity segments first, numeric-sparsity video
+segments second**. `■` visible; `□` masked.
+Top-k selections are illustrative.
+
+**`dense_query_full=False` (default)**
+
+```text
+           Dense KV    Video KV
+           0 1         2 3 4 5
+Dense Q0   ■ ■         □ ■ ■ □
+Dense Q1   ■ ■         ■ □ □ ■
+Video Q2   ■ ■         ■ □ ■ □
+Video Q3   ■ ■         □ ■ □ ■
+Video Q4   ■ ■         ■ ■ □ □
+Video Q5   ■ ■         □ □ ■ ■
+```
+
+**`dense_query_full=True` (FastH3 dense-query rule)**
+
+```text
+           Dense KV    Video KV
+           0 1         2 3 4 5
+Dense Q0   ■ ■         ■ ■ ■ ■
+Dense Q1   ■ ■         ■ ■ ■ ■
+Video Q2   ■ ■         ■ □ ■ □
+Video Q3   ■ ■         □ ■ □ ■
+Video Q4   ■ ■         ■ ■ □ □
+Video Q5   ■ ■         □ □ ■ ■
+```
+
+For samples with numeric sparsity, coarse attention covers BF16-pooled blocks
+from **all segments**, producing `fine + gate * coarse[its_block]` per token.
+A sample whose segments all have `sparsity=None` uses **full attention through
+BSA**, with no coarse branch. This is how the independent images above are
+handled; a dense image inside a VSA sample still participates in coarse.
 
 ## Examples with and without context parallelism
 
@@ -226,13 +238,14 @@ torchrun --standalone --nproc-per-node=8 demo_cp.py \
 
 ### Shared example
 
-The example uses PyTorch's differentiable All-to-All. Ulysses, projections,
-loss normalization and parameter-gradient reduction belong to the caller;
-they are not new `cudnn_vsa` APIs. Here every rank starts with the same full
-raster pack and replicated weights. Data loading can instead supply the final
-local rows directly. The explicit reorder below materializes one Ring shard
-per Ulysses rank for readability; a caller can combine its row map with the
-Ulysses slice to gather only the final local rows.
+This example uses PyTorch's differentiable All-to-All, replicated weights and
+the same full raster pack on every rank. Ulysses, projections, loss normalization
+and gradient reduction are caller code. For clarity, it materializes a Ring
+shard before the Ulysses slice; data loading can gather the final local rows
+directly by composing those maps.
+
+<details>
+<summary>Complete Python example: demo_cp.py</summary>
 
 ```python
 import argparse
@@ -369,6 +382,8 @@ if world > 1:
     dist.destroy_process_group()
 ```
 
+</details>
+
 For the example, each layer projects `[A, 1024]` into Q/K/V/gate with shape
 `[A, 8, 128]`. After Ulysses exchange and removal of transport padding, each
 has shape `[layout.tokens, 8/U, 128]`; the inverse exchange and output
@@ -379,130 +394,67 @@ renumbering the local shard. Final global output gathering is caller-owned.
 When using a training framework's parameter-gradient reduction, use that
 instead of the example's manual reduction, so gradients are not reduced twice.
 
-## Code structure
-
-| File | Responsibility |
-| --- | --- |
-| `vsa.py` | Public attention entry and explicit block/raster reorder helpers |
-| `vsa_core.py` | Routing, cuDNN BSA/FA4 calls, single-device execution and ring communication/autograd |
-| `vsa_layout.py` | Static sample/block geometry, row maps, routing templates and coarse boundaries |
-| `vsa_kernels.py` | Fused token reordering, slot gathers, Q/K/V padding, FP32 pooling and gated merge kernels |
-
-Both input orders share the core's attention math, per-region budgets and
-fine-before-coarse schedule. The core does not import the public entry.
-
 ## Ring context parallelism
 
-Ordinary VSA and Ring use the same forward API:
+Pass an existing Ring process group to the same layout builder and attention API:
 
 ```python
 layout = build_vsa_layout(
-    samples, head_num=H, input_order="block", device=device,
-    ring_cp_group=group,  # Existing caller-owned group; None selects ordinary VSA.
-    ring_partition="cyclic",  # Default; "contiguous" is also supported.
+    samples, head_num=H, input_order="block", device="cuda",
+    ring_cp_group=group, ring_partition="cyclic",  # Or "contiguous".
 )
+# Global raster inputs -> this Ring rank's compact block stream, once per pack.
+tokens_local = to_block_order(tokens_global, vsa_layout=layout)
+position_ids_local = to_block_order(position_ids_global, vsa_layout=layout)
+# After token-wise projection and any caller-owned Ulysses exchange:
 out = vsa_attention(q, k, v, gate, layout)
 ```
 
-`build_vsa_layout` returns `VSALayout` in both modes. `ring_cp_group=None`
-builds a full layout (`layout.ring is None`) without distributed initialization,
-including on CPU. A member process group builds a local Ring shard, including
-size-one groups, and requires `input_order="block"`. Rank and size come from
-the supplied group; nonmember handles are rejected.
+Here `H` is the head count seen by VSA (`H_total // U` with Ulysses).
+`ring_cp_group=None` creates a full `VSALayout` (`layout.ring is None`),
+without distributed initialization, including on CPU. A member group creates
+a local Ring layout and supplies its rank and size. Nonmember handles are
+rejected; even a size-one group requires block input.
 
-All group ranks supply identical global sample geometry and head counts.
-Create groups once during parallel initialization and share them across
-micro-batch layouts; layers reuse each layout. VSA borrows group handles and
-never creates or destroys them. Forward and backward share `ring_cp_group`
-by default. Optional `ring_cp_bwd_group` must have identical members and rank
-order. Groups and transport options are bound at construction; keep the groups
-alive through backward and CUDA Graph replay. See **Forward communication
-overlap** for stream-priority configuration.
+Create groups once, share them across micro-batch layouts, and reuse each
+layout across layers. All group members must supply the same global sample
+geometry, head count and partition policy. VSA borrows the groups; keep them
+alive through backward and CUDA Graph replay. Forward and backward share
+`ring_cp_group` unless `ring_cp_bwd_group` supplies a group with identical
+members and rank order.
 
-Full layouts and Ring shards share slot maps, routing templates and coarse
-metadata. `tokens`, `blocks` and row/slot maps describe local input;
-`groups`, `sample_slices` and `sample_lengths` describe global samples.
-`layout.ring` holds the bound groups, local rank/size, global token count,
-block ownership, peer lengths and all-gather permutation. Coarse Q boundaries
-are local; KV boundaries cover the corresponding global samples. Full layouts
-share their Q/KV boundary and block-ID tensors.
+### Block ownership
 
-### Compact input and block ownership
+Ring input contains only valid tokens from owned blocks, in increasing global
+block-ID order. `to_block_order` fuses selection and reordering without a full
+block-ordered intermediate or communication. Already-local block input skips
+it. For globally block-ordered data, distribute owned blocks directly instead
+of applying the raster conversion again.
 
-Ring layouts require `input_order="block"`, including size-one groups. Each
-rank supplies only its valid local tokens in increasing owned-block order,
-without padding. Keep Q/K/V/gate, position coordinates and gradients in that
-same order; outputs preserve it. Reuse the layout across layers.
-
-Plan blocks in the order described in **Input order**, numbering them across
-packed samples. `ring_partition` selects their ownership independently of
-`input_order`, and is recorded as `layout.ring.partition`:
+`ring_partition` chooses ownership independently of `input_order`; the choice
+is stored in `layout.ring.partition`:
 
 | `ring_partition` | Global block ownership |
 | --- | --- |
 | `"cyclic"` (default) | Block `b` belongs to rank `b % R`; global numbering continues across samples |
 | `"contiguous"` | Each sample contributes at most one consecutive block interval to each rank |
 
-Cyclic ownership spreads neighboring Q/KV blocks across ranks, which can reduce
-per-peer sparse-work concentration. Neither policy guarantees balanced dynamic
-top-k work. Both share the same routing, attention and communication kernels.
-All group ranks must select the same policy. Rebuild the layout and reshard the
-input when changing it; do not reinterpret an existing local tensor.
+For contiguous ownership, start at rank 0. For each sample's N blocks, compute
+`base, extra = divmod(N, R)`: visiting ranks cyclically from the current start,
+assign `base + 1` consecutive blocks to the first `extra` ranks and `base` to
+the rest. Advance the start by `extra` modulo R, so the next sample begins at
+the first rank that received fewer blocks. If `extra=0`, keep the start.
 
-For contiguous ownership, start the first sample at rank 0. For N blocks,
-compute `base, extra = divmod(N, R)` and visit ranks cyclically from the
-current start. The first `extra` ranks receive `base + 1` consecutive blocks;
-the others receive `base`. Then advance the start by `extra` modulo R: the
-next sample starts at the first rank that received fewer blocks. If N is
-divisible by R, keep the start unchanged. A rank can receive no blocks from
-an individual sample.
+Both policies balance per-sample and cumulative block counts within one.
+They do not balance valid-token counts or dynamic top-k work. Cyclic ownership
+spreads neighboring blocks across ranks; contiguous ownership makes each
+sample's rank-local interval simple to slice. Both use the same attention
+kernels. Changing policy requires rebuilding the layout and resharding inputs.
 
-This rotation keeps both per-sample and cumulative block counts within one
-block of each other, without searching for the globally least-loaded rank.
-Every rank uses `C = ceil(global_blocks / R)` internal blocks. Valid token
-lengths do not affect ownership; partial blocks can produce unequal token loads.
-Each block stays within one segment and sample; samples remain isolated during
-routing and attention. Neither a sample's token count nor its block count
-needs to be a multiple of R. The total block count must be at least R; smaller
-packs are rejected on every rank. Every rank receives valid input tokens.
-Internal buffers pad partial and dummy blocks to 64 slots.
-
-Ownership is explicit: `p = layout.ring.global_to_gather[b]` maps global block
-`b` to rank-major storage, so `owner = p // C` and `local_block = p % C`.
-`layout.ring.block_ids` lists this rank's global IDs, with `-1` for dummy blocks.
-All ranks derive the same maps from the sample geometry, without communication.
-
-For a Ring shard, `layout.input_rows` maps local compact rows to the original
-global sample/segment/FHW stream. `to_block_order` uses this map to fuse **shard
-selection and reordering**: it reads only owned rows and does not materialize
-an intermediate full block-ordered tensor. If every rank has the full raster
-pack, prepare inputs once before the stack:
-
-```python
-from vsa import to_block_order
-
-layout = build_vsa_layout(
-    samples, head_num=H, input_order="block", device="cuda",
-    ring_cp_group=group,
-)
-# tokens_global: [layout.ring.global_tokens, hidden_size], in sample/segment/FHW order.
-# position_ids_global: [T_global] or [T_global, axes], aligned with those tokens.
-tokens_local = to_block_order(tokens_global, vsa_layout=layout)
-position_ids_local = to_block_order(position_ids_global, vsa_layout=layout)
-# Build local RoPE cos/sin from position_ids_local; reuse across layers with
-# the same RoPE configuration. Preserve each sample's original position values.
-# Use the same helper for aligned target/mask tensors when needed.
-assert tokens_local.shape == (layout.tokens, tokens_global.shape[1])
-# Token-wise projections and all VSA layers now consume the local block order.
-```
-
-The helper adds no padding and performs no communication. Its backward scatters
-into the original global shape, with zero gradients at unowned rows; it does
-not reduce gradients across ranks. Data loading and final output gathering
-remain caller-owned. Already local block-ordered tensors bypass this helper.
-A global block-ordered tensor is not a raster input: distribute whole blocks
-using their ownership maps without applying the FHW conversion again.
-Any Ulysses all-to-all is also caller-owned and must preserve local block order.
+The pack must contain at least R blocks so every Ring rank owns valid data.
+Individual samples need no token/block divisibility by R and may be absent
+from some ranks. Internally every rank has `C = ceil(global_blocks / R)`
+blocks of 64 slots; partial and dummy slots are excluded from the math.
 
 ### Worked example: two samples on three ranks
 
@@ -574,40 +526,25 @@ rank. The following routing example uses the contiguous ownership diagram.
 
 ### Routing and top-k
 
-The routing code follows this sequence:
-
-1. `_build_sample_blocks` in [vsa_layout.py](vsa_layout.py) records a separate
-   budget for each numeric-sparsity video region: `keep = max(1, ceil((1 -
-   sparsity) * region_blocks))`. Dense KV blocks are always included. These
-   budgets and sample boundaries are static; selected video block IDs change
-   with Q/K on each forward call.
-2. `ring_attention_slots` in [vsa_core.py](vsa_core.py) computes local Q/K/V
-   block means in FP32, dividing by valid token counts. Padding is zero and
-   dummy blocks have zero means. Pooled K/V is all-gathered in rank order,
-   then `layout.ring.global_to_gather` restores global block order and removes
-   dummy blocks. Routing uses local Q means and globally ordered K means.
-3. `route` is shared by full and Ring layouts. The layout precomputes each
-   sample's local routing rows and offsets into pooled Q/K; `route` calls
-   `_route_group` for those rows. For each video KV region and head, it forms FP32 scores
-   `Q_mean @ K_mean.T`, with TF32 and autocast disabled, then selects that
-   region's `keep` largest scores independently for every Q block. Routing
-   uses unscaled dot products; attention applies its softmax scale later.
-   Every peer's candidate blocks in that region participate in this one
-   selection. No score or top-k-index collective is needed because each Q
-   block has one owner and the K means are already global.
-4. `topk(..., sorted=False)` chooses region-relative IDs; `selected.sort(-1)`
-   sorts those IDs, and `+ start` converts them to global block IDs. Dense
-   keys and fully retained regions come from the layout's template. With
-   `dense_query_full=True`, dense Q rows keep their full-sample template and
-   skip top-k; sparse video Q rows keep their regional budgets. Layouts with
-   no dynamic selections reuse the template directly. Routing runs under
-   `no_grad`: gradients flow through the selected fine attention and the
-   coarse branch, not through discrete top-k decisions.
-5. `partition_indices` in [vsa_kernels.py](vsa_kernels.py) groups selected IDs
-   using the same `global_to_gather` map as pooled K/V. With capacity C, mapped
-   position `p` gives `owner = p // C` and `local_block = p % C`. It records
-   each peer's valid count. A peer may contribute zero selected keys. These
-   per-peer lists drive fine attention as K/V shards arrive.
+1. [vsa_layout.py](vsa_layout.py)'s `_build_sample_blocks` fixes sample boundaries
+   and each video's `keep = max(1, ceil((1 - sparsity) * region_blocks))` budget.
+   Selected IDs change with Q/K on every forward; dense KV is always included.
+2. [vsa_core.py](vsa_core.py)'s `ring_attention_slots` pools local Q/K/V in FP32
+   using valid token counts; dummy means are zero. K/V summaries are all-gathered
+   in rank order, then `global_to_gather` restores global block order and removes
+   dummies. Local Q means now see all candidate K means in their own sample.
+3. The shared `route` / `_route_group` computes unscaled FP32 `Q_mean @ K_mean.T`
+   with TF32/autocast disabled. Each Q block/head selects top-k independently
+   within each video region, across all peers. `topk(..., sorted=False)` returns
+   relative IDs; `selected.sort(-1)` and `+ start` produce sorted global IDs.
+   Dense KV and fully retained regions use static templates; exempt dense Q
+   rows (`dense_query_full=True`) skip top-k. No dynamic selections means the
+   template is reused directly. Routing runs under `no_grad`; gradients pass
+   through fine/coarse attention, not discrete selection. Global K means avoid
+   any extra score/index collective. Attention applies softmax scaling later.
+4. [vsa_kernels.py](vsa_kernels.py)'s `partition_indices` maps selected global IDs
+   to each owner's local block IDs and valid counts, using `global_to_gather`.
+   A peer can contribute zero keys. These lists drive fine attention as K/V arrives.
 
 For sample A above, four video blocks at sparsity 0.5 give `keep=2`. Suppose
 one head of query block `b3` has these scores:
@@ -626,17 +563,14 @@ there is no single top-k across all video regions in the pack.
 
 ### Execution
 
-Single-device and ring execution share `block_means`, which returns
-differentiable FP32 Q/K/V means. Single-device execution selects coarse blocks
-and fuses routing detach and coarse dtype conversion in `routing_and_coarse_means`.
-Ring execution pools all local slots, including zero-filled dummy blocks;
-`_GatherMeans` communicates K means in FP32 for routing and V means in BF16
-for coarse attention, packing their raw bytes into one all-gather. This byte
-packing preserves each field's bits without quantizing K. V is cast inside the
-communication autograd boundary; backward combines dK/dV into one FP32
-reduce-scatter SUM and returns FP32 gradients to pooling. Forward pooled K/V
-payload is 25% smaller than sending both in FP32; the forward and backward
-collective counts remain one each. End-to-end latency must still be measured.
+Both modes share differentiable FP32 `block_means`. Single-device execution
+selects coarse blocks and fuses routing detach/coarse casts in
+`routing_and_coarse_means`. Ring pools all local slots, including zero dummies.
+Its `_GatherMeans` packs **FP32 K + BF16 V** as raw bytes in one all-gather,
+without quantizing K. V is cast inside the communication autograd boundary;
+backward combines dK/dV in one **FP32 reduce-scatter SUM**, returning FP32
+pooling gradients. Forward summary traffic is 25% smaller than FP32 K/V;
+collective counts remain one forward and one backward.
 
 For the example above, let `KV_r` be rank r's entire internal K/V shard,
 including its slot padding. Q stays on its original rank throughout fine
@@ -706,13 +640,10 @@ layout = build_vsa_layout(
 out = vsa_attention(q, k, v, gate, layout)
 ```
 
-Forward and backward use the same group by default. To choose a different
-backward NCCL stream priority, create a second group with the same members
-and rank order, then pass it as `ring_cp_bwd_group`. Forward pooled all-gather
-and fine KV P2P use `ring_cp_group`; backward fine P2P and pooled-gradient
-reduce-scatter use `ring_cp_bwd_group`. VSA borrows the handles; the caller
-owns creation and destruction and keeps them alive through backward and
-CUDA Graph replay.
+`ring_cp_group` carries forward pooled all-gather and fine P2P;
+`ring_cp_bwd_group` carries backward P2P and pooled-gradient reduce-scatter.
+The groups default to the same handle. For different backward priority, create
+a second group with identical membership and rank order.
 
 Enqueuing P2P before BSA does not guarantee that its GPU kernel starts first.
 BSA and NCCL can compete for SM resources, including shared memory. With
@@ -740,95 +671,25 @@ own data dependencies.
 
 ### Why this design
 
-- **Keep the sparse-attention unit intact.** Pooling, routing and cuDNN BSA
-  operate on whole blocks. A contiguous FHW sequence shard can split one
-  4×4×4 tile across ranks. Ordering and distributing whole blocks once at the
-  dataset/model boundary gives every block a single owner; subsequent layers
-  can pool and project local tokens directly. Compact input also keeps slot
-  padding out of the surrounding projections and MLPs.
-- **Keep each sample's local blocks contiguous.** Assigning a single interval
-  per sample/rank preserves local block order and simplifies the dataset's
-  slicing. Divide by block count and rotate the extra-block recipients across
-  samples. This balances cumulative block counts with a single carried start
-  rank, independent of partial-block lengths. Layout construction computes one
-  ownership map, reused by pooled gather, routing and every VSA layer.
-- **Keep global routing information small.** Local Q blocks need pooled K
-  from candidate blocks across the full sample to preserve the per-region
-  top-k budgets. Coarse attention also needs pooled K/V. Gathering one summary
-  per block provides that view, while fine attention streams token-level K/V
-  through two receive/compute buffers instead of storing all peers' full K/V
-  at once. Q, output accumulation and dQ stay local.
-- **Keep communication shapes predictable.** Equal internal slot capacities
-  make P2P transfers match and support CUDA Graph reuse. Valid sizes and
-  routing counts exclude partial/dummy slots from the math. Sample boundaries
-  remain explicit metadata even when one rank holds blocks from several
-  samples. Ranks with only fine-attention queries still participate in the
-  pooled-gradient collective when other samples use coarse attention.
+- **Whole-block ownership** keeps each pooling/routing/BSA unit on one Ring
+  rank. Compact inputs avoid sending attention-slot padding through projections
+  and MLPs; reordering happens once at the model boundary.
+- **Two ownership policies** support different workloads. Cyclic spreads
+  neighboring blocks; contiguous gives each sample/rank one interval and rotates
+  remainder recipients. Both compute ownership once and reuse the maps in all layers.
+- **Global block summaries** let local Q choose top-k over the full sample and
+  compute coarse attention. Fine attention circulates token-level K/V through
+  two receive/compute buffers; Q, output accumulation and dQ stay local.
+- **Equal internal capacities** give matching P2P shapes and support CUDA Graph
+  reuse. Valid sizes and explicit sample boundaries exclude padding and prevent
+  cross-sample attention, including when fine-only and coarse samples share ranks.
 
-The tradeoff is that fine attention circulates **whole padded K/V shards**,
-even when routing selects few blocks from a peer. Sparsity reduces attention
-work but does not proportionally reduce these transferred bytes. Pooled K/V
-is still gathered globally, and additional ranks add communication steps.
-Balancing block counts does not guarantee equal valid token totals or attention
-work: partial blocks, sample lengths, sparsity and selected KV owners also
-affect compute and overlap. Benchmark the complete workload when changing its
-distribution policy.
-
-## Attention semantics
-
-`sparsity` is a video segment's **KV-block drop fraction**. By default, every
-query block and head independently selects top-k blocks from **each** video KV
-region, including cross-video attention:
-
-```text
-k = max(1, ceil((1 - sparsity) * video_region_blocks))
-```
-
-The KV segment sets the budget; Q/K determines the selected blocks.
-`sparsity=None` makes a region dense: its KV blocks are always visible, with
-padding only. Numeric sparsity uses 4×4×4 video tiles; `0` keeps all those blocks.
-
-[FastH3](https://github.com/hao-ai-lab/FastVideo/blob/d5253fd71055927f12aa6c4aa679b93a00238851/fastvideo/attention/backends/video_sparse_attn_h3.py#L27-L31)
-adds a query-side exception: dense queries see **all** KV blocks.
-`dense_query_full=True` enables that exception; the default `False` applies
-video KV sparsity to every query. Dense queries come from `sparsity=None` regions.
-
-Example fine masks for one sample/head at sparsity 0.5. Both axes follow the
-internal block order: **None-sparsity segments first, numeric-sparsity video
-segments second**. `■` visible; `□` masked.
-Top-k selections are illustrative.
-
-**`dense_query_full=False` (default)**
-
-```text
-           Dense KV    Video KV
-           0 1         2 3 4 5
-Dense Q0   ■ ■         □ ■ ■ □
-Dense Q1   ■ ■         ■ □ □ ■
-Video Q2   ■ ■         ■ □ ■ □
-Video Q3   ■ ■         □ ■ □ ■
-Video Q4   ■ ■         ■ ■ □ □
-Video Q5   ■ ■         □ □ ■ ■
-```
-
-**`dense_query_full=True` (FastH3 dense-query rule)**
-
-```text
-           Dense KV    Video KV
-           0 1         2 3 4 5
-Dense Q0   ■ ■         ■ ■ ■ ■
-Dense Q1   ■ ■         ■ ■ ■ ■
-Video Q2   ■ ■         ■ □ ■ □
-Video Q3   ■ ■         □ ■ □ ■
-Video Q4   ■ ■         ■ ■ □ □
-Video Q5   ■ ■         □ □ ■ ■
-```
-
-For samples with numeric sparsity, coarse attention covers BF16-pooled blocks
-from **all segments**, producing `fine + gate * coarse[its_block]` per token.
-A sample whose segments all have `sparsity=None` uses **full attention through
-BSA**, with no coarse branch. This is how the independent images above are
-handled; a dense image inside a VSA sample still participates in coarse.
+Fine attention sends **whole padded K/V shards**, even when few blocks from a
+peer are selected. Sparsity reduces compute, not these bytes; pooled K/V still
+requires a global gather, and larger rings add hops. Partial blocks, sample
+lengths, sparsity and selected owners affect load balance and overlap.
+Compare full-workload latency for both policies; balanced block counts and
+visible P2P overlap alone do not guarantee better throughput.
 
 ## Performance
 
@@ -846,8 +707,8 @@ Both modes share input generation, numerical checks, graph capture and timing.
 `--cases` selects workloads, `--heads` selects head counts, `--check-only` runs
 reference and retained-backward checks, and `--output` accepts a JSON file or
 directory. The `vsa-perf/v4` JSON uses `<case>-h<heads>` keys; each case records
-checks, global useful FLOPs and per-GPU throughput/MFU. Ring timing samples are
-reduced across ranks before summarizing. Ring defaults to H=2 and omits traces;
+checks, global useful FLOPs and per-GPU throughput/MFU. Ring timing takes the
+maximum rank latency for each replay before summarizing. Ring defaults to H=2 and omits traces;
 add `--profile` to save a trace per rank.
 Use the same explicit `--seed` in both modes when comparing performance:
 the defaults are 2026 for ordinary VSA and 937 for Ring. Matched seeds,
@@ -939,6 +800,8 @@ timed samples. JSON records `ring_partition`, phase latency, TFLOP/s/GPU and MFU
 Inputs are seeded random tensors; matching geometry does not reproduce a
 particular model layer's routing decisions.
 
+#### Cyclic versus contiguous
+
 The two supported ownership policies were compared in a separate four-GB200
 allocation, in cyclic / contiguous / contiguous / cyclic order. Each run uses
 10 warmups and 50 timed graph replays; values are medians of two run medians,
@@ -953,6 +816,8 @@ The 0.8% total-time difference applies to these random inputs. Actual model
 routing can concentrate selected KV blocks by peer, so benchmark both policies
 in the model as well. This allocation did not repeat ordinary VSA; the matched
 ordinary/Ring comparison below is a separate measurement.
+
+#### Ordinary VSA versus Ring4
 
 Measured in one four-GB200 allocation with the software environment above.
 Ordinary VSA runs the full sequence on one GPU without a process group;
@@ -1027,23 +892,55 @@ torchrun --standalone --nproc-per-node=8 --module benchmark.perf_vsa --ring \
   --ring-size 2 --cases fine_only_peer --check-only
 ```
 
-Ring input defaults to block order and rejects raster order. The default ring
-cases are `ragged`, `single64k` and `thd64k`. Each chosen case must contain at
-least R global blocks; undersized packs raise an error instead of creating
-empty ranks. The small `partial_blocks`, `fine_only_peer` and `dense` cases
-contain three, two and six blocks respectively. For multiple
-nodes, replace `--standalone` with the usual torchrun rendezvous arguments.
-Each JSON result records numerical/graph checks and source hashes. Distributed
-timing takes the maximum latency across ranks for each replay; per-GPU MFU
-divides global valid attention GEMM FLOPs by that time and R times the dense
-BF16 GPU peak. Use `thd720p44s` for the long-sequence profile described above.
+Ring tests use block input. Defaults are `ragged`, `single64k` and `thd64k`;
+each case needs at least R global blocks. The small `partial_blocks`,
+`fine_only_peer` and `dense` cases contain 3, 2 and 6 blocks respectively.
+For multiple nodes, replace `--standalone` with torchrun rendezvous arguments.
+JSON records numerical/graph checks and source hashes; timing and MFU follow
+the definitions in **Performance**. Use `thd720p44s` for the long-sequence profile.
 
 The strict BF16 `fine_only_peer` case has an unresolved numerical failure:
 dQ and dK for a six-token fine-only sample can fall below the 0.99999 native
 reference similarity threshold. The command above reports this failure;
 the case and threshold remain unchanged.
 
-[MIT License](LICENSE).
+## Code structure
+
+| File | Responsibility |
+| --- | --- |
+| `vsa.py` | Public attention entry and explicit block/raster reorder helpers |
+| `vsa_core.py` | Routing, cuDNN BSA/FA4 calls, single-device execution and ring communication/autograd |
+| `vsa_layout.py` | Static sample/block geometry, row maps, routing templates and coarse boundaries |
+| `vsa_kernels.py` | Fused token reordering, slot gathers, Q/K/V padding, FP32 pooling and gated merge kernels |
+
+Both input orders share the core's attention math, per-region budgets and
+fine-before-coarse schedule. The core does not import the public entry.
+
+<details>
+<summary>Layout maps and reorder gradients</summary>
+
+`layout.input_rows` maps supplied rows to global raster rows (identity for a
+full raster layout). `tokens`, `blocks` and row/slot maps are local;
+`groups`, `sample_slices` and `sample_lengths` describe global samples.
+`slot_row` maps 64-token slots to input rows (`-1` for padding), and `row_slot`
+is the inverse on valid rows. Padding is zero and excluded from means and attention.
+
+Block input uses fused Q/K/V padding and gradient restoration. `slots_are_input`
+skips conversion only when `tokens == blocks * 64`, with no partial/dummy blocks.
+Raster input always uses the raster-to-slot path. Reorder backward scatters to
+the original raster shape; Ring leaves unowned rows zero and performs no
+cross-rank gradient reduction. A full layout's inverse helper restores raster
+order; Ring output gathering and reassembly are caller-owned.
+
+`layout.ring` stores groups/options, rank/size, global token count, block
+ownership, peer sizes and the all-gather permutation. With capacity C,
+`p = layout.ring.global_to_gather[b]` gives `owner = p // C` and
+`local_block = p % C`. `layout.ring.block_ids` lists local global IDs, with
+`-1` for dummy blocks. All ranks derive these maps from geometry without
+communication. Coarse Q boundaries are local, while KV boundaries span the
+global sample; full layouts share Q/KV boundary and block-ID tensors.
+
+</details>
 
 ## Acknowledgements
 
@@ -1051,3 +948,5 @@ Thanks to [FastVideo / FastH3](https://github.com/hao-ai-lab/FastVideo/blob/d525
 for the VSA reference and semantics, and
 [NVIDIA cuDNN BSA](https://github.com/NVIDIA/cudnn-frontend/blob/v1.28.0/python/cudnn/block_sparse_attention/_interface.py)
 for the core block-sparse attention kernels used by this implementation.
+
+[MIT License](LICENSE).

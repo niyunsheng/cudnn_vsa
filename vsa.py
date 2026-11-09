@@ -74,9 +74,9 @@ def vsa_attention(q, k, v, gate, vsa_layout, *, scale=None):
     padding. Output uses the same order; Q/K/V/gate must share that order.
     The caller reorders tokens and positions once before the entire VSA stack.
 
-    layout.ring selects Ring execution using the groups and transport options
+    layout.ring selects Ring execution using the group and transport options
     bound by build_vsa_layout, including size-one groups. The caller owns the
-    groups' lifetime and any external Ulysses transforms. raster_to_block_wo_padding
+    group's lifetime and any external Ulysses transforms. raster_to_block_wo_padding
     prepares the local compact shard from a full raster tensor before the stack.
     Ordinary and Ring attention use the same call signature.
     """

@@ -289,55 +289,12 @@ def test_microbatch_layouts_borrow_one_group(metadata_group, monkeypatch):
                               input_order="block", ring_cp_group=group)
     assert first.tokens != second.tokens
     assert first.ring.group is second.ring.group is group
-    assert first.ring.bwd_group is second.ring.bwd_group is group
     assert (first.ring.size, first.ring.rank) == (4, 1)
     with pytest.raises(FrozenInstanceError):
         first.ring.group = metadata_group(4, 1)
     del first
     assert second.ring.group is group
     assert group.size() == 4 and group.rank() == 1
-
-
-def test_microbatch_layouts_borrow_two_groups(metadata_group, monkeypatch):
-    forward, backward = metadata_group(4, 1), metadata_group(4, 1)
-    monkeypatch.setattr(dist, "get_process_group_ranks", lambda group: [1, 3, 5, 7])
-    def unexpected(*args, **kwargs):
-        pytest.fail("Layouts must not create or destroy caller-owned groups")
-    monkeypatch.setattr(dist, "new_group", unexpected)
-    monkeypatch.setattr(dist, "destroy_process_group", unexpected)
-    layouts = [build_vsa_layout(samples, head_num=2, input_order="block",
-                               ring_cp_group=forward, ring_cp_bwd_group=backward)
-               for samples in (PACK, [[Segment("video", (4, 8, 8), .5)]])]
-    assert layouts[0].tokens != layouts[1].tokens
-    for layout in layouts:
-        assert layout.ring.group is forward and layout.ring.bwd_group is backward
-        with pytest.raises(FrozenInstanceError):
-            layout.ring.bwd_group = forward
-
-
-@pytest.mark.parametrize("backward", [object(), False, 1, dist.GroupMember.NON_GROUP_MEMBER])
-def test_invalid_backward_group(backward, metadata_group):
-    with pytest.raises(ValueError, match="ring_cp_bwd_group.*ProcessGroup"):
-        build_vsa_layout(PACK, head_num=2, input_order="block",
-                         ring_cp_group=metadata_group(4, 0), ring_cp_bwd_group=backward)
-
-
-@pytest.mark.parametrize("size,rank", [(2, 0), (4, 1)])
-def test_backward_group_requires_same_size_and_rank(size, rank, metadata_group):
-    with pytest.raises(ValueError, match="size and local rank"):
-        build_vsa_layout(PACK, head_num=2, input_order="block",
-                         ring_cp_group=metadata_group(4, 0),
-                         ring_cp_bwd_group=metadata_group(size, rank))
-
-
-@pytest.mark.parametrize("members", [[0, 2, 4, 7], [0, 4, 2, 6]])
-def test_backward_group_requires_same_members_and_order(members, metadata_group, monkeypatch):
-    forward, backward = metadata_group(4, 0), metadata_group(4, 0)
-    monkeypatch.setattr(dist, "get_process_group_ranks",
-                        lambda group: [0, 2, 4, 6] if group is forward else members)
-    with pytest.raises(ValueError, match="members and rank order"):
-        build_vsa_layout(PACK, head_num=2, input_order="block",
-                         ring_cp_group=forward, ring_cp_bwd_group=backward)
 
 
 def test_same_shape_groups_keep_distinct_runtimes(metadata_group, monkeypatch):
@@ -353,29 +310,69 @@ def test_same_shape_groups_keep_distinct_runtimes(metadata_group, monkeypatch):
     runtimes = [core._ring_runtime(layout, torch.device("cpu")) for layout in layouts]
     for layout, runtime, group in zip(layouts, runtimes, groups):
         assert runtime.group is layout.ring.group is group
-        assert runtime.bwd_group is layout.ring.bwd_group is group
         assert runtime.peers == tuple(peers[group])
         assert core._ring_runtime(layout, torch.device("cpu")) is runtime
     assert runtimes[0] is not runtimes[1]
 
 
 @pytest.mark.parametrize("batch", [None, False, True])
-@pytest.mark.parametrize("bound", [(False, True), (True, False)])
-def test_runtime_resolves_transport_for_each_group(batch, bound, monkeypatch):
+@pytest.mark.parametrize("bound", [False, True])
+def test_runtime_resolves_shared_transport(batch, bound, monkeypatch):
     from types import SimpleNamespace
     import vsa_core as core
 
-    groups = [SimpleNamespace(bound_device_id=torch.device("cuda:0") if value else None)
-              for value in bound]
-    ring = SimpleNamespace(group=groups[0], bwd_group=groups[1], batch_p2p=batch,
+    group = SimpleNamespace(bound_device_id=torch.device("cuda:0") if bound else None)
+    ring = SimpleNamespace(group=group, batch_p2p=batch,
                            bwd_bucket_size=None, size=2, rank=0, _runtime={})
     monkeypatch.setattr(dist, "get_process_group_ranks", lambda group: [1, 3])
     monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: object())
     layout = SimpleNamespace(ring=ring)
     runtime = core._ring_runtime(layout, torch.device("cpu"))
-    assert runtime.group is groups[0] and runtime.bwd_group is groups[1]
-    assert (runtime.batch_p2p, runtime.bwd_batch_p2p) == (bound if batch is None else (batch, batch))
+    assert runtime.group is group
+    assert runtime.batch_p2p == (bound if batch is None else batch)
     assert core._ring_runtime(layout, torch.device("cpu")) is runtime
+
+
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize("rank", range(4))
+def test_ring_exchange_shares_group_and_reverses_peers(batch, rank, metadata_group, monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    import vsa_core as core
+
+    group = metadata_group(4, rank)
+    peers = (1, 3, 5, 7)
+    transfers, waits, batches = [], [], []
+    def operation(kind):
+        def run(tensor, peer, actual_group):
+            assert actual_group is group
+            transfers.append((kind, tensor, peer))
+            return SimpleNamespace(wait=lambda: waits.append(peer))
+        return run
+    def batched(ops):
+        batches.append(len(ops))
+        return [op.op(op.tensor, op.peer, op.group) for op in ops]
+    monkeypatch.setattr(core.dist, "isend", operation("send"))
+    monkeypatch.setattr(core.dist, "irecv", operation("receive"))
+    monkeypatch.setattr(core.dist, "P2POp", lambda op, tensor, peer, group:
+                        SimpleNamespace(op=op, tensor=tensor, peer=peer, group=group))
+    monkeypatch.setattr(core.dist, "batch_isend_irecv", batched)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: object())
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    runtime = SimpleNamespace(group=group, peers=peers, rank=rank, size=4,
+                              batch_p2p=batch, stream=SimpleNamespace(wait_stream=lambda stream: None))
+    pairs = [(object(), object()), (object(), object())]
+    for reverse in (False, True):
+        transfers.clear()
+        core._ring_exchange(runtime, pairs, reverse=reverse)
+        previous, following = peers[(rank-1) % 4], peers[(rank+1) % 4]
+        sender, receiver = (previous, following) if reverse else (following, previous)
+        assert [event[1:] for event in transfers if event[0] == "send"] == [
+            (send, sender) for send, _ in pairs]
+        assert [event[1:] for event in transfers if event[0] == "receive"] == [
+            (receive, receiver) for _, receive in pairs]
+    assert len(waits) == 8
+    assert batches == ([4, 4] if batch else [])
 
 
 def test_full_layout_needs_no_distributed_state(monkeypatch):
@@ -406,7 +403,6 @@ def test_invalid_transport_options_fail_at_construction(options, match, metadata
 
 
 @pytest.mark.parametrize("options", [
-    {"ring_cp_bwd_group": object()},
     {"ring_cp_batch_p2p": False}, {"ring_cp_batch_p2p": True},
     {"ring_cp_bwd_bucket_size": None}, {"ring_cp_bwd_bucket_size": 64},
     {"ring_partition": "contiguous"},

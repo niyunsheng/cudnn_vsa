@@ -19,7 +19,7 @@ pytestmark = pytest.mark.usefixtures("cpu_kernels")
 @pytest.mark.parametrize("size", [1, 2])
 @pytest.mark.parametrize("used", ["both", "k", "v", "zero"])
 def test_pooled_transport_preserves_fp32_gradients(monkeypatch, size, used):
-    runtime = SimpleNamespace(size=size, group=object(), bwd_group=object())
+    runtime = SimpleNamespace(size=size, group=object())
     wire_dtypes, reductions = [], []
 
     def gather(out, value, *, group):
@@ -29,7 +29,7 @@ def test_pooled_transport_preserves_fp32_gradients(monkeypatch, size, used):
         out.copy_(torch.cat([value] * size))
 
     def reduce_scatter(out, grad, *, group):
-        assert group is runtime.bwd_group and grad.dtype == torch.float32
+        assert group is runtime.group and grad.dtype == torch.float32
         assert grad.is_contiguous()
         reductions.append(grad.shape)
         # A remote rank contributes 1/256 of the local derivative. The sum

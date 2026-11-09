@@ -169,8 +169,7 @@ Create groups once, share them across micro-batch layouts, and reuse each
 layout across layers. All group members must supply the same global sample
 geometry, head count and partition policy. VSA borrows the groups; keep them
 alive through backward and CUDA Graph replay. Forward and backward share
-`ring_cp_group` unless `ring_cp_bwd_group` supplies a group with identical
-members and rank order.
+the same `ring_cp_group`.
 
 ### Block ownership
 
@@ -362,8 +361,8 @@ backward.
 
 Set transport options on `build_vsa_layout`, alongside `ring_cp_group`.
 `ring_cp_batch_p2p=None` uses individual P2P for lazy NCCL groups and batched
-P2P for device-bound groups, resolved independently for forward and backward.
-A boolean selects that mode for both groups explicitly.
+P2P for device-bound groups, using the same mode in forward and backward.
+A boolean selects that mode explicitly.
 `ring_cp_bwd_bucket_size="auto"` uses 64 query blocks per backward bucket for
 SM100, H=2, one sample and 128 physical local blocks; other shapes use the
 backend default. Pass `None` for the backend default everywhere, or a positive
@@ -389,10 +388,8 @@ layout = build_vsa_layout(
 out = vsa_attention(q, k, v, gate, layout)
 ```
 
-`ring_cp_group` carries forward pooled all-gather and fine P2P;
-`ring_cp_bwd_group` carries backward P2P and pooled-gradient reduce-scatter.
-The groups default to the same handle. For different backward priority, create
-a second group with identical membership and rank order.
+`ring_cp_group` carries forward pooled all-gather and fine P2P, and backward
+P2P and pooled-gradient reduce-scatter. Its priority applies to both directions.
 
 Enqueuing P2P before BSA does not guarantee that its GPU kernel starts first.
 BSA and NCCL can compete for SM resources, including shared memory. With
@@ -406,11 +403,8 @@ Priority belongs to the process group's internal NCCL stream. Changing only
 the stream around `isend`/`irecv` is insufficient. VSA borrows the supplied
 groups and does not replace them or modify global scheduling settings. The
 benchmark's `--high-priority-group` uses the configuration above.
-`--forward-only-high-priority` creates a high-priority forward group and an
-ordinary-priority backward group; omitting both flags uses one
-ordinary-priority group. The flags are mutually exclusive. A high-priority
-group also affects backward when reused there, even if backward P2P was
-already overlapped.
+Omitting `--high-priority-group` uses an ordinary-priority group. High priority
+also affects backward, even if backward P2P was already overlapped.
 The pooled collectives use synchronous APIs. Some PyTorch versions run them
 on the current CUDA stream, so their kernel priorities can differ from the
 group's asynchronous P2P stream. Inspect the captured nodes in the target build.
@@ -952,7 +946,7 @@ slots). Opposite directions reuse these kernels. `slots_are_input` skips slot
 conversion only for block input with `tokens == blocks * 64` and no
 partial/dummy blocks; raster input always takes the raster-to-slot path.
 
-`layout.ring` stores groups/options, rank/size, global token count, block
+`layout.ring` stores the group/options, rank/size, global token count, block
 ownership, peer sizes and the all-gather permutation. With capacity C,
 `p = layout.ring.global_to_gather[b]` gives `owner = p // C` and
 `local_block = p % C`. `layout.ring.block_ids` lists local global IDs, with

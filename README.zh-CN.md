@@ -165,8 +165,7 @@ rank 和 size 从进程组获取。非成员句柄会被拒绝；即使组大小
 进程组只创建一次，在不同 micro-batch 的 layout 之间共享；每个 layout 在层间复用。
 组内所有成员必须使用相同的全局样本形状、head 数和分配策略。
 VSA 借用进程组，调用方应使其存活到反向和 CUDA Graph replay 完成。
-前反向默认共享 `ring_cp_group`；也可通过 `ring_cp_bwd_group` 传入成员和
-rank 顺序完全相同的另一组。
+前反向共用同一个 `ring_cp_group`。
 
 ### Block 归属
 
@@ -351,8 +350,8 @@ Coarse attention 覆盖每个参与样本的所有 block，不受 fine top-k 列
 
 在 `build_vsa_layout` 中与 `ring_cp_group` 一起设置传输选项。
 `ring_cp_batch_p2p=None` 对延迟初始化的 NCCL 进程组使用独立 P2P，
-对绑定设备的进程组使用批量 P2P，前向和反向分别解析。
-传入布尔值可以为两个进程组显式选择同一种模式。
+对绑定设备的进程组使用批量 P2P，前反向使用相同模式。
+传入布尔值可以显式选择该模式。
 在 SM100、H=2、单样本、128 个物理本地 block 的情况下，
 `ring_cp_bwd_bucket_size="auto"` 为每个反向 bucket 使用 64 个 query block；
 其他形状使用后端默认值。传入 `None` 可使所有情况都使用后端默认值，
@@ -378,9 +377,8 @@ layout = build_vsa_layout(
 out = vsa_attention(q, k, v, gate, layout)
 ```
 
-`ring_cp_group` 承担前向池化 all-gather 和 fine P2P；
-`ring_cp_bwd_group` 承担反向 P2P 和池化梯度 reduce-scatter。
-默认使用同一个句柄。需要不同的反向优先级时，创建成员及 rank 顺序完全相同的第二个组。
+`ring_cp_group` 承担前向池化 all-gather 和 fine P2P，以及反向 P2P 和池化梯度
+reduce-scatter。它的优先级同时作用于前反向。
 
 在 BSA 之前将 P2P 入队，并不保证它的 GPU kernel 先开始执行。
 BSA 和 NCCL 可能竞争 SM 资源，包括共享内存。
@@ -392,9 +390,8 @@ CUDA Graph replay 必须遵守捕获的节点优先级
 优先级属于进程组内部的 NCCL 流。仅改变 `isend`/`irecv` 外围的流并不足够。
 VSA 借用传入的进程组，不会替换它们，也不会修改全局调度设置。
 Benchmark 的 `--high-priority-group` 使用上述配置。
-`--forward-only-high-priority` 创建一个高优先级前向进程组和一个普通优先级反向进程组；
-两个标志都不设置时，则使用一个普通优先级进程组。这两个标志互斥。
-如果反向复用了高优先级进程组，即使反向 P2P 已经实现重叠，也仍会受到高优先级的影响。
+不设置 `--high-priority-group` 时使用普通优先级进程组。
+即使反向 P2P 已经实现重叠，也仍会受到高优先级的影响。
 池化 collective 使用同步 API。一些 PyTorch 版本会在当前 CUDA 流上运行这些操作，
 因此它们的 kernel 优先级可能与进程组的异步 P2P 流不同。
 应检查目标构建中捕获的节点。

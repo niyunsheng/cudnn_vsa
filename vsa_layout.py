@@ -72,9 +72,8 @@ class SampleBlocks:
 
 @dataclass(frozen=True)
 class _RingMetadata:
-    """Borrowed process groups and distribution metadata for one local layout."""
+    """Borrowed process group and distribution metadata for one local layout."""
     group: dist.ProcessGroup = field(repr=False)
-    bwd_group: dist.ProcessGroup = field(repr=False)
     size: int
     rank: int
     partition: str
@@ -238,7 +237,7 @@ def _plan_ring_blocks(groups, ring_size, partition="cyclic"):
 
 def _finalize_layout(samples, global_rows, groups, sample_slices, *, head_num,
                      dense_query_full, device, input_order, ring_size, ring_rank,
-                     ring_cp_group, ring_cp_bwd_group, ring_cp_batch_p2p,
+                     ring_cp_group, ring_cp_batch_p2p,
                      ring_cp_bwd_bucket_size, ring_partition="cyclic") -> VSALayout:
     """Materialize padding, inverse maps and coarse metadata from planned blocks.
 
@@ -271,7 +270,7 @@ def _finalize_layout(samples, global_rows, groups, sample_slices, *, head_num,
             for local, bid in enumerate(ids):
                 global_to_gather[bid] = rank * capacity + local
         ring = _RingMetadata(
-            group=ring_cp_group, bwd_group=ring_cp_bwd_group, batch_p2p=ring_cp_batch_p2p,
+            group=ring_cp_group, batch_p2p=ring_cp_batch_p2p,
             bwd_bucket_size=ring_cp_bwd_bucket_size,
             size=ring_size, rank=ring_rank, partition=ring_partition, global_tokens=sum(sizes),
             local_groups=tuple(local_groups),
@@ -374,7 +373,7 @@ def _build_sample_blocks(segments, *, token_offset, block_offset):
 
 
 def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
-                     input_order="raster", ring_cp_group=None, ring_cp_bwd_group=None,
+                     input_order="raster", ring_cp_group=None,
                      ring_cp_batch_p2p=None,
                      ring_cp_bwd_bucket_size="auto", ring_partition="cyclic") -> VSALayout:
     """Build a full layout or an explicitly requested ring shard from Segments.
@@ -401,10 +400,8 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
     Pass an existing member ProcessGroup to bind a Ring shard, including size one.
     Rank/size come from that group; layout only borrows it and never creates or
     destroys groups. Different micro-batch layouts can share the same group.
-    ring_cp_bwd_group optionally binds a separate existing group for backward
-    P2P and pooled-gradient reduce-scatter. Its members and rank order must match
-    ring_cp_group. None reuses ring_cp_group for both directions. The caller
-    chooses each group's NCCL stream priority once during parallel initialization.
+    Forward/backward P2P and pooled collectives all use ring_cp_group. The caller
+    chooses its NCCL stream priority once during parallel initialization.
     Ring shards require input_order="block" and contain only valid owned-block
     rows without padding. ring_partition="cyclic" (default) assigns global
     block b to rank b % ring_size. "contiguous" assigns at most one interval
@@ -420,7 +417,7 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
     raster_to_block_wo_padding selects and reorders a Ring shard from global
     raster rows in one gather. block_wo_padding_to_raster requires a full layout.
     ring_cp_batch_p2p=None chooses batched P2P for device-bound groups and
-    individual P2P for lazy groups, independently in each direction.
+    individual P2P for lazy groups, using the same mode in both directions.
     ring_cp_bwd_bucket_size="auto" selects the
     measured SM100/H2/local-128-block/single-sample setting; None uses the backend
     default, and a positive integer overrides it. These options require a group.
@@ -446,21 +443,11 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
         ring_size, ring_rank = ring_cp_group.size(), ring_cp_group.rank()
         if ring_size < 1 or not 0 <= ring_rank < ring_size:
             raise ValueError("ring_cp_group must contain this rank and have positive size")
-        if ring_cp_bwd_group is None:
-            ring_cp_bwd_group = ring_cp_group
-        if not isinstance(ring_cp_bwd_group, dist.ProcessGroup):
-            raise ValueError("ring_cp_bwd_group must be a ProcessGroup containing this rank")
-        if (ring_cp_bwd_group.size(), ring_cp_bwd_group.rank()) != (ring_size, ring_rank):
-            raise ValueError("ring_cp_bwd_group must match ring_cp_group size and local rank")
-        if (ring_cp_bwd_group is not ring_cp_group and
-                dist.get_process_group_ranks(ring_cp_bwd_group) !=
-                dist.get_process_group_ranks(ring_cp_group)):
-            raise ValueError("ring_cp_bwd_group must match ring_cp_group members and rank order")
         if isinstance(head_num, bool) or not isinstance(head_num, int) or head_num < 1:
             raise ValueError("head_num must be a positive integer")
         if not isinstance(dense_query_full, bool):
             raise ValueError("dense_query_full must be a bool")
-    elif (ring_cp_bwd_group is not None or ring_cp_batch_p2p is not None
+    elif (ring_cp_batch_p2p is not None
           or ring_cp_bwd_bucket_size != "auto" or ring_partition != "cyclic"):
         raise ValueError("Ring transport options require ring_cp_group")
     samples, block_rows, groups, sample_slices = _plan_samples(samples)
@@ -472,7 +459,7 @@ def build_vsa_layout(samples, *, head_num, dense_query_full=False, device="cpu",
     return _finalize_layout(samples, block_rows, groups, sample_slices,
                             head_num=head_num, dense_query_full=dense_query_full, device=device,
                             input_order=input_order, ring_size=ring_size, ring_rank=ring_rank,
-                            ring_cp_group=ring_cp_group, ring_cp_bwd_group=ring_cp_bwd_group,
+                            ring_cp_group=ring_cp_group,
                             ring_cp_batch_p2p=ring_cp_batch_p2p,
                             ring_cp_bwd_bucket_size=ring_cp_bwd_bucket_size,
                             ring_partition=ring_partition)
